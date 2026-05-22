@@ -22,6 +22,8 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Any, Dict, List
 
+from hermes_constants import get_hermes_home
+
 from agent.usage_pricing import (
     CanonicalUsage,
     DEFAULT_PRICING,
@@ -356,12 +358,15 @@ class InsightsEngine:
                     {
                         "skill": skill_name,
                         "view_count": 0,
+                        "explicit_view_count": 0,
+                        "auto_preload_count": 0,
                         "manage_count": 0,
                         "last_used_at": None,
                     },
                 )
                 if tool_name == "skill_view":
                     entry["view_count"] += 1
+                    entry["explicit_view_count"] += 1
                 else:
                     entry["manage_count"] += 1
 
@@ -369,6 +374,48 @@ class InsightsEngine:
                     entry["last_used_at"] is None or timestamp > entry["last_used_at"]
                 ):
                     entry["last_used_at"] = timestamp
+
+        # ── Augment with bump_use telemetry from .usage.json ──────────────────
+        # bump_use() is called by auto-preload (full and compact) as well as
+        # explicit slash-skill loads.  DB tool calls only see explicit
+        # skill_view/skill_manage.  Expose both counts so insights can tell
+        # "runtime preload" from "manual view" instead of flattening both.
+        usage_file = get_hermes_home() / "skills" / ".usage.json"
+        if usage_file.exists():
+            try:
+                with open(usage_file, "r", encoding="utf-8") as f:
+                    usage_data = json.load(f)
+                if isinstance(usage_data, dict):
+                    for skill_name, rec in usage_data.items():
+                        if not isinstance(rec, dict):
+                            continue
+                        use_count = int(rec.get("use_count") or 0)
+                        if use_count == 0:
+                            continue
+                        entry = skill_counts.get(skill_name)
+                        if entry is None:
+                            entry = {
+                                "skill": skill_name,
+                                "view_count": 0,
+                                "explicit_view_count": 0,
+                                "auto_preload_count": 0,
+                                "manage_count": 0,
+                                "last_used_at": None,
+                            }
+                            skill_counts[skill_name] = entry
+                        explicit_views = int(entry.get("explicit_view_count") or 0)
+                        auto_preloads = max(use_count - explicit_views, 0)
+                        entry["auto_preload_count"] = auto_preloads
+                        entry["view_count"] = explicit_views + auto_preloads
+                        # latest timestamp wins
+                        last_used = rec.get("last_used_at")
+                        if last_used and (
+                            entry["last_used_at"] is None
+                            or last_used > entry["last_used_at"]
+                        ):
+                            entry["last_used_at"] = last_used
+            except (json.JSONDecodeError, OSError, ValueError):
+                pass  # best-effort only
 
         return list(skill_counts.values())
 
@@ -571,12 +618,18 @@ class InsightsEngine:
 
         top_skills = []
         for skill in skill_usage:
-            total_count = skill["view_count"] + skill["manage_count"]
+            explicit_views = int(skill.get("explicit_view_count") or 0)
+            auto_preloads = int(skill.get("auto_preload_count") or 0)
+            view_count = int(skill.get("view_count") or (explicit_views + auto_preloads))
+            manage_count = int(skill.get("manage_count") or 0)
+            total_count = view_count + manage_count
             percentage = (total_count / total_skill_actions * 100) if total_skill_actions else 0
             top_skills.append({
                 "skill": skill["skill"],
-                "view_count": skill["view_count"],
-                "manage_count": skill["manage_count"],
+                "view_count": view_count,
+                "explicit_view_count": explicit_views,
+                "auto_preload_count": auto_preloads,
+                "manage_count": manage_count,
                 "total_count": total_count,
                 "percentage": percentage,
                 "last_used_at": skill.get("last_used_at"),
@@ -804,13 +857,13 @@ class InsightsEngine:
         if top_skills:
             lines.append("  🧠 Top Skills")
             lines.append("  " + "─" * 56)
-            lines.append(f"  {'Skill':<28} {'Loads':>7} {'Edits':>7} {'Last used':>11}")
+            lines.append(f"  {'Skill':<28} {'Loads':>7} {'Auto':>7} {'Edits':>7} {'Last used':>11}")
             for skill in top_skills[:10]:
                 last_used = "—"
                 if skill.get("last_used_at"):
                     last_used = datetime.fromtimestamp(skill["last_used_at"]).strftime("%b %d")
                 lines.append(
-                    f"  {skill['skill'][:28]:<28} {skill['view_count']:>7,} {skill['manage_count']:>7,} {last_used:>11}"
+                    f"  {skill['skill'][:28]:<28} {skill['view_count']:>7,} {skill.get('auto_preload_count', 0):>7,} {skill['manage_count']:>7,} {last_used:>11}"
                 )
             summary = skills.get("summary", {})
             lines.append(
@@ -911,7 +964,7 @@ class InsightsEngine:
                 if skill.get("last_used_at"):
                     suffix = f", last used {datetime.fromtimestamp(skill['last_used_at']).strftime('%b %d')}"
                 lines.append(
-                    f"  {skill['skill']} — {skill['view_count']:,} loads, {skill['manage_count']:,} edits{suffix}"
+                    f"  {skill['skill']} — {skill['view_count']:,} loads ({skill.get('auto_preload_count', 0):,} auto), {skill['manage_count']:,} edits{suffix}"
                 )
             lines.append("")
 

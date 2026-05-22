@@ -521,3 +521,254 @@ def build_preloaded_skills_prompt(
         loaded_names.append(skill_name)
 
     return "\n\n".join(prompt_parts), loaded_names, missing
+
+
+# -----------------------------------------------------------------------------------------
+# Per-turn auto skill preloader
+# -----------------------------------------------------------------------------------------
+# Runtime-level routing lives here (not only inside skills) so the first model
+# call sees the right skill bundle before it has a chance to forget Step 0.
+# Rules use OR matching across pipe-separated keywords.  Keep keywords specific:
+# broad words like "new" cause noisy false positives and slow turns.
+
+_AUTO_PRELOAD_RULES: list[tuple[str, list[str], str]] = [
+    # Base code-task controller. Other code-related rules below also include it
+    # explicitly so PR/debug/test/review prompts get the deterministic bundle.
+    (
+        "执行代码|代码任务|小修|快速修复|严格验证|代码改动|改代码|写代码|"
+        "代码复杂度|风险分级|执行代码任务|修 bug|修复代码|implement code|"
+        "code task|coding task|fix bug|small fix|quick fix|modify code",
+        ["code-task-execution"],
+        "code execution task",
+    ),
+    # GitHub PR / git write workflow bundle.
+    (
+        "创建PR|提PR|建PR|合PR|PR详情|PR改动|PR审查|提交PR|开PR|"
+        "pull request|github pr|gh pr|merge pr|create pr|open pr|"
+        "branch|commit|push|rebase|cherry-pick",
+        ["code-task-execution", "github-pr-workflow"],
+        "GitHub PR workflow",
+    ),
+    # Debugging bundle.
+    (
+        "调试|排查问题|找bug|系统调试|复现问题|根因分析|debugging|debug|"
+        "root cause|reproduce|failing behavior|traceback|stack trace",
+        ["code-task-execution", "systematic-debugging"],
+        "systematic debugging",
+    ),
+    # TDD / regression-test bundle.
+    (
+        "TDD|红绿重构|测试先行|RED|GREEN|REFACTOR|写测试用例|回归测试|"
+        "test driven|red green|regression test|tests first|write tests",
+        ["code-task-execution", "test-driven-development"],
+        "TDD workflow",
+    ),
+    # Review / quality-gate bundle.
+    (
+        "代码审查|PR审查|pre-commit|质量门禁|自动修复|提交前检查|安全扫描|"
+        "code review|quality gate|security scan|preflight|verify before commit",
+        ["code-task-execution", "requesting-code-review"],
+        "code review",
+    ),
+    # spike
+    (
+        "spike|throwaway|验证实验|快速验证|quick check|validate idea",
+        ["spike"],
+        "spike experiment",
+    ),
+    # writing-plans
+    (
+        "写计划|写个计划|做计划|实施计划|任务分解|拆解任务|规划|implementation plan|"
+        "write plan|break down",
+        ["writing-plans"],
+        "writing plans",
+    ),
+    # subagent-driven-development
+    (
+        "子代理|子Agent|delegate|multi-agent|并行任务|委托任务|subagent|orchestrate|parallel",
+        ["subagent-driven-development"],
+        "subagent-driven development",
+    ),
+    # skill authoring / self-repair bundle.
+    (
+        "skill author|写skill|更新skill|修skill|优化skill|patch skill|"
+        "fix skill|update skill|create skill|skill 不对|skill失效",
+        ["code-task-execution", "hermes-agent-skill-authoring", "skill-self-repair"],
+        "skill authoring",
+    ),
+    # knowledge base / wiki
+    (
+        "知识库|资料库|wiki|GET笔记|RaymondWiki|knowledge base|raymond|notes",
+        ["wiki-ops", "getnote-ops"],
+        "knowledge base management",
+    ),
+]
+
+_L1_FAST_KEYWORDS = (
+    "小修",
+    "快速修复",
+    "small fix",
+    "quick fix",
+    "typo",
+    "拼写",
+    "一行",
+    "配置小改",
+)
+
+_NON_L1_KEYWORDS = (
+    "pr",
+    "pull request",
+    "merge",
+    "branch",
+    "commit",
+    "push",
+    "debug",
+    "调试",
+    "复现",
+    "根因",
+    "tdd",
+    "测试先行",
+    "回归测试",
+    "security",
+    "安全",
+    "auth",
+    "权限",
+    "migration",
+    "迁移",
+    "并发",
+    "concurrency",
+    "public api",
+    "review",
+    "审查",
+)
+
+
+def _config_bool(section: dict, key: str, default: bool) -> bool:
+    value = section.get(key, default)
+    return bool(value) if isinstance(value, bool) else default
+
+
+def _is_l1_fast_message(msg_lower: str) -> bool:
+    msg_lower = msg_lower.lower()
+    return any(k.lower() in msg_lower for k in _L1_FAST_KEYWORDS) and not any(
+        k.lower() in msg_lower for k in _NON_L1_KEYWORDS
+    )
+
+
+def _build_code_task_compact_context(
+    user_message: str,
+    task_id: str | None = None,
+) -> str:
+    """Return a small L1 code-task SOP without loading the full skill body.
+
+    This is intentionally narrow: it avoids the large SKILL.md payload for
+    obvious low-risk fixes while preserving the marker and safety gates.
+    """
+    try:
+        from tools.skill_usage import bump_use
+        bump_use("code-task-execution")
+    except Exception:
+        pass
+
+    runtime_note = (
+        "[AUTO-PRELOADED-COMPACT] The \"code-task-execution\" skill was "
+        f"compact-preloaded for an L1 fast-path request: {user_message.strip()[:80]}"
+    )
+    session_line = f"\nSession/task id: {task_id}" if task_id else ""
+    return f"""[IMPORTANT: Compact runtime guidance from the \"code-task-execution\" skill is active for this turn.]
+
+# code-task-execution — L1 Compact Fast Path
+
+Use this compact path only for obvious low-risk 1-2 file fixes. Escalate to the full skill or related skills if the task involves PRs, debugging/root cause, TDD, security/auth/path/state/migrations, public API behavior, unrelated working-tree changes, or two failed attempts.
+
+Required steps:
+1. Classify the task as L1 unless risk signals require escalation.
+2. Run `git status --short` before editing in a git repo.
+3. Locate the exact file/pattern and make the smallest possible patch.
+4. Run one targeted test, import/build parse, CLI smoke, or equivalent.
+5. Run scope gate: `git diff --name-only` and `git diff --check`.
+6. Final report must include status, changed files, verification commands, risk, next step.
+7. End the final answer with exactly: `[skill: code-task-execution]`.
+
+Do not refactor unrelated code, format whole files unless requested, add broad abstractions, auto-commit, or auto-open PR unless the user explicitly asks.{session_line}
+
+{runtime_note}"""
+
+
+def _matched_auto_preload_slugs(msg_lower: str) -> list[str]:
+    """Return deterministic, de-duplicated auto-preload skill bundle."""
+    matched_slugs: list[str] = []
+    for keywords, slugs, _reason in _AUTO_PRELOAD_RULES:
+        kw_list = [k.strip().lower() for k in keywords.split("|") if k.strip()]
+        if any(kw in msg_lower for kw in kw_list):
+            for slug in slugs:
+                if slug not in matched_slugs:
+                    matched_slugs.append(slug)
+    return matched_slugs
+
+
+def build_auto_skill_preload_context(
+    user_message: str,
+    task_id: str | None = None,
+) -> str:
+    """Auto-preload deterministic skill bundles for the current turn.
+
+    Returns an empty string when no skills match or auto-preload is disabled.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        skills_cfg = cfg.get("skills", {}) if isinstance(cfg.get("skills"), dict) else {}
+        if not _config_bool(skills_cfg, "auto_preload", False):
+            return ""
+        compact_l1 = _config_bool(skills_cfg, "auto_preload_compact_l1", True)
+    except Exception:
+        return ""
+
+    if not user_message or not user_message.strip():
+        return ""
+
+    msg_lower = user_message.lower()
+    msg_stripped = user_message.strip()
+    matched_slugs = _matched_auto_preload_slugs(msg_lower)
+
+    if not matched_slugs:
+        return ""
+
+    prompt_parts: list[str] = []
+    loaded_names: list[str] = []
+    compact_code_task = (
+        compact_l1
+        and "code-task-execution" in matched_slugs
+        and _is_l1_fast_message(msg_lower)
+    )
+
+    for slug in matched_slugs:
+        if slug == "code-task-execution" and compact_code_task:
+            prompt_parts.append(_build_code_task_compact_context(user_message, task_id=task_id))
+            loaded_names.append(slug)
+            continue
+
+        cmd_key = f"/{slug.replace('_', '-')}"
+        invocation = build_skill_invocation_message(
+            cmd_key,
+            user_instruction="",
+            task_id=task_id,
+            runtime_note=(
+                f"[AUTO-PRELOADED] The \"{slug}\" skill was automatically "
+                f"preloaded because the user's request matches: {msg_stripped[:80]}"
+            ),
+        )
+        if invocation:
+            prompt_parts.append(invocation)
+            loaded_names.append(slug)
+
+    if not prompt_parts:
+        return ""
+
+    logger.debug(
+        "auto_skill_preload: matched %s for user message: %s",
+        loaded_names,
+        msg_stripped[:60],
+    )
+    return "\n\n".join(prompt_parts)

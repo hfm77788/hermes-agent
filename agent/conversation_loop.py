@@ -438,16 +438,39 @@ def run_conversation(
             _should_review_memory = True
             agent._turns_since_memory = 0
 
+    # ── Per-turn auto skill preloader ──────────────────────────────────────────
+    # Ephemerally inject auto-matched skills into this turn only.
+    # Does NOT touch the cached system prompt — safe for gateway per-message
+    # fresh AIAgent pattern.  Original user_message is preserved in the
+    # persist_user_message field for clean transcripts.
+    auto_skill_context = ""
+    try:
+        from agent.skill_commands import build_auto_skill_preload_context
+        auto_skill_context = build_auto_skill_preload_context(
+            user_message,
+            task_id=task_id,
+        )
+    except Exception:
+        pass  # Auto-preload is best-effort; never block the turn
+
     # Add user message
-    user_msg = {"role": "user", "content": user_message}
+    user_msg_content = user_message
+    if auto_skill_context:
+        # Inject skill content as prefix; model sees both skill SOP and request
+        user_msg_content = (
+            f"{auto_skill_context.strip()}\n\n"
+            f"[User request — preserved verbatim below]\n"
+            f"{user_message}"
+        )
+    user_msg = {"role": "user", "content": user_msg_content}
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
-    
+
     if not agent.quiet_mode:
         _print_preview = _summarize_user_message_for_log(user_message)
         agent._safe_print(f"💬 Starting conversation: '{_print_preview[:60]}{'...' if len(_print_preview) > 60 else ''}'")
-    
+
     # ── System prompt (cached per session for prefix caching) ──
     # Built once on first call, reused for all subsequent calls.
     # Only rebuilt after context compression events (which invalidate

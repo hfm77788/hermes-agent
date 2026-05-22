@@ -1295,6 +1295,12 @@ DEFAULT_CONFIG = {
         # External hub installs (trusted/community sources) are always
         # scanned regardless of this setting.
         "guard_agent_created": False,
+        # Per-turn auto skill preloader: when a user message matches deterministic
+        # routing keywords, the matching skill bundle is preloaded into the turn.
+        "auto_preload": True,
+        # For obvious low-risk L1 code fixes, inject a compact code-task SOP
+        # instead of the full SKILL.md to reduce context and latency.
+        "auto_preload_compact_l1": True,
     },
 
     # Curator — background skill maintenance.

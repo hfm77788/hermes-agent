@@ -16,8 +16,9 @@ from agent.insights import (
 
 
 @pytest.fixture()
-def db(tmp_path):
-    """Create a SessionDB with a temp database file."""
+def db(tmp_path, monkeypatch):
+    """Create a SessionDB with a temp database file and isolated Hermes home."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
     db_path = tmp_path / "test_insights.db"
     session_db = SessionDB(db_path=db_path)
     yield session_db
@@ -369,6 +370,34 @@ class TestInsightsPopulated:
         assert top_skill["manage_count"] == 0
         assert top_skill["total_count"] == 2
         assert top_skill["last_used_at"] is not None
+
+    def test_skill_breakdown_tracks_auto_preload_separately(self, populated_db):
+        import json as _json
+        from hermes_constants import get_hermes_home
+
+        usage_dir = get_hermes_home() / "skills"
+        usage_dir.mkdir(parents=True, exist_ok=True)
+        (usage_dir / ".usage.json").write_text(
+            _json.dumps({
+                "github-pr-workflow": {"use_count": 5, "last_used_at": time.time()},
+                "code-task-execution": {"use_count": 3, "last_used_at": time.time()},
+            }),
+            encoding="utf-8",
+        )
+
+        engine = InsightsEngine(populated_db)
+        report = engine.generate(days=30)
+        skills = report["skills"]
+
+        github = next(s for s in skills["top_skills"] if s["skill"] == "github-pr-workflow")
+        code_task = next(s for s in skills["top_skills"] if s["skill"] == "code-task-execution")
+
+        assert github["explicit_view_count"] == 2
+        assert github["auto_preload_count"] == 3
+        assert github["view_count"] == 5
+        assert code_task["explicit_view_count"] == 0
+        assert code_task["auto_preload_count"] == 3
+        assert code_task["view_count"] == 3
 
     def test_skill_breakdown_respects_days_filter(self, populated_db):
         engine = InsightsEngine(populated_db)
