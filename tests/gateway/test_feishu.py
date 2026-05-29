@@ -1027,6 +1027,104 @@ class TestAdapterBehavior(unittest.TestCase):
             )
         )
 
+    def test_data_ingestion_group_allows_plain_link_without_mention(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        data_ingestion_group_id = "oc_a19b4f58f14f7bea48a67610eb0bcb33"
+        config = PlatformConfig(
+            extra={
+                "group_rules": {
+                    data_ingestion_group_id: {
+                        "policy": "open",
+                        "require_mention": False,
+                    }
+                }
+            }
+        )
+        adapter = FeishuAdapter(config)
+        adapter._bot_open_id = "ou_bot"
+
+        message = SimpleNamespace(
+            content=json.dumps({"text": "https://mp.weixin.qq.com/s/abc123"}),
+            mentions=[],
+        )
+
+        self.assertTrue(
+            _admits_group(
+                adapter,
+                message,
+                SimpleNamespace(open_id="ou_anyone", user_id=None),
+                data_ingestion_group_id,
+            )
+        )
+
+    def test_data_ingestion_group_allows_keyword_and_link_without_mention(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        data_ingestion_group_id = "oc_a19b4f58f14f7bea48a67610eb0bcb33"
+        config = PlatformConfig(
+            extra={
+                "group_rules": {
+                    data_ingestion_group_id: {
+                        "policy": "open",
+                        "require_mention": False,
+                    }
+                }
+            }
+        )
+        adapter = FeishuAdapter(config)
+        adapter._bot_open_id = "ou_bot"
+
+        message = SimpleNamespace(
+            content=json.dumps(
+                {"text": "资料录入 https://mp.weixin.qq.com/s/abc123"}
+            ),
+            mentions=[],
+        )
+
+        self.assertTrue(
+            _admits_group(
+                adapter,
+                message,
+                SimpleNamespace(open_id="ou_anyone", user_id=None),
+                data_ingestion_group_id,
+            )
+        )
+
+    def test_other_group_still_rejects_non_mention_message(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        config = PlatformConfig(
+            extra={
+                "default_group_policy": "open",
+                "group_rules": {
+                    "oc_a19b4f58f14f7bea48a67610eb0bcb33": {
+                        "policy": "open",
+                        "require_mention": False,
+                    }
+                },
+            }
+        )
+        adapter = FeishuAdapter(config)
+        adapter._bot_open_id = "ou_bot"
+
+        message = SimpleNamespace(
+            content=json.dumps({"text": "https://mp.weixin.qq.com/s/abc123"}),
+            mentions=[],
+        )
+
+        self.assertFalse(
+            _admits_group(
+                adapter,
+                message,
+                SimpleNamespace(open_id="ou_anyone", user_id=None),
+                "oc_other_group",
+            )
+        )
+
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
     def test_group_message_matches_bot_open_id_when_configured(self):
         from gateway.config import PlatformConfig
@@ -5195,6 +5293,17 @@ class TestThemeMaterialIngestionRouting(unittest.TestCase):
         )
         event.message.content = json.dumps(
             {"text": "链接 https://feishu.cn/docs/doc_abc123"}
+        )
+        self.assertTrue(adapter._has_document_url(event))
+
+    def test_has_document_url_true_for_wechat_article(self):
+        adapter = self._build_adapter()
+        event = self._build_event(
+            self.THEME_GROUP_ID,
+            text="",
+        )
+        event.message.content = json.dumps(
+            {"text": "链接 https://mp.weixin.qq.com/s/abc123"}
         )
         self.assertTrue(adapter._has_document_url(event))
 
