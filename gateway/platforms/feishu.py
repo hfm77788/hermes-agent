@@ -1467,6 +1467,10 @@ class FeishuAdapter(BasePlatformAdapter):
         # Feishu reaction deletion requires the opaque reaction_id returned
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
+        # Per-chat flag: True when a preview_only has been triggered and
+        # confirmed_ingestion is still pending for the same chat_id.
+        # Guards against confirmed_ingestion firing without a preceding preview.
+        self._pending_theme_preview: Dict[str, bool] = {}
         self._load_seen_message_ids()
 
     @staticmethod
@@ -2783,11 +2787,16 @@ class FeishuAdapter(BasePlatformAdapter):
         return lock
 
     # -------------------------------------------------------------------------
-    # Theme Material Ingestion Group routing
+    # Theme Material Ingestion Group routing — two-gate system
     # -------------------------------------------------------------------------
     _THEME_INGESTION_GROUP_ID = "oc_a19b4f58f14f7bea48a67610eb0bcb33"
-    _THEME_INGESTION_KEYWORDS = frozenset({
-        "录入", "入库", "归档", "转 markdown", "整理资料", "新资料",
+    # Keywords that trigger preview_only (Gate 1)
+    _PREVIEW_ONLY_TRIGGER_KEYWORDS = frozenset({
+        "录入", "入库", "归档", "整理资料", "转 markdown", "请处理这份资料", "资料录入测试",
+    })
+    # Keywords that confirm ingestion (Gate 2)
+    _CONFIRM_KEYWORDS = frozenset({
+        "确认录入", "可以录入", "进入处理", "开始处理", "确认入库", "生成候选 source",
     })
     _THEME_INGESTION_TOPIC_EXISTING_PATHS = {
         "competition_aild": "projects/competition-consulting-qa/aild/",
@@ -2795,6 +2804,240 @@ class FeishuAdapter(BasePlatformAdapter):
         "chuangqingchun": None,  # TODO: confirm path
     }
     _THEME_INGESTION_DUPLICATE_POLICY = "reuse_existing"
+
+    # Topic prediction patterns (HIGH confidence)
+    _TOPIC_PATTERNS = {
+        "competition_aild": {
+            "existing_path": "projects/competition-consulting-qa/aild/",
+            "high_confidence": frozenset({"aild", "aild.caa.org.cn", "智能设计大赛"}),
+            "medium_confidence": frozenset({"aild"}),
+        },
+        "competition_emergency_safety": {
+            "existing_path": "projects/competition-consulting-qa/emergency-safety/",
+            "high_confidence": frozenset({"nyseic.cn", "全国青少年应急与安全科普创新大赛", "应急安全"}),
+            "medium_confidence": frozenset({"应急与安全"}),
+        },
+        "chuangqingchun": {
+            "existing_path": None,  # TODO: confirm path
+            "high_confidence": frozenset({"创青春", "中银杯"}),
+            "medium_confidence": frozenset({"创业大赛", "中国青年创青春", "天津青年创青春"}),
+        },
+    }
+
+    # Mapping from auto_skill action to actual skill name
+    _INGESTION_ACTION_TO_SKILL = {
+        "preview_only": "theme-material-ingestion",
+        "confirmed_ingestion": "theme-material-ingestion",
+    }
+
+    def _check_theme_ingestion_trigger(
+        self, chat_id: str, message: Any, event: MessageEvent
+    ) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+        """Check if a message triggers theme ingestion.
+
+        Returns:
+            Tuple of (action, trigger_reason, predicted_topic, confidence) or (None, None, None, None)
+            action is one of: "preview_only", "confirmed_ingestion", or None
+        """
+        if chat_id != self._THEME_INGESTION_GROUP_ID:
+            return None, None, None, None
+
+        # Use event.text as the canonical text content (pre-extracted by the adapter)
+        raw_text = getattr(event, "text", "") or ""
+        normalized = raw_text.lower()
+
+        # Check for confirmation keywords first (Gate 2)
+        if any(kw in normalized for kw in self._CONFIRM_KEYWORDS):
+            # Guard: confirmed_ingestion only valid if a preview_only was triggered
+            # for this chat_id in the same session. Without a prior preview,
+            # silently fall through to no-action.
+            if not self._pending_theme_preview.get(chat_id, False):
+                logger.info(
+                    "[Feishu] Theme material ingestion confirm ignored (no pending preview): "
+                    "chat_id=%s message_id=%s",
+                    chat_id,
+                    event.message_id,
+                )
+                return None, None, None, None
+            # Consume the pending flag — this confirmed_ingestion is now terminal
+            self._pending_theme_preview[chat_id] = False
+            logger.info(
+                "[Feishu] Theme material ingestion confirmed: "
+                "chat_id=%s message_id=%s has_attachment=%s has_url=%s trigger_reason=confirm_keyword "
+                "predicted_topic=%s confidence=%s action=%s",
+                chat_id,
+                event.message_id,
+                self._has_attachments(event),
+                self._has_document_url(event),
+                "unknown",
+                "N/A",
+                "confirmed_ingestion",
+            )
+            return "confirmed_ingestion", "confirm_keyword", None, None
+
+        # Check for preview_only trigger conditions (Gate 1)
+        has_attachment = self._has_attachments(event)
+        has_url = self._has_document_url(event)
+
+        # Attachment triggers
+        if has_attachment:
+            self._pending_theme_preview[chat_id] = True
+            topic, confidence = self._predict_topic(raw_text)
+            logger.info(
+                "[Feishu] Theme material ingestion preview: "
+                "chat_id=%s message_id=%s has_attachment=%s has_url=%s trigger_reason=attachment "
+                "predicted_topic=%s confidence=%s action=%s",
+                chat_id,
+                event.message_id,
+                has_attachment,
+                has_url,
+                topic,
+                confidence,
+                "preview_only",
+            )
+            return "preview_only", "attachment", topic, confidence
+
+        # URL triggers
+        if has_url:
+            self._pending_theme_preview[chat_id] = True
+            topic, confidence = self._predict_topic(raw_text)
+            logger.info(
+                "[Feishu] Theme material ingestion preview: "
+                "chat_id=%s message_id=%s has_attachment=%s has_url=%s trigger_reason=document_url "
+                "predicted_topic=%s confidence=%s action=%s",
+                chat_id,
+                event.message_id,
+                has_attachment,
+                has_url,
+                topic,
+                confidence,
+                "preview_only",
+            )
+            return "preview_only", "document_url", topic, confidence
+
+        # Keyword triggers
+        kw_triggered = any(kw in normalized for kw in self._PREVIEW_ONLY_TRIGGER_KEYWORDS)
+        if kw_triggered:
+            # Do NOT trigger for casual greetings
+            skip_keywords = frozenset({"你好", "收到", "谢谢", "在吗", "ok", "好的", "嗯", "好"})
+            if any(g in normalized for g in skip_keywords):
+                return None, None, None, None
+            self._pending_theme_preview[chat_id] = True
+            topic, confidence = self._predict_topic(raw_text)
+            logger.info(
+                "[Feishu] Theme material ingestion preview: "
+                "chat_id=%s message_id=%s has_attachment=%s has_url=%s trigger_reason=keyword "
+                "predicted_topic=%s confidence=%s action=%s",
+                chat_id,
+                event.message_id,
+                has_attachment,
+                has_url,
+                topic,
+                confidence,
+                "preview_only",
+            )
+            return "preview_only", "keyword", topic, confidence
+
+        # @mention + explicit processing request check
+        if self._mentions_self(message):
+            explicit_request_keywords = frozenset({
+                "录入", "入库", "处理", "整理", "归档", "转", "markdown",
+            })
+            if any(kw in normalized for kw in explicit_request_keywords):
+                self._pending_theme_preview[chat_id] = True
+                topic, confidence = self._predict_topic(raw_text)
+                logger.info(
+                    "[Feishu] Theme material ingestion preview: "
+                    "chat_id=%s message_id=%s has_attachment=%s has_url=%s trigger_reason=mention_request "
+                    "predicted_topic=%s confidence=%s action=%s",
+                    chat_id,
+                    event.message_id,
+                    has_attachment,
+                    has_url,
+                    topic,
+                    confidence,
+                    "preview_only",
+                )
+                return "preview_only", "mention_request", topic, confidence
+
+        return None, None, None, None
+
+    def _has_attachments(self, event: MessageEvent) -> bool:
+        """Check if the event has attachments (images, PDF, Word, Excel, PPT, zip, etc.)."""
+        message = getattr(event, "message", None)
+        if not message:
+            return False
+        # Check media_refs for file/image attachments
+        media_refs = getattr(message, "media_refs", None) or []
+        if media_refs:
+            return True
+        # Check normalized message type for file types
+        msg_type = getattr(message, "message_type", "") or ""
+        file_types = frozenset({"file", "image", "audio", "media", "video"})
+        if msg_type.lower() in file_types:
+            return True
+        return False
+
+    def _has_document_url(self, event: MessageEvent) -> bool:
+        """Check if the event contains a URL that looks like a document link."""
+        message = getattr(event, "message", None)
+        raw_content = getattr(message, "content", "") or "" if message else ""
+        if not raw_content:
+            return False
+        # Content may be a JSON string — extract text field if so
+        try:
+            parsed = json.loads(raw_content)
+            if isinstance(parsed, dict):
+                raw_content = parsed.get("text", "") or ""
+        except (ValueError, TypeError):
+            pass
+        if not raw_content:
+            return False
+        # URL patterns for document links
+        # Pattern 1: file extension in URL (.pdf, .doc, .xls, .ppt, .zip)
+        url_pattern_ext = re.compile(
+            r"https?://[^\s<>\"']+\.(?:pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar)",
+            re.IGNORECASE,
+        )
+        # Pattern 2: feishu/lark domain with path (e.g. https://xxx.feishu.cn/doc/...)
+        # Matches: contains (feishu|lark|wenjian|docs). as domain component followed by '/' and path chars
+        url_pattern_domain = re.compile(
+            r"https?://[^\s<>\"']*(?:feishu|lark|wenjian|docs)\.[^\s<>\"']+/[^\s<>\"']*",
+            re.IGNORECASE,
+        )
+        # Pattern 3: /doc/ or /file/ path patterns
+        url_pattern_path = re.compile(
+            r"https?://[^\s<>\"']+(?:/doc/|/file/)[^\s<>\"']*",
+            re.IGNORECASE,
+        )
+        return bool(
+            url_pattern_ext.search(raw_content)
+            or url_pattern_domain.search(raw_content)
+            or url_pattern_path.search(raw_content)
+        )
+
+    def _predict_topic(self, text: str) -> tuple[Optional[str], str]:
+        """Predict the topic from text content.
+
+        Returns:
+            Tuple of (topic_key, confidence) where confidence is "HIGH", "MEDIUM", "LOW", or "UNKNOWN"
+        """
+        if not text:
+            return None, "UNKNOWN"
+        normalized = text.lower()
+
+        for topic_key, pattern_data in self._TOPIC_PATTERNS.items():
+            high_conf = pattern_data["high_confidence"]
+            medium_conf = pattern_data["medium_confidence"]
+
+            # Check HIGH confidence first
+            if any(term in normalized for term in high_conf):
+                return topic_key, "HIGH"
+            # Check MEDIUM confidence
+            if any(term in normalized for term in medium_conf):
+                return topic_key, "MEDIUM"
+
+        return None, "UNKNOWN"
 
     async def _handle_message_with_guards(self, event: MessageEvent) -> None:
         """Dispatch a single event through the agent pipeline with per-chat serialization
@@ -2805,20 +3048,18 @@ class FeishuAdapter(BasePlatformAdapter):
         """
         chat_id = getattr(event.source, "chat_id", "") or "" if event.source else ""
         message = getattr(event, "message", None)
-        raw_text = getattr(message, "text", "") or "" if message else ""
 
-        # Theme Material Ingestion Group routing
-        if chat_id == self._THEME_INGESTION_GROUP_ID:
-            normalized = raw_text.lower()
-            kw_triggered = any(kw in normalized for kw in self._THEME_INGESTION_KEYWORDS)
-            mention_triggered = message and self._mentions_self(message)
-            if kw_triggered or mention_triggered:
-                event.auto_skill = "theme-material-ingestion"
-                logger.info(
-                    "[Feishu] Theme material ingestion triggered: "
-                    "chat_id=%s keyword=%s mention=%s",
-                    chat_id, kw_triggered, mention_triggered,
-                )
+        # Theme Material Ingestion Group routing — two-gate system
+        action, trigger_reason, predicted_topic, confidence = self._check_theme_ingestion_trigger(
+            chat_id, message, event
+        )
+        if action:
+            event.auto_skill = self._INGESTION_ACTION_TO_SKILL.get(action)
+            # Store ingestion metadata on the event for the skill to use
+            event.ingestion_action = action
+            event.ingestion_trigger_reason = trigger_reason
+            event.ingestion_predicted_topic = predicted_topic
+            event.ingestion_confidence = confidence
 
         chat_lock = self._get_chat_lock(chat_id)
         async with chat_lock:

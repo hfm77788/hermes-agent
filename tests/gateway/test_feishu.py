@@ -4282,6 +4282,7 @@ class TestFeishuPostMentionsBot(unittest.TestCase):
         adapter._bot_open_id = bot_open_id
         adapter._bot_user_id = bot_user_id
         adapter._bot_name = bot_name
+        adapter._pending_theme_preview = {}
         return adapter
 
     def test_post_mentions_bot_uses_is_self_flag(self):
@@ -4313,6 +4314,7 @@ class TestFeishuExtractMessageContent(unittest.TestCase):
         adapter._bot_user_id = ""
         adapter._bot_name = "Hermes"
         adapter._download_feishu_message_resources = AsyncMock(return_value=([], []))
+        adapter._pending_theme_preview = {}
         return adapter
 
     def test_returns_five_tuple_with_mentions(self):
@@ -4368,6 +4370,7 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         adapter._resolve_source_chat_type = Mock(return_value="group")
         adapter.build_source = Mock(return_value=SimpleNamespace(thread_id=None))
         adapter._dispatch_inbound_event = AsyncMock()
+        adapter._pending_theme_preview = {}
         return adapter
 
     def test_leading_self_mention_stripped_for_command(self):
@@ -4546,6 +4549,7 @@ class TestFeishuFetchMessageText(unittest.TestCase):
         adapter._message_text_cache = {}
         adapter._client = Mock()
         adapter._build_get_message_request = Mock(return_value=object())
+        adapter._pending_theme_preview = {}
         return adapter
 
     def test_fetch_message_text_renders_mentions_without_hint_prefix(self):
@@ -4658,6 +4662,7 @@ class TestFeishuMentionEndToEnd(unittest.TestCase):
         adapter._resolve_source_chat_type = Mock(return_value="group")
         adapter.build_source = Mock(return_value=SimpleNamespace(thread_id=None))
         adapter._dispatch_inbound_event = AsyncMock()
+        adapter._pending_theme_preview = {}
         return adapter
 
     def _run(self, adapter, text, mentions):
@@ -4826,12 +4831,14 @@ class TestFeishuMentionEndToEnd(unittest.TestCase):
 
 
 class TestThemeMaterialIngestionRouting(unittest.TestCase):
-    """Tests for theme material ingestion group routing in _handle_message_with_guards."""
+    """Tests for theme material ingestion group two-gate routing."""
 
     THEME_GROUP_ID = "oc_a19b4f58f14f7bea48a67610eb0bcb33"
     OTHER_GROUP_ID = "oc_99999999999999999999999999999"
 
-    def _build_event(self, chat_id, text="", mentions=None, message_type="text"):
+    def _build_event(
+        self, chat_id, text="", mentions=None, message_type="text", media_refs=None
+    ):
         from gateway.platforms.base import MessageEvent
 
         source = SimpleNamespace(chat_id=chat_id)
@@ -4840,6 +4847,7 @@ class TestThemeMaterialIngestionRouting(unittest.TestCase):
             content=json.dumps({"text": text}) if text else "{}",
             message_type=message_type,
             mentions=mentions or [],
+            media_refs=media_refs or [],
         )
         event = MessageEvent(
             text=text,
@@ -4848,6 +4856,8 @@ class TestThemeMaterialIngestionRouting(unittest.TestCase):
             message_id="m_test",
             raw_message=msg,
         )
+        # _handle_message_with_guards reads event.message for text/content/mentions
+        event.message = msg
         return event
 
     def _build_adapter(self):
@@ -4860,64 +4870,163 @@ class TestThemeMaterialIngestionRouting(unittest.TestCase):
         adapter._require_mention = True
         adapter._chat_locks = {}
         adapter.handle_message = AsyncMock()
+        adapter._pending_theme_preview = {}
         return adapter
 
-    # -----------------------------------------------------------------
-    # 1. Specified group + keyword trigger
-    # -----------------------------------------------------------------
-    def test_keyword_trigger_sets_auto_skill(self):
+    # =========================================================================
+    # Gate 1 — preview_only trigger tests
+    # =========================================================================
+
+    # 1. "你好" → no trigger
+    def test_casual_greeting_no_trigger(self):
         adapter = self._build_adapter()
-        event = self._build_event(self.THEME_GROUP_ID, text="请帮我录入一份新资料")
-        # Ensure event.message has .text for routing code
-        event.message = SimpleNamespace(text="请帮我录入一份新资料")
+        event = self._build_event(self.THEME_GROUP_ID, text="你好")
 
         class FakeLock:
             async def __aenter__(self): pass
             async def __aexit__(self, *args): pass
 
         adapter._get_chat_lock = Mock(return_value=FakeLock())
-
         asyncio.run(adapter._handle_message_with_guards(event))
-
-        self.assertEqual(event.auto_skill, "theme-material-ingestion")
+        self.assertIsNone(getattr(event, "auto_skill", None))
         adapter.handle_message.assert_awaited_once_with(event)
 
-    # -----------------------------------------------------------------
-    # 2. Specified group + @mention trigger (verifies _mentions_self is called)
-    # -----------------------------------------------------------------
-    def test_mention_trigger_sets_auto_skill(self):
-        import unittest.mock
-        from gateway.platforms.feishu import FeishuAdapter  # noqa: F401
+    # 2. "收到" → no trigger
+    def test_casual_acknowledgement_no_trigger(self):
+        adapter = self._build_adapter()
+        event = self._build_event(self.THEME_GROUP_ID, text="收到")
 
+        class FakeLock:
+            async def __aenter__(self): pass
+            async def __aexit__(self, *args): pass
+
+        adapter._get_chat_lock = Mock(return_value=FakeLock())
+        asyncio.run(adapter._handle_message_with_guards(event))
+        self.assertIsNone(getattr(event, "auto_skill", None))
+
+    # 3. attachment → preview_only
+    def test_attachment_triggers_preview(self):
+        adapter = self._build_adapter()
+        event = self._build_event(
+            self.THEME_GROUP_ID, text="", message_type="file"
+        )
+        # Simulate attachment via media_refs
+        event.message.media_refs = [SimpleNamespace(file_key="fk_123", file_name="report.pdf")]
+
+        class FakeLock:
+            async def __aenter__(self): pass
+            async def __aexit__(self, *args): pass
+
+        adapter._get_chat_lock = Mock(return_value=FakeLock())
+        asyncio.run(adapter._handle_message_with_guards(event))
+        self.assertEqual(event.auto_skill, "theme-material-ingestion")
+        self.assertEqual(event.ingestion_action, "preview_only")
+        self.assertEqual(event.ingestion_trigger_reason, "attachment")
+
+    # 4. URL → preview_only
+    def test_document_url_triggers_preview(self):
         adapter = self._build_adapter()
         event = self._build_event(
             self.THEME_GROUP_ID,
-            text="@_user_1 请帮我整理资料",
-            mentions=[],
+            text="请查看这份文档 https://example.feishu.cn/docs/docx_abc123",
         )
-        event.message = SimpleNamespace(text="@_user_1 请帮我整理资料")
 
         class FakeLock:
             async def __aenter__(self): pass
             async def __aexit__(self, *args): pass
 
         adapter._get_chat_lock = Mock(return_value=FakeLock())
-
-        with unittest.mock.patch.object(
-            FeishuAdapter, "_mentions_self", return_value=True
-        ):
-            asyncio.run(adapter._handle_message_with_guards(event))
-
+        asyncio.run(adapter._handle_message_with_guards(event))
         self.assertEqual(event.auto_skill, "theme-material-ingestion")
+        self.assertEqual(event.ingestion_action, "preview_only")
+        self.assertEqual(event.ingestion_trigger_reason, "document_url")
 
-    # -----------------------------------------------------------------
-    # 3. Specified group + attachment trigger (no text, no mention → no trigger)
-    # -----------------------------------------------------------------
-    # -----------------------------------------------------------------
-    def test_attachment_trigger_sets_auto_skill(self):
+    # 5. "请处理这份资料" → preview_only
+    def test_explicit_processing_request_triggers_preview(self):
         adapter = self._build_adapter()
-        # Attachment-only message: text empty, but in a group context
-        event = self._build_event(self.THEME_GROUP_ID, text="", mentions=[])
+        event = self._build_event(
+            self.THEME_GROUP_ID, text="请处理这份资料，有份文档需要录入"
+        )
+
+        class FakeLock:
+            async def __aenter__(self): pass
+            async def __aexit__(self, *args): pass
+
+        adapter._get_chat_lock = Mock(return_value=FakeLock())
+        asyncio.run(adapter._handle_message_with_guards(event))
+        self.assertEqual(event.auto_skill, "theme-material-ingestion")
+        self.assertEqual(event.ingestion_action, "preview_only")
+        self.assertEqual(event.ingestion_trigger_reason, "keyword")
+
+    # =========================================================================
+    # Gate 2 — confirmed_ingestion tests
+    # =========================================================================
+
+    # 6. "确认录入" → confirmed_ingestion
+    def test_confirm_keyword_triggers_ingestion(self):
+        adapter = self._build_adapter()
+        # Set pending preview flag to simulate prior preview_only
+        adapter._pending_theme_preview[self.THEME_GROUP_ID] = True
+        event = self._build_event(self.THEME_GROUP_ID, text="确认录入这份资料")
+
+        class FakeLock:
+            async def __aenter__(self): pass
+            async def __aexit__(self, *args): pass
+
+        adapter._get_chat_lock = Mock(return_value=FakeLock())
+        asyncio.run(adapter._handle_message_with_guards(event))
+        self.assertEqual(event.auto_skill, "theme-material-ingestion")
+        self.assertEqual(event.ingestion_action, "confirmed_ingestion")
+        self.assertEqual(event.ingestion_trigger_reason, "confirm_keyword")
+
+    def test_confirm_enter_processing_triggers_ingestion(self):
+        adapter = self._build_adapter()
+        # Set pending preview flag to simulate prior preview_only
+        adapter._pending_theme_preview[self.THEME_GROUP_ID] = True
+        event = self._build_event(self.THEME_GROUP_ID, text="进入处理流程")
+
+        class FakeLock:
+            async def __aenter__(self): pass
+            async def __aexit__(self, *args): pass
+
+        adapter._get_chat_lock = Mock(return_value=FakeLock())
+        asyncio.run(adapter._handle_message_with_guards(event))
+        self.assertEqual(event.ingestion_action, "confirmed_ingestion")
+
+    def test_confirm_generate_candidate_triggers_ingestion(self):
+        adapter = self._build_adapter()
+        # Set pending preview flag to simulate prior preview_only
+        adapter._pending_theme_preview[self.THEME_GROUP_ID] = True
+        event = self._build_event(self.THEME_GROUP_ID, text="生成候选 source")
+
+        class FakeLock:
+            async def __aenter__(self): pass
+            async def __aexit__(self, *args): pass
+
+        adapter._get_chat_lock = Mock(return_value=FakeLock())
+        asyncio.run(adapter._handle_message_with_guards(event))
+        self.assertEqual(event.ingestion_action, "confirmed_ingestion")
+
+    # Guard tests for pending preview
+    def test_confirm_keyword_without_preview_returns_none(self):
+        """Without a prior preview_only, confirmed_ingestion must not fire."""
+        adapter = self._build_adapter()
+        # No preview triggered first — directly send "确认录入"
+        event = self._build_event(self.THEME_GROUP_ID, text="确认录入")
+
+        class FakeLock:
+            async def __aenter__(self): pass
+            async def __aexit__(self, *args): pass
+
+        adapter._get_chat_lock = Mock(return_value=FakeLock())
+        asyncio.run(adapter._handle_message_with_guards(event))
+        # Must NOT trigger — no prior preview_only for this chat_id
+        # Check auto_skill is None (ingestion_action is only set when action is not None)
+        self.assertIsNone(event.auto_skill)
+
+    def test_confirm_keyword_after_preview_triggers_ingestion(self):
+        """After a preview_only, confirmed_ingestion must fire."""
+        adapter = self._build_adapter()
 
         class FakeLock:
             async def __aenter__(self): pass
@@ -4925,59 +5034,197 @@ class TestThemeMaterialIngestionRouting(unittest.TestCase):
 
         adapter._get_chat_lock = Mock(return_value=FakeLock())
 
-        # Without keyword or mention, should NOT trigger
-        asyncio.run(adapter._handle_message_with_guards(event))
-        self.assertIsNone(getattr(event, "auto_skill", None))
+        # Step 1: trigger preview_only with an attachment
+        preview_event = self._build_event(
+            self.THEME_GROUP_ID,
+            text="请处理这份资料",
+            message_type="file",
+        )
+        asyncio.run(adapter._handle_message_with_guards(preview_event))
+        self.assertEqual(preview_event.ingestion_action, "preview_only")
+        self.assertTrue(
+            adapter._pending_theme_preview.get(self.THEME_GROUP_ID, False),
+            "preview_only should set pending flag",
+        )
 
-    # -----------------------------------------------------------------
-    # 4. Non-specified group does NOT trigger
-    # -----------------------------------------------------------------
-    def test_other_group_does_not_trigger(self):
+        # Step 2: send "确认录入" — should now trigger confirmed_ingestion
+        confirm_event = self._build_event(self.THEME_GROUP_ID, text="确认录入")
+        asyncio.run(adapter._handle_message_with_guards(confirm_event))
+        self.assertEqual(confirm_event.ingestion_action, "confirmed_ingestion")
+        self.assertFalse(
+            adapter._pending_theme_preview.get(self.THEME_GROUP_ID, False),
+            "confirmed_ingestion should consume the pending flag",
+        )
+
+    # =========================================================================
+    # Topic prediction tests
+    # =========================================================================
+
+    # 7. AILD text → competition_aild
+    def test_aild_topic_prediction(self):
         adapter = self._build_adapter()
-        event = self._build_event(self.OTHER_GROUP_ID, text="请帮我录入资料")
+        topic, confidence = adapter._predict_topic(
+            "这是AILD智能设计大赛的参赛资料，请帮我录入"
+        )
+        self.assertEqual(topic, "competition_aild")
+        self.assertEqual(confidence, "HIGH")
+
+    def test_aild_domain_topic_prediction(self):
+        adapter = self._build_adapter()
+        topic, confidence = adapter._predict_topic(
+            "请入库这份文档，来源是 aild.caa.org.cn"
+        )
+        self.assertEqual(topic, "competition_aild")
+        self.assertEqual(confidence, "HIGH")
+
+    # 8. 应急安全 text → competition_emergency_safety
+    def test_emergency_safety_topic_prediction(self):
+        adapter = self._build_adapter()
+        topic, confidence = adapter._predict_topic(
+            "这是全国青少年应急与安全科普创新大赛的资料"
+        )
+        self.assertEqual(topic, "competition_emergency_safety")
+        self.assertEqual(confidence, "HIGH")
+
+    def test_emergency_safety_short_keyword_prediction(self):
+        adapter = self._build_adapter()
+        topic, confidence = adapter._predict_topic(
+            "应急安全科普活动资料入库"
+        )
+        self.assertEqual(topic, "competition_emergency_safety")
+        self.assertEqual(confidence, "HIGH")
+
+    # 9. 创青春 text → chuangqingchun
+    def test_chuangqingchun_topic_prediction(self):
+        adapter = self._build_adapter()
+        topic, confidence = adapter._predict_topic(
+            "创青春大赛创业计划书，请帮忙整理"
+        )
+        self.assertEqual(topic, "chuangqingchun")
+        self.assertEqual(confidence, "HIGH")
+
+    def test_chuangqingchun_zhongyin_topic_prediction(self):
+        adapter = self._build_adapter()
+        topic, confidence = adapter._predict_topic(
+            "中银杯创青春大赛通知文件"
+        )
+        self.assertEqual(topic, "chuangqingchun")
+        self.assertEqual(confidence, "HIGH")
+
+    # 10. unknown → just ask, no wiki write
+    def test_unknown_topic_prediction(self):
+        adapter = self._build_adapter()
+        topic, confidence = adapter._predict_topic(
+            "这是一份普通的会议纪要"
+        )
+        self.assertIsNone(topic)
+        self.assertEqual(confidence, "UNKNOWN")
+
+    def test_empty_text_unknown(self):
+        adapter = self._build_adapter()
+        topic, confidence = adapter._predict_topic("")
+        self.assertIsNone(topic)
+        self.assertEqual(confidence, "UNKNOWN")
+
+    # =========================================================================
+    # Non-theme-group tests
+    # =========================================================================
+
+    def test_other_group_no_trigger(self):
+        adapter = self._build_adapter()
+        event = self._build_event(
+            self.OTHER_GROUP_ID, text="请帮我录入资料"
+        )
 
         class FakeLock:
             async def __aenter__(self): pass
             async def __aexit__(self, *args): pass
 
         adapter._get_chat_lock = Mock(return_value=FakeLock())
-
         asyncio.run(adapter._handle_message_with_guards(event))
-
         self.assertIsNone(getattr(event, "auto_skill", None))
-        adapter.handle_message.assert_awaited_once_with(event)
 
-    # -----------------------------------------------------------------
-    # 5. Existing path mapping constants present
-    # -----------------------------------------------------------------
-    def test_existing_paths_defined(self):
+    # =========================================================================
+    # Helper / utility tests
+    # =========================================================================
+
+    def test_confirm_keywords_defined(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        expected = frozenset({
+            "确认录入", "可以录入", "进入处理", "开始处理", "确认入库", "生成候选 source",
+        })
+        self.assertEqual(FeishuAdapter._CONFIRM_KEYWORDS, expected)
+
+    def test_preview_only_keywords_defined(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        expected = frozenset({
+            "录入", "入库", "归档", "整理资料", "转 markdown", "请处理这份资料", "资料录入测试",
+        })
+        self.assertEqual(FeishuAdapter._PREVIEW_ONLY_TRIGGER_KEYWORDS, expected)
+
+    def test_topic_patterns_defined(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        patterns = FeishuAdapter._TOPIC_PATTERNS
+        self.assertIn("competition_aild", patterns)
+        self.assertIn("competition_emergency_safety", patterns)
+        self.assertIn("chuangqingchun", patterns)
+        # HIGH confidence patterns exist
+        self.assertTrue(len(patterns["competition_aild"]["high_confidence"]) > 0)
+        self.assertTrue(len(patterns["competition_emergency_safety"]["high_confidence"]) > 0)
+        self.assertTrue(len(patterns["chuangqingchun"]["high_confidence"]) > 0)
+
+    def test_has_document_url_true_for_pdf_link(self):
+        adapter = self._build_adapter()
+        event = self._build_event(
+            self.THEME_GROUP_ID,
+            text="",
+        )
+        event.message.content = json.dumps(
+            {"text": "请看 https://example.com/doc.pdf"}
+        )
+        self.assertTrue(adapter._has_document_url(event))
+
+    def test_has_document_url_true_for_feishu_doc(self):
+        adapter = self._build_adapter()
+        event = self._build_event(
+            self.THEME_GROUP_ID,
+            text="",
+        )
+        event.message.content = json.dumps(
+            {"text": "链接 https://feishu.cn/docs/doc_abc123"}
+        )
+        self.assertTrue(adapter._has_document_url(event))
+
+    def test_has_document_url_false_for_plain_text(self):
+        adapter = self._build_adapter()
+        event = self._build_event(
+            self.THEME_GROUP_ID,
+            text="你好，请帮我处理资料",
+        )
+        self.assertFalse(adapter._has_document_url(event))
+
+    def test_has_attachments_true_for_media_refs(self):
+        adapter = self._build_adapter()
+        event = self._build_event(self.THEME_GROUP_ID, text="")
+        event.message.media_refs = [SimpleNamespace(file_key="fk_1")]
+        self.assertTrue(adapter._has_attachments(event))
+
+    def test_has_attachments_false_for_text_only(self):
+        adapter = self._build_adapter()
+        event = self._build_event(self.THEME_GROUP_ID, text="你好")
+        self.assertFalse(adapter._has_attachments(event))
+
+    def test_ingestion_action_to_skill_mapping(self):
         from gateway.platforms.feishu import FeishuAdapter
 
         self.assertEqual(
-            FeishuAdapter._THEME_INGESTION_TOPIC_EXISTING_PATHS["competition_aild"],
-            "projects/competition-consulting-qa/aild/",
+            FeishuAdapter._INGESTION_ACTION_TO_SKILL["preview_only"],
+            "theme-material-ingestion",
         )
         self.assertEqual(
-            FeishuAdapter._THEME_INGESTION_TOPIC_EXISTING_PATHS["competition_emergency_safety"],
-            "projects/competition-consulting-qa/emergency-safety/",
-        )
-        self.assertIsNone(
-            FeishuAdapter._THEME_INGESTION_TOPIC_EXISTING_PATHS["chuangqingchun"],
-        )
-        self.assertEqual(
-            FeishuAdapter._THEME_INGESTION_DUPLICATE_POLICY,
-            "reuse_existing",
-        )
-
-    # -----------------------------------------------------------------
-    # 6. All trigger keywords defined
-    # -----------------------------------------------------------------
-    def test_trigger_keywords_defined(self):
-        from gateway.platforms.feishu import FeishuAdapter
-
-        expected_kw = {"录入", "入库", "归档", "转 markdown", "整理资料", "新资料"}
-        self.assertEqual(FeishuAdapter._THEME_INGESTION_KEYWORDS, expected_kw)
-        self.assertEqual(
-            FeishuAdapter._THEME_INGESTION_GROUP_ID,
-            "oc_a19b4f58f14f7bea48a67610eb0bcb33",
+            FeishuAdapter._INGESTION_ACTION_TO_SKILL["confirmed_ingestion"],
+            "theme-material-ingestion",
         )
