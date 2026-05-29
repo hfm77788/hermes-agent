@@ -3010,10 +3010,16 @@ class FeishuAdapter(BasePlatformAdapter):
             r"https?://[^\s<>\"']+(?:/doc/|/file/)[^\s<>\"']*",
             re.IGNORECASE,
         )
+        # Pattern 4: WeChat article URLs (mp.weixin.qq.com)
+        url_pattern_wechat = re.compile(
+            r"https?://(?:www\.)?mp\.weixin\.qq\.com/s[/?]",
+            re.IGNORECASE,
+        )
         return bool(
             url_pattern_ext.search(raw_content)
             or url_pattern_domain.search(raw_content)
             or url_pattern_path.search(raw_content)
+            or url_pattern_wechat.search(raw_content)
         )
 
     def _predict_topic(self, text: str) -> tuple[Optional[str], str]:
