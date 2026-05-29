@@ -1801,11 +1801,6 @@ def run_doctor(args):
                 check_warn(item["name"], f"(missing {vars_str})")
             else:
                 check_warn(item["name"], "(system dependency not met)")
-
-        # Count disabled tools with API key requirements
-        api_disabled = [u for u in unavailable if (u.get("missing_vars") or u.get("env_vars"))]
-        if api_disabled:
-            issues.append("Run 'hermes setup' to configure missing API keys for full tool access")
     except Exception as e:
         check_warn("Could not check tool availability", f"({e})")
     
