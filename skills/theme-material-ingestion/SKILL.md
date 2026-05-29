@@ -1,67 +1,87 @@
 ---
-description: Automatically process theme materials submitted to the theme material ingestion group (oc_a19b4f58f14f7bea48a67610eb0bcb33). Receives, classifies, and stages materials for review.
+description: Automatically process theme materials submitted to the theme material ingestion group (oc_a19b4f58f14f7bea48a67610eb0bcb33). Two-gate workflow: preview on trigger match, confirmed ingestion on explicit user confirmation.
 ---
 
 # Theme Material Ingestion Skill
 
 You are processing messages from the **主题资料录入群** (Theme Material Ingestion Group).
 
-## Your Task
-When a message arrives in this group and meets the trigger conditions, you must:
+## Two-Gate Workflow
 
-1. **Identify the message source** - Record chat_id, sender name, message_id, and timestamp
-2. **Extract content** - Handle text, links, images, and documents appropriately
-3. **Classify the topic** - Match against known themes with confidence level
-4. **Stage the material** - Write to staging directory, never directly to main wiki
-5. **Respond in group** - Confirm receipt or ask clarifying questions
+### Gate 1 — preview_only (auto on trigger match)
+When a message arrives and meets trigger conditions, the gateway already sets:
+- `event.ingestion_action = "preview_only"`
+- `event.ingestion_trigger_reason` (e.g., "attachment", "keyword", "document_url", "mention_request")
+- `event.ingestion_predicted_topic` (e.g., "competition_aild", "competition_emergency_safety", "chuangqingchun", None)
+- `event.ingestion_confidence` ("HIGH", "MEDIUM", "LOW", "UNKNOWN")
 
-## Trigger Conditions
-A message triggers this workflow when it:
-- Is from chat_id `oc_a19b4f58f14f7bea48a67610eb0bcb33`
-- AND contains `@` mention of the bot **OR** trigger keywords **OR** attachments
+**Your job at this stage**: Reply in the group with a preview message. Do NOT write files yet.
 
-**Trigger Keywords**: `录入`, `入库`, `归档`, `转 Markdown`, `整理资料`, `新资料`
+### Gate 2 — confirmed_ingestion (on user confirmation)
+Only when user replies with one of: **确认录入**, **可以录入**, **进入处理**, **开始处理**, **确认入库**, **生成候选 source**
 
-## Existing Path Mapping
+Only then:
+1. Convert to Markdown
+2. write_file to `projects/_staging/materials/...`
+3. Generate `candidate_source.md`
+4. Generate `ingestion_report.md`
 
-| topic | existing_path | duplicate_policy |
-|-------|-------------|-----------------|
-| `competition_aild` | `projects/competition-consulting-qa/aild/` | reuse_existing |
-| `competition_emergency_safety` | `projects/competition-consulting-qa/emergency-safety/` | reuse_existing |
-| `chuangqingchun` | `TODO: confirm path` | reuse_existing |
-| `unknown` | N/A (requires human confirmation) | N/A |
+## Trigger Conditions (handled by gateway — for reference only)
+A message triggers `preview_only` when it is from chat_id `oc_a19b4f58f14f7bea48a67610eb0bcb33` AND contains:
+- **Attachments**: images, PDF, Word, Excel, PPT, zip
+- **Document URLs**: links to feishu docs, PDF/doc/xls/ppt links
+- **Trigger keywords**: 录入, 入库, 归档, 整理资料, 转 markdown, 请处理这份资料, 资料录入测试
+- **@mention + explicit processing request** (录入/入库/处理/整理/归档/转 markdown)
 
-**Duplicate policy**: `reuse_existing` — do NOT create new directories; reuse the existing path for each known topic.
+**Do NOT trigger for**: 你好, 收到, 谢谢, 在吗, OK, 好的, 嗯, 好
 
-## Built-in Topic Definitions
+## Preview Message Template (Gate 1)
+When you receive `preview_only`, reply in the group with:
 
-### 1. `competition_aild`
-- **Name**: AILD 智能设计大赛
-- **HIGH confidence**: `AILD`, `aild.caa.org.cn`, `智能设计大赛`
-- **MEDIUM confidence**: `aild`
-- **Existing path**: `projects/competition-consulting-qa/aild/`
+```
+已检测到一份可能需要录入的资料。
+初步判断：
+- 资料类型：<文件/链接/文本/图片/未知>
+- 可能主题：<AILD / 应急安全 / 创青春 / 未确定>
+- 建议暂存位置：<projects/_staging/materials/...>
+- 后续可能归入：<既有专区路径或待确认>
+- 风险提示：<来源不明/需核验/含个人信息/无>
+请确认是否进入资料处理流程：
+回复"确认录入"后，我再转 Markdown、生成候选 source，并等待侯方明审核。
+```
 
-### 2. `competition_emergency_safety`
-- **Name**: 全国青少年应急与安全科普创新大赛
-- **HIGH confidence**: `nyseic.cn`, `全国青少年应急与安全科普创新大赛`, `应急安全`
-- **MEDIUM confidence**: `应急与安全`
-- **Existing path**: `projects/competition-consulting-qa/emergency-safety/`
+## Topic Prediction
 
-### 3. `chuangqingchun`
-- **Name**: 创青春大赛
-- **HIGH confidence**: `创青春`, `中银杯`
-- **MEDIUM confidence**: `创业大赛`, `中国青年创青春`, `天津青年创青春`
-- **Existing path**: `TODO: confirm path`
+| topic_key | Name | Existing Path | Duplicate Policy |
+|-----------|------|---------------|-----------------|
+| `competition_aild` | AILD 智能设计大赛 | `projects/competition-consulting-qa/aild/` | reuse_existing |
+| `competition_emergency_safety` | 全国青少年应急与安全科普创新大赛 | `projects/competition-consulting-qa/emergency-safety/` | reuse_existing |
+| `chuangqingchun` | 创青春大赛 | `待确认` | require_user_confirmation |
+| `unknown` | N/A | N/A — requires human confirmation | N/A |
 
-### 4. `unknown`
-- Cannot determine topic → requires user confirmation before staging
-- **Never** write directly to official wiki for `unknown` topics
+## Topic Confidence Patterns
 
-## Confidence Levels
-- **HIGH**: Explicit match on topic name or official domain
-- **MEDIUM**: Multiple weak keyword matches
-- **LOW**: Only generic terms (competition, notification, plan, etc.)
-- **UNKNOWN**: No match possible → ask for clarification
+### `competition_aild`
+- **HIGH**: `AILD`, `aild.caa.org.cn`, `智能设计大赛`
+- **MEDIUM**: `aild`
+
+### `competition_emergency_safety`
+- **HIGH**: `nyseic.cn`, `全国青少年应急与安全科普创新大赛`, `应急安全`
+- **MEDIUM**: `应急与安全`
+
+### `chuangqingchun`
+- **HIGH**: `创青春`, `中银杯`
+- **MEDIUM**: `创业大赛`, `中国青年创青春`, `天津青年创青春`
+
+## Staging Directory Structure
+```
+projects/_staging/materials/<topic>/<timestamp>_<sender>_<message_id>/
+├── manifest.md          # List of all received items
+├── original/           # Original files (images, PDFs, Word docs)
+├── converted/          # Converted Markdown
+├── candidate_source.md # Generated candidate source metadata
+└── ingestion_report.md # Processing report
+```
 
 ## Step-by-Step Processing
 
@@ -71,51 +91,35 @@ A message triggers this workflow when it:
 - message_id: <from event>
 - sender: <from event>
 - timestamp: <from event>
-- has_attachment: true/false
-- text_content: <raw text or "" >
+- has_attachment: <from event metadata>
+- ingestion_action: "preview_only" or "confirmed_ingestion"
+- ingestion_trigger_reason: <from event>
+- ingestion_predicted_topic: <from event>
+- ingestion_confidence: <from event>
 ```
 
-### Step 2: Classify Topic
-Check text against each topic's keywords in order:
-1. Try HIGH confidence matches first
-2. Fall back to MEDIUM confidence
-3. If no match → `unknown`
+### Step 2a: If `preview_only` — Send Preview
+- Identify material type from attachment presence, URL presence, or text content
+- Predict topic using `ingestion_predicted_topic`
+- Build staging path suggestion: `projects/_staging/materials/<topic>/`
+- Reply with the preview template above
 
-### Step 3: Stage Material
-- Stage to: `projects/_staging/materials/<topic>/<timestamp>_<sender>_<message_id>/`
-- Never write directly to `projects/competition-consulting-qa/*/official/`
-- Create a `manifest.md` inside the staging dir listing all received files
+### Step 2b: If `confirmed_ingestion` — Execute Full Pipeline
+1. **Convert content** — If attachment (PDF/Word/Excel/PPT), download and convert to Markdown
+2. **Write staging files** — write_file to `projects/_staging/materials/<topic>/...`
+3. **Generate `candidate_source.md`** with metadata (source chat, sender, timestamp, topic, confidence, file list)
+4. **Generate `ingestion_report.md`** with processing summary
+5. Reply in group confirming ingestion with staging path
 
-### Step 4: Respond in Group
-**For known topics (HIGH/MEDIUM confidence)**:
-```
-已收到资料，主题：[topic_name]
-资料已暂存至待审区，请等待人工审核后入库。
-```
-
-**For `unknown`**:
-```
-您好，系统无法自动识别此资料主题。
-请确认资料属于哪个主题（AILD / 应急安全 / 创青春），或联系管理员确认后再录入。
-```
-
-**For attachments** (images/PDF/Word):
-```
-已收到附件，正在处理中...
-```
-→ Download and stage to the same staging directory.
-
-## Staging Directory Structure
-```
-projects/_staging/materials/<topic>/<timestamp>_<sender>_<message_id>/
-├── manifest.md          # List of all received items
-├── original/           # Original files (images, PDFs, Word docs)
-└── converted/          # Converted Markdown (if applicable)
-```
+### Step 3: For `unknown` topics
+- Do NOT write to wiki
+- Ask user to confirm topic before staging
+- For `chuangqingchun` until path confirmed, always ask
 
 ## Rules
 1. **Never write directly to official wiki** (`projects/competition-consulting-qa/*/official/`)
 2. **Always stage first** → GPT/人工审核 → 才能 move to official
 3. **For `unknown` topics**: always ask in group, never guess
-4. **For `chuangqingchun`**: flag as needing path confirmation until `existing_path` is set
-5. **Duplicate files**: `duplicate_policy: reuse_existing` — do not overwrite; append with timestamp suffix if needed
+4. **For `chuangqingchun`**: flag as needing path confirmation
+5. **Duplicate files**: `duplicate_policy: reuse_existing` — do not overwrite
+6. **Logging**: Never print raw_text. Only log: chat_id, message_id, has_attachment, has_url, trigger_reason, predicted_topic, confidence, action
