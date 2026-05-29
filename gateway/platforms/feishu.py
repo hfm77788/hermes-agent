@@ -1433,6 +1433,75 @@ def _competition_keyword_matches(text: str) -> str | None:
             return kw
     return None
 
+
+# Theme material ingestion skill routing
+# Group where colleagues submit theme-related materials for automatic ingestion
+_FEISHU_THEME_MATERIAL_INGESTION_GROUP_ID = os.getenv(
+    "FEISHU_THEME_MATERIAL_INGESTION_GROUP_ID",
+    "oc_a19b4f58f14f7bea48a67610eb0bcb33",
+)
+_FEISHU_THEME_MATERIAL_TRIGGER_KEYWORDS = (
+    "录入",
+    "入库",
+    "归档",
+    "转 Markdown",
+    "整理资料",
+    "新资料",
+)
+
+# Topic definitions for theme material ingestion
+_FEISHU_THEME_TOPICS = {
+    "competition_aild": {
+        "name": "AILD 智能设计大赛",
+        "high_confidence": ("AILD", "aild.caa.org.cn", "智能设计大赛"),
+        "medium_confidence": ("aild",),
+    },
+    "competition_emergency_safety": {
+        "name": "全国青少年应急与安全科普创新大赛",
+        "high_confidence": ("nyseic.cn", "全国青少年应急与安全科普创新大赛", "应急安全"),
+        "medium_confidence": ("应急与安全",),
+    },
+    "chuangqingchun": {
+        "name": "创青春大赛",
+        "high_confidence": ("创青春", "中银杯"),
+        "medium_confidence": ("创业大赛", "中国青年创青春", "天津青年创青春"),
+    },
+}
+
+
+def _theme_material_ingestion_keyword_matches(text: str) -> str | None:
+    """Return the first matched trigger keyword or None."""
+    if not text:
+        return None
+    for kw in _FEISHU_THEME_MATERIAL_TRIGGER_KEYWORDS:
+        if kw in text:
+            return kw
+    return None
+
+
+def _should_route_to_theme_material_ingestion(
+    chat_id: str,
+    text: str,
+    has_attachments: bool,
+    is_mentioned: bool,
+) -> bool:
+    """Determine if message should route to theme material ingestion skill.
+
+    Returns True if:
+    - chat_id matches the theme material ingestion group, AND
+    - (message @mentions the bot OR contains trigger keywords OR has attachments)
+    """
+    if chat_id != _FEISHU_THEME_MATERIAL_INGESTION_GROUP_ID:
+        return False
+    if is_mentioned:
+        return True
+    if _theme_material_ingestion_keyword_matches(text):
+        return True
+    if has_attachments:
+        return True
+    return False
+
+
 class FeishuAdapter(BasePlatformAdapter):
     """Feishu/Lark bot adapter."""
 
@@ -2904,6 +2973,22 @@ class FeishuAdapter(BasePlatformAdapter):
                     chat_id,
                     text[:80],
                 )
+
+        # Theme material ingestion skill routing
+        # Route to theme-material-ingestion skill when:
+        # - chat_id matches the theme material ingestion group, AND
+        # - message @mentions bot OR contains trigger keywords OR has attachments
+        has_attachments = bool(getattr(event, "media_urls", None))
+        is_mentioned = False  # Simplified: trigger on keywords/attachments for now
+        if _should_route_to_theme_material_ingestion(chat_id, text, has_attachments, is_mentioned):
+            event.auto_skill = "theme-material-ingestion"
+            logger.info(
+                "[Feishu] Theme material ingestion routing triggered: chat_id=%s "
+                "text_preview=%r has_attachments=%s",
+                chat_id,
+                text[:80] if text else "",
+                has_attachments,
+            )
 
         chat_lock = self._get_chat_lock(chat_id)
         async with chat_lock:
