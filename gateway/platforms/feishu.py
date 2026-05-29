@@ -1405,8 +1405,12 @@ def check_feishu_requirements() -> bool:
 
 
 # Competition consulting skill routing
-_FEISHU_COMPETITION_GROUP_ID = "oc_23fcf4738957cae42defd61410f26c15"
-_FEISHU_COMPETITION_KEYWORDS = frozenset({
+# Raymond private deployment: group ID configurable via env var
+_FEISHU_COMPETITION_GROUP_ID = os.getenv(
+    "FEISHU_COMPETITION_CONSULTING_GROUP_ID",
+    "oc_23fcf4738957cae42defd61410f26c15",
+)
+_FEISHU_COMPETITION_KEYWORDS = (
     "aild",
     "智能设计大赛",
     "应急与安全科普创新大赛",
@@ -1417,7 +1421,7 @@ _FEISHU_COMPETITION_KEYWORDS = frozenset({
     "赛项",
     "证书",
     "家长咨询",
-})
+)
 
 def _competition_keyword_matches(text: str) -> str | None:
     """Return the first matched keyword or None."""
