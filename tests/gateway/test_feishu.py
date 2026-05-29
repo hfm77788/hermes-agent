@@ -4282,6 +4282,7 @@ class TestFeishuPostMentionsBot(unittest.TestCase):
         adapter._bot_open_id = bot_open_id
         adapter._bot_user_id = bot_user_id
         adapter._bot_name = bot_name
+        adapter._pending_theme_preview = {}
         return adapter
 
     def test_post_mentions_bot_uses_is_self_flag(self):
@@ -4313,6 +4314,7 @@ class TestFeishuExtractMessageContent(unittest.TestCase):
         adapter._bot_user_id = ""
         adapter._bot_name = "Hermes"
         adapter._download_feishu_message_resources = AsyncMock(return_value=([], []))
+        adapter._pending_theme_preview = {}
         return adapter
 
     def test_returns_five_tuple_with_mentions(self):
@@ -4368,6 +4370,7 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         adapter._resolve_source_chat_type = Mock(return_value="group")
         adapter.build_source = Mock(return_value=SimpleNamespace(thread_id=None))
         adapter._dispatch_inbound_event = AsyncMock()
+        adapter._pending_theme_preview = {}
         return adapter
 
     def test_leading_self_mention_stripped_for_command(self):
@@ -4546,6 +4549,7 @@ class TestFeishuFetchMessageText(unittest.TestCase):
         adapter._message_text_cache = {}
         adapter._client = Mock()
         adapter._build_get_message_request = Mock(return_value=object())
+        adapter._pending_theme_preview = {}
         return adapter
 
     def test_fetch_message_text_renders_mentions_without_hint_prefix(self):
@@ -4658,6 +4662,7 @@ class TestFeishuMentionEndToEnd(unittest.TestCase):
         adapter._resolve_source_chat_type = Mock(return_value="group")
         adapter.build_source = Mock(return_value=SimpleNamespace(thread_id=None))
         adapter._dispatch_inbound_event = AsyncMock()
+        adapter._pending_theme_preview = {}
         return adapter
 
     def _run(self, adapter, text, mentions):
@@ -4865,6 +4870,7 @@ class TestThemeMaterialIngestionRouting(unittest.TestCase):
         adapter._require_mention = True
         adapter._chat_locks = {}
         adapter.handle_message = AsyncMock()
+        adapter._pending_theme_preview = {}
         return adapter
 
     # =========================================================================
@@ -4959,6 +4965,8 @@ class TestThemeMaterialIngestionRouting(unittest.TestCase):
     # 6. "确认录入" → confirmed_ingestion
     def test_confirm_keyword_triggers_ingestion(self):
         adapter = self._build_adapter()
+        # Set pending preview flag to simulate prior preview_only
+        adapter._pending_theme_preview[self.THEME_GROUP_ID] = True
         event = self._build_event(self.THEME_GROUP_ID, text="确认录入这份资料")
 
         class FakeLock:
@@ -4973,6 +4981,8 @@ class TestThemeMaterialIngestionRouting(unittest.TestCase):
 
     def test_confirm_enter_processing_triggers_ingestion(self):
         adapter = self._build_adapter()
+        # Set pending preview flag to simulate prior preview_only
+        adapter._pending_theme_preview[self.THEME_GROUP_ID] = True
         event = self._build_event(self.THEME_GROUP_ID, text="进入处理流程")
 
         class FakeLock:
@@ -4985,6 +4995,8 @@ class TestThemeMaterialIngestionRouting(unittest.TestCase):
 
     def test_confirm_generate_candidate_triggers_ingestion(self):
         adapter = self._build_adapter()
+        # Set pending preview flag to simulate prior preview_only
+        adapter._pending_theme_preview[self.THEME_GROUP_ID] = True
         event = self._build_event(self.THEME_GROUP_ID, text="生成候选 source")
 
         class FakeLock:
@@ -4994,6 +5006,55 @@ class TestThemeMaterialIngestionRouting(unittest.TestCase):
         adapter._get_chat_lock = Mock(return_value=FakeLock())
         asyncio.run(adapter._handle_message_with_guards(event))
         self.assertEqual(event.ingestion_action, "confirmed_ingestion")
+
+    # Guard tests for pending preview
+    def test_confirm_keyword_without_preview_returns_none(self):
+        """Without a prior preview_only, confirmed_ingestion must not fire."""
+        adapter = self._build_adapter()
+        # No preview triggered first — directly send "确认录入"
+        event = self._build_event(self.THEME_GROUP_ID, text="确认录入")
+
+        class FakeLock:
+            async def __aenter__(self): pass
+            async def __aexit__(self, *args): pass
+
+        adapter._get_chat_lock = Mock(return_value=FakeLock())
+        asyncio.run(adapter._handle_message_with_guards(event))
+        # Must NOT trigger — no prior preview_only for this chat_id
+        # Check auto_skill is None (ingestion_action is only set when action is not None)
+        self.assertIsNone(event.auto_skill)
+
+    def test_confirm_keyword_after_preview_triggers_ingestion(self):
+        """After a preview_only, confirmed_ingestion must fire."""
+        adapter = self._build_adapter()
+
+        class FakeLock:
+            async def __aenter__(self): pass
+            async def __aexit__(self, *args): pass
+
+        adapter._get_chat_lock = Mock(return_value=FakeLock())
+
+        # Step 1: trigger preview_only with an attachment
+        preview_event = self._build_event(
+            self.THEME_GROUP_ID,
+            text="请处理这份资料",
+            message_type="file",
+        )
+        asyncio.run(adapter._handle_message_with_guards(preview_event))
+        self.assertEqual(preview_event.ingestion_action, "preview_only")
+        self.assertTrue(
+            adapter._pending_theme_preview.get(self.THEME_GROUP_ID, False),
+            "preview_only should set pending flag",
+        )
+
+        # Step 2: send "确认录入" — should now trigger confirmed_ingestion
+        confirm_event = self._build_event(self.THEME_GROUP_ID, text="确认录入")
+        asyncio.run(adapter._handle_message_with_guards(confirm_event))
+        self.assertEqual(confirm_event.ingestion_action, "confirmed_ingestion")
+        self.assertFalse(
+            adapter._pending_theme_preview.get(self.THEME_GROUP_ID, False),
+            "confirmed_ingestion should consume the pending flag",
+        )
 
     # =========================================================================
     # Topic prediction tests

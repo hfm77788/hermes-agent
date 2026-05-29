@@ -1467,6 +1467,10 @@ class FeishuAdapter(BasePlatformAdapter):
         # Feishu reaction deletion requires the opaque reaction_id returned
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
+        # Per-chat flag: True when a preview_only has been triggered and
+        # confirmed_ingestion is still pending for the same chat_id.
+        # Guards against confirmed_ingestion firing without a preceding preview.
+        self._pending_theme_preview: Dict[str, bool] = {}
         self._load_seen_message_ids()
 
     @staticmethod
@@ -2844,6 +2848,19 @@ class FeishuAdapter(BasePlatformAdapter):
 
         # Check for confirmation keywords first (Gate 2)
         if any(kw in normalized for kw in self._CONFIRM_KEYWORDS):
+            # Guard: confirmed_ingestion only valid if a preview_only was triggered
+            # for this chat_id in the same session. Without a prior preview,
+            # silently fall through to no-action.
+            if not self._pending_theme_preview.get(chat_id, False):
+                logger.info(
+                    "[Feishu] Theme material ingestion confirm ignored (no pending preview): "
+                    "chat_id=%s message_id=%s",
+                    chat_id,
+                    event.message_id,
+                )
+                return None, None, None, None
+            # Consume the pending flag — this confirmed_ingestion is now terminal
+            self._pending_theme_preview[chat_id] = False
             logger.info(
                 "[Feishu] Theme material ingestion confirmed: "
                 "chat_id=%s message_id=%s has_attachment=%s has_url=%s trigger_reason=confirm_keyword "
@@ -2864,6 +2881,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         # Attachment triggers
         if has_attachment:
+            self._pending_theme_preview[chat_id] = True
             topic, confidence = self._predict_topic(raw_text)
             logger.info(
                 "[Feishu] Theme material ingestion preview: "
@@ -2881,6 +2899,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         # URL triggers
         if has_url:
+            self._pending_theme_preview[chat_id] = True
             topic, confidence = self._predict_topic(raw_text)
             logger.info(
                 "[Feishu] Theme material ingestion preview: "
@@ -2903,6 +2922,7 @@ class FeishuAdapter(BasePlatformAdapter):
             skip_keywords = frozenset({"你好", "收到", "谢谢", "在吗", "ok", "好的", "嗯", "好"})
             if any(g in normalized for g in skip_keywords):
                 return None, None, None, None
+            self._pending_theme_preview[chat_id] = True
             topic, confidence = self._predict_topic(raw_text)
             logger.info(
                 "[Feishu] Theme material ingestion preview: "
@@ -2924,6 +2944,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 "录入", "入库", "处理", "整理", "归档", "转", "markdown",
             })
             if any(kw in normalized for kw in explicit_request_keywords):
+                self._pending_theme_preview[chat_id] = True
                 topic, confidence = self._predict_topic(raw_text)
                 logger.info(
                     "[Feishu] Theme material ingestion preview: "
