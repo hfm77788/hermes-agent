@@ -1659,6 +1659,164 @@ class TestWeComFileMetadataExtraction:
         assert result["analysis"]["subject_code"] == "FDN"
         assert result["analysis"]["category_code"] == "PUB"
 
+    # ── Test 7: URL-encoded filename from body.file ─────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_url_encoded_filename_from_file_block_decodes_correctly(self):
+        """WeCom file API returns filenames as URL-encoded strings.
+
+        Simulate the exact payload from the smoke test:
+        filename = doc_bede7da94a33_%E5%A4%A9%E6%B4%A5...%E7%AE%80%E4%BB%8B%EF%BC%882026.5%EF%BC%89+7.pdf
+        The ``+`` represents a space (application/x-www-form-urlencoded).
+        After unquote_plus + collapse, must decode to readable Chinese.
+        """
+        adapter = self._adapter()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        encoded_name = (
+            "doc_bede7da94a33_%E5%A4%A9%E6%B4%A5%E5%B8%82%E9%9D%92%E5%B9%B4%E5%88%9B%E4%B8%9A"
+            "%E5%B0%B1%E4%B8%9A%E5%9F%BA%E9%87%91%E4%BC%9A%E7%AE%80%E4%BB%8B%EF%BC%882026.5"
+            "%EF%BC%89+7.pdf"
+        )
+        body = {
+            "msgtype": "file",
+            "file": {
+                "filename": encoded_name,
+                "media_id": "media-file-001",
+            },
+        }
+
+        result = adapter._detect_wecom_ingestion_candidate(
+            body=body,
+            text="",
+            media_urls=[],
+            media_types=["application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+            message_id="test-url-encoded",
+        )
+        assert result is not None, "URL-encoded DOCX should trigger ingestion candidate"
+
+        # Filename must be decoded to readable Chinese
+        file_names = result.get("file_names", [])
+        decoded_names = [n for n in file_names if "基金会" in n or "简介" in n]
+        assert decoded_names, f"Decoded filename with 基金会/简介 not found in {file_names}"
+        # Must contain the Chinese keywords (whitespace normalised)
+        assert "天津市青年创业就业基金会简介（2026.5）" in decoded_names[0]
+
+        # Pre-analysis must recognise FDN + PUB from the decoded filename
+        assert result["analysis"]["subject_code"] == "FDN", (
+            f"Expected FDN, got {result['analysis']['subject_code']}"
+        )
+        assert result["analysis"]["category_code"] == "PUB", (
+            f"Expected PUB, got {result['analysis']['category_code']}"
+        )
+        assert result["analysis"]["confidence"] == "HIGH"
+        assert "filename" in result["analysis"]["basis"]
+
+    # ── Test 8: URL-encoded filename from body.appmsg.title ────────────────────
+
+    @pytest.mark.asyncio
+    async def test_url_encoded_filename_from_appmsg_title_decodes_correctly(self):
+        """appmsg.title can also be URL-encoded Chinese."""
+        adapter = self._adapter()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        encoded_name = (
+            "%E5%A4%A9%E6%B4%A5%E5%B8%82%E9%9D%92%E5%B9%B4%E5%88%9B%E4%B8%9A%E5%B0%B1"
+            "%E4%B8%9A%E5%9F%BA%E9%87%91%E4%BC%9A%E7%AE%80%E4%BB%8B%EF%BC%882026.5%EF%BC%89.docx"
+        )
+        body = {
+            "msgtype": "appmsg",
+            "appmsg": {
+                "title": encoded_name,
+                "des": "简介",
+            },
+        }
+
+        result = adapter._detect_wecom_ingestion_candidate(
+            body=body,
+            text="",
+            media_urls=[],
+            media_types=["application/msword"],
+            message_id="test-url-encoded-appmsg",
+        )
+        assert result is not None
+        # Filename must be decoded
+        file_names = result.get("file_names", [])
+        assert any("基金会" in n for n in file_names), f"{file_names}"
+        assert result["analysis"]["subject_code"] == "FDN"
+        assert result["analysis"]["category_code"] == "PUB"
+        assert result["analysis"]["confidence"] == "HIGH"
+
+    # ── Test 9: URL-encoded filename from mixed.msg_item ───────────────────────
+
+    @pytest.mark.asyncio
+    async def test_url_encoded_filename_from_mixed_msg_item_decodes_correctly(self):
+        """mixed.msg_item[*].file.filename can also be URL-encoded."""
+        adapter = self._adapter()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        encoded_name = (
+            "%E5%A4%A9%E6%B4%A5%E5%B8%82%E9%9D%92%E5%B9%B4%E5%88%9B%E4%B8%9A%E5%B0%B1"
+            "%E4%B8%9A%E5%9F%BA%E9%87%91%E4%BC%9A%E7%AE%80%E4%BB%8B%EF%BC%882026.5%EF%BC%89.pdf"
+        )
+        body = {
+            "msgtype": "mixed",
+            "mixed": {
+                "msg_item": [
+                    {
+                        "msgtype": "file",
+                        "file": {
+                            "filename": encoded_name,
+                            "media_id": "media-pdf-003",
+                        },
+                    },
+                ]
+            },
+        }
+
+        result = adapter._detect_wecom_ingestion_candidate(
+            body=body,
+            text="",
+            media_urls=[],
+            media_types=["application/pdf"],
+            message_id="test-url-encoded-mixed",
+        )
+        assert result is not None
+        file_names = result.get("file_names", [])
+        assert any("基金会" in n for n in file_names), f"{file_names}"
+        assert result["analysis"]["subject_code"] == "FDN"
+        assert result["analysis"]["category_code"] == "PUB"
+        assert result["analysis"]["confidence"] == "HIGH"
+
+    # ── Test 10: + used as space in filename ────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_plus_sign_decoded_as_space_in_filename(self):
+        """``+`` inside a WeCom filename = literal space (form-encoded)."""
+        adapter = self._adapter()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        # WeCom sometimes encodes spaces as + in filenames
+        body = {
+            "msgtype": "file",
+            "file": {
+                "filename": "2026+年项目申报指南.pdf",
+                "media_id": "media-file-plus",
+            },
+        }
+
+        result = adapter._detect_wecom_ingestion_candidate(
+            body=body,
+            text="",
+            media_urls=[],
+            media_types=["application/pdf"],
+            message_id="test-plus-space",
+        )
+        assert result is not None
+        file_names = result.get("file_names", [])
+        # After decode, + must become space
+        assert any("2026 年" in n or "2026" in n for n in file_names), f"{file_names}"
+
 
 class TestWeComStagingWrite:
     """Test the raymond-wiki staging write path triggered on reply=1."""

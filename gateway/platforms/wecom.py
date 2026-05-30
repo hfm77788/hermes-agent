@@ -42,7 +42,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, unquote_plus, urlparse
 
 try:
     import aiohttp
@@ -466,6 +466,20 @@ _FILE_BLOCK_PATHS = (
 )
 
 
+def _normalize_wecom_filename(value: str) -> str:
+    """Normalize a WeCom filename: URL-decode and collapse excess whitespace.
+
+    WeCom file APIs return filenames as URL-encoded strings (e.g.
+    ``%E5%A4%A9%E6%B4%A5...``).  ``+`` is decoded as a space per the
+    ``application/x-www-form-urlencoded`` encoding that WeCom uses.
+    """
+    raw = str(value or "").strip()
+    # unquote_plus handles both %-encoded chars AND embedded + as spaces
+    decoded = unquote_plus(raw)
+    # Collapse any runs of whitespace so excess spacing does not pollute the name.
+    return " ".join(decoded.split())
+
+
 def _collect_metadata_from_block(block: Any) -> Dict[str, Any]:
     """Extract all file metadata fields from a single dict block.
 
@@ -475,11 +489,11 @@ def _collect_metadata_from_block(block: Any) -> Dict[str, Any]:
     if not isinstance(block, dict):
         return {}
     result: Dict[str, Any] = {}
-    # filename / name / title
+    # filename / name / title — always URL-decode (WeCom uses URL encoding)
     for key in _FILENAME_KEYS:
         val = block.get(key)
         if val and isinstance(val, str):
-            result["file_name"] = val.strip()
+            result["file_name"] = _normalize_wecom_filename(val)
             break
     # media_id
     for key in ("media_id", "mediaid", "fileid", "file_id"):
@@ -511,6 +525,14 @@ def _extract_wecom_file_metadata_static(
     media_urls: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Extract comprehensive file metadata from a WeCom message body.
+
+    # DIAGNOSTIC: snapshot body.file keys for forensic analysis
+    _file_block = body.get("file") if isinstance(body.get("file"), dict) else {}
+    logger.info(
+        "[wecom] FORENSIC body.file keys=%s values=%s",
+        list(_file_block.keys()),
+        {k: str(v)[:80] for k, v in _file_block.items()},
+    )
 
     Searches these block paths:
         body.file, body.image, body.video, body.voice, body.appmsg,
@@ -592,14 +614,14 @@ def _extract_wecom_file_metadata_static(
         parsed = urlparse(url)
         path_part = parsed.path or ""
         if path_part:
-            name = Path(path_part).name
+            name = _normalize_wecom_filename(Path(path_part).name)
             # Only treat as a file if it has an extension
             if name and "." in name:
                 file_names.append(name)
                 seen_urls.add(url)
         else:
             # Local cache path — e.g. /tmp/wecom_media_xxx.docx
-            name = Path(url).name
+            name = _normalize_wecom_filename(Path(url).name)
             if name and ("." in name or len(name) > 4):
                 file_names.append(name)
                 seen_urls.add(url)
