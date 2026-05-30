@@ -1405,6 +1405,8 @@ class TestWeComStagingWrite:
             saved = json.load(f)
         assert saved["topic"] == "competition_aild"
         assert saved["confirmed_message_id"] == "confirmed-abc-123"
+        assert saved["staging_write_status"] == "written"
+        assert saved["staging_path"] == "projects/_staging/materials/uploads/confirmed/2026/05/confirmed-abc-123"
 
     def test_write_wecom_ingestion_staging_skipped_when_no_wiki_root(self, tmp_path):
         fake = tmp_path / "nonexistent"

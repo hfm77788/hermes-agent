@@ -207,8 +207,10 @@ def _write_wecom_ingestion_staging(manifest: Dict[str, Any]) -> Dict[str, Any]:
         state_dir.mkdir(parents=True, exist_ok=True)
         report_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. INGESTION_MANIFEST.json
+        # 1. INGESTION_MANIFEST.json (enrich with write metadata first)
         manifest_path = confirmed_dir / "INGESTION_MANIFEST.json"
+        manifest["staging_write_status"] = "written"
+        manifest["staging_path"] = str(confirmed_dir.relative_to(wiki_root))
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)
 
