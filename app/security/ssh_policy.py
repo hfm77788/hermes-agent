@@ -9,10 +9,9 @@ from typing import Final
 ALLOWED_SERVICES: Final[list[str]] = ["hermes-mcp", "hermes-gateway", "wecom", "feishu"]
 
 # The denylist intentionally stays small and obvious. The execution layer
-# combines these patterns with a few write-sensitive special cases so that
-# reads of /etc/passwd remain allowed while writes are blocked.
+# combines these patterns with write-sensitive special cases.
 DENYLIST_PATTERNS: Final[tuple[str, ...]] = (
-    r"\.env(?:\b|/|$)",
+    r"\.env(?:\b|/)",
     r"\btoken\b",
     r"\bsecret\b",
     r"\bcookie\b",
@@ -25,6 +24,9 @@ DENYLIST_PATTERNS: Final[tuple[str, ...]] = (
     r"\bssh\b",
     r"\bscp\b",
 )
+
+# /etc/passwd is always blocked — no reads, no writes.
+_PASSWD_RE = re.compile(r"/etc/passwd\b", re.IGNORECASE)
 
 L4_AUTHORIZED_COMMANDS: Final[tuple[str, ...]] = (
     "ssh_restart_service",
@@ -39,12 +41,6 @@ L4_AUTHORIZED_COMMANDS: Final[tuple[str, ...]] = (
 DEFAULT_TIMEOUT: Final[int] = 30
 MAX_TIMEOUT: Final[int] = 120
 FULL_SSH_DEFAULT_ENABLED: Final[bool] = False
-
-_WRITE_CONTEXT_RE = re.compile(
-    r"(?:\b(?:>|>>|tee|cp|mv|install|truncate|sed\s+-i|perl\s+-i)\b|"
-    r">|>>|\|\s*tee\b).{0,120}/etc/passwd\b",
-    re.IGNORECASE | re.DOTALL,
-)
 
 _SERVICE_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
 _DENYLIST_REGEXES = [re.compile(pattern, re.IGNORECASE | re.DOTALL) for pattern in DENYLIST_PATTERNS]
@@ -98,23 +94,21 @@ def requires_l4_auth(command_name: str) -> bool:
     return command_name in L4_AUTHORIZED_COMMANDS
 
 
-def _has_write_to_passwd(command: str) -> bool:
-    """Return True when a command appears to write to /etc/passwd."""
-    return bool(_WRITE_CONTEXT_RE.search(command))
+def _is_denylisted_pattern(command: str) -> tuple[bool, str]:
+    """Check command against all denylist patterns."""
+    normalized = command or ""
+    for regex, pattern in zip(_DENYLIST_REGEXES, DENYLIST_PATTERNS):
+        if regex.search(normalized):
+            return True, f"blocked by denylist pattern: {pattern}"
+    return False, ""
 
 
 def is_denylisted_command(command: str) -> tuple[bool, str]:
     """Return (denied, reason) for a shell command string.
 
-    Reads of /etc/passwd are allowed, but any obvious write path is blocked.
+    All access to /etc/passwd is blocked (reads and writes).
     """
-    normalized = command or ""
-    for regex, pattern in zip(_DENYLIST_REGEXES, DENYLIST_PATTERNS):
-        if pattern == r"/etc/passwd\b":
-            if "/etc/passwd" in normalized and _has_write_to_passwd(normalized):
-                return True, "write access to /etc/passwd is blocked"
-            continue
-        if regex.search(normalized):
-            return True, f"blocked by denylist pattern: {pattern}"
-    return False, ""
+    if _PASSWD_RE.search(command or ""):
+        return True, "access to /etc/passwd is always blocked"
+    return _is_denylisted_pattern(command)
 
