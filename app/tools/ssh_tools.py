@@ -347,8 +347,24 @@ def ssh_repair_feishu(timeout: int = 120) -> str:
     return _repair_service("feishu", "ssh_repair_feishu", timeout)
 
 
-def ssh_exec_command(command: str, timeout: int = MAX_TIMEOUT) -> str:
-    """Execute an arbitrary command when full SSH is explicitly enabled."""
+def ssh_exec_command(
+    command: str,
+    timeout: int = MAX_TIMEOUT,
+    *,
+    allow_full_ssh: bool = False,
+    user_authorization: str = "",
+) -> str:
+    """Execute an arbitrary command when full SSH is explicitly enabled.
+
+    Triple-gate authorization:
+      1. allow_full_ssh=True must be passed in the call payload
+      2. user_authorization must be non-empty and describe command intent
+      3. Environment variables SSH_FULL_SSH_ENABLED=1 + SSH_L4_AUTHORIZED=1
+         must both be set
+
+    This capability is disabled by default.  It is strictly bounded to the
+    local Hermes MCP host and cannot be used for ssh/scp jump-host hopping.
+    """
     timeout = clamp_timeout(timeout)
     if not is_full_ssh_enabled():
         return _deny(
@@ -364,6 +380,20 @@ def ssh_exec_command(command: str, timeout: int = MAX_TIMEOUT) -> str:
             "L4 authorization is required for arbitrary command execution",
             timeout,
         )
+    if not allow_full_ssh:
+        return _deny(
+            "ssh_exec_command",
+            command,
+            "allow_full_ssh=true must be set in the call payload",
+            timeout,
+        )
+    if not user_authorization or not user_authorization.strip():
+        return _deny(
+            "ssh_exec_command",
+            command,
+            "user_authorization must be non-empty and describe command intent",
+            timeout,
+        )
     denied, reason = is_denylisted_command(command)
     if denied:
         return _deny("ssh_exec_command", command, reason, timeout)
@@ -372,6 +402,7 @@ def ssh_exec_command(command: str, timeout: int = MAX_TIMEOUT) -> str:
         timeout=timeout,
         tool="ssh_exec_command",
         shell=False,
+        extra={"user_authorization": user_authorization.strip()},
     )
 
 

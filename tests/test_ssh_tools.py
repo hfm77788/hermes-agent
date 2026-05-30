@@ -129,20 +129,60 @@ def test_denylist_command_rejected(monkeypatch):
         raise AssertionError("subprocess.run should not be called")
 
     monkeypatch.setattr(ssh_tools.subprocess, "run", _boom)
-    result = _parse(ssh_tools.ssh_exec_command("cat /etc/shadow"))
+    result = _parse(ssh_tools.ssh_exec_command(
+        "cat /etc/shadow",
+        allow_full_ssh=True,
+        user_authorization="test: verify shadow file access is blocked",
+    ))
     assert result["status"] == "denied"
     assert "denylist" in result["output"] or "blocked" in result["output"]
     assert called["value"] is False
 
 
-def test_write_to_passwd_is_blocked(monkeypatch):
+def test_passwd_read_is_blocked(monkeypatch):
+    """All /etc/passwd access — reads and writes — is always blocked."""
     import app.tools.ssh_tools as ssh_tools
 
     monkeypatch.setenv("SSH_FULL_SSH_ENABLED", "1")
     monkeypatch.setenv("SSH_L4_AUTHORIZED", "1")
-    result = _parse(ssh_tools.ssh_exec_command("echo test >> /etc/passwd"))
+    called = {"value": False}
+
+    def _boom(*args, **kwargs):
+        called["value"] = True
+        raise AssertionError("subprocess.run should not be called")
+
+    monkeypatch.setattr(ssh_tools.subprocess, "run", _boom)
+    result = _parse(ssh_tools.ssh_exec_command(
+        "cat /etc/passwd",
+        allow_full_ssh=True,
+        user_authorization="test: verify passwd read is blocked",
+    ))
     assert result["status"] == "denied"
     assert "passwd" in result["output"].lower()
+    assert called["value"] is False
+
+
+def test_passwd_write_is_blocked(monkeypatch):
+    """All /etc/passwd access — reads and writes — is always blocked."""
+    import app.tools.ssh_tools as ssh_tools
+
+    monkeypatch.setenv("SSH_FULL_SSH_ENABLED", "1")
+    monkeypatch.setenv("SSH_L4_AUTHORIZED", "1")
+    called = {"value": False}
+
+    def _boom(*args, **kwargs):
+        called["value"] = True
+        raise AssertionError("subprocess.run should not be called")
+
+    monkeypatch.setattr(ssh_tools.subprocess, "run", _boom)
+    result = _parse(ssh_tools.ssh_exec_command(
+        "echo test >> /etc/passwd",
+        allow_full_ssh=True,
+        user_authorization="test: verify passwd write is blocked",
+    ))
+    assert result["status"] == "denied"
+    assert "passwd" in result["output"].lower()
+    assert called["value"] is False
 
 
 def test_secret_output_is_redacted(monkeypatch):
@@ -168,6 +208,67 @@ def test_exec_command_default_denied(monkeypatch):
     result = _parse(ssh_tools.ssh_exec_command("echo hi"))
     assert result["status"] == "denied"
     assert "disabled by default" in result["output"]
+
+
+def test_exec_command_missing_allow_full_ssh(monkeypatch):
+    """Without allow_full_ssh=True, exec is denied even when env vars are set."""
+    import app.tools.ssh_tools as ssh_tools
+
+    monkeypatch.setenv("SSH_FULL_SSH_ENABLED", "1")
+    monkeypatch.setenv("SSH_L4_AUTHORIZED", "1")
+    result = _parse(ssh_tools.ssh_exec_command(
+        "echo hi",
+        user_authorization="intentional call",
+    ))
+    assert result["status"] == "denied"
+    assert "allow_full_ssh=true" in result["output"]
+
+
+def test_exec_command_missing_user_authorization(monkeypatch):
+    """Without a non-empty user_authorization, exec is denied."""
+    import app.tools.ssh_tools as ssh_tools
+
+    monkeypatch.setenv("SSH_FULL_SSH_ENABLED", "1")
+    monkeypatch.setenv("SSH_L4_AUTHORIZED", "1")
+    result = _parse(ssh_tools.ssh_exec_command(
+        "echo hi",
+        allow_full_ssh=True,
+    ))
+    assert result["status"] == "denied"
+    assert "user_authorization" in result["output"]
+
+
+def test_exec_command_empty_user_authorization(monkeypatch):
+    """A blank/whitespace-only user_authorization is also rejected."""
+    import app.tools.ssh_tools as ssh_tools
+
+    monkeypatch.setenv("SSH_FULL_SSH_ENABLED", "1")
+    monkeypatch.setenv("SSH_L4_AUTHORIZED", "1")
+    result = _parse(ssh_tools.ssh_exec_command(
+        "echo hi",
+        allow_full_ssh=True,
+        user_authorization="   ",
+    ))
+    assert result["status"] == "denied"
+    assert "user_authorization" in result["output"]
+
+
+def test_exec_command_succeeds_with_full_creds(monkeypatch):
+    """Triple-gate satisfied: env vars + allow_full_ssh + user_authorization."""
+    import app.tools.ssh_tools as ssh_tools
+
+    monkeypatch.setenv("SSH_FULL_SSH_ENABLED", "1")
+    monkeypatch.setenv("SSH_L4_AUTHORIZED", "1")
+    monkeypatch.setattr(ssh_tools.subprocess, "run", lambda *a, **k: _completed(a[0], stdout="ok\n"))
+    result = _parse(ssh_tools.ssh_exec_command(
+        "echo ok",
+        allow_full_ssh=True,
+        user_authorization="Smoke test: verify triple-gate path works end-to-end",
+    ))
+    assert result["status"] == "success"
+    assert result["output"].strip() == "ok"
+    # user_authorization must appear somewhere in the JSON output (payload field or extra)
+    assert "Smoke test" in json.dumps(result)
 
 
 def test_l4_missing_rejects_privileged_commands(monkeypatch):
