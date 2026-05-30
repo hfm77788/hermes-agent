@@ -106,14 +106,12 @@ VOICE_SUPPORTED_MIMES = {"audio/amr"}
 
 WECOM_INGESTION_CONFIRMATION_TEMPLATE = (
     "已检测到一份可能需要进入知识库处理的资料。\n\n"
-    "初步分析：\n"
-    "1. 资料类型：{source_label}\n"
-    "2. 识别标题：{title}\n"
-    "3. 可能主体：{subject_label}（{subject_code}）\n"
-    "4. 可能类目：{category_label}（{category_code}）\n"
-    "5. 推荐暂存位置：{suggested_path}\n"
-    "6. 后续可能归入：{future_location}\n"
-    "7. 置信度：{confidence}\n\n"
+    "初步阅读：\n"
+    "1. 识别标题：{title}\n"
+    "2. 内容判断：{content_hint}\n"
+    "3. 主要线索：{excerpt_hint}\n"
+    "4. 建议处理：{recommendation}\n"
+    "5. 推荐暂存：{suggested_path}\n\n"
     "请选择：\n"
     "1. 进入知识库自动处理工作流\n"
     "2. 暂不处理\n"
@@ -128,6 +126,132 @@ WECOM_INGESTION_QUEUED_WITH_STAGING_TEXT = "已进入待处理队列，并已生
 # ─── Staging helpers (module-level, no class needed) ─────────────────────────
 
 import re as _re
+import zipfile
+import xml.etree.ElementTree as ET
+
+
+def _extract_wecom_document_text_excerpt(
+    file_metadata: Dict[str, Any],
+    max_chars: int = 2000,
+) -> Dict[str, Any]:
+    """Extract text excerpt from a supported document file.
+
+    Supports:
+    - TXT / MD: direct UTF-8 read
+    - DOCX: standard library zipfile + xml (no python-docx required)
+    - PDF: uses fitz (PyMuPDF) if available; skipped otherwise
+
+    Returns:
+        {
+            "text_excerpt": "...",
+            "text_extract_status": "ok / skipped_no_local_file / skipped_unsupported_type / failed",
+            "text_extract_source": "pdf / docx / txt / md / filename_only",
+            "text_extract_error": ""
+        }
+    """
+    result: Dict[str, Any] = {
+        "text_excerpt": "",
+        "text_extract_status": "skipped_no_local_file",
+        "text_extract_source": "filename_only",
+        "text_extract_error": "",
+    }
+
+    # Look for local paths in various metadata fields
+    local_paths: List[str] = []
+    for key in ("local_paths", "cached_paths", "download_paths", "media_urls"):
+        paths = file_metadata.get(key, [])
+        if isinstance(paths, list):
+            local_paths.extend(paths)
+
+    if not local_paths:
+        return result
+
+    text_found = ""
+
+    for path_str in local_paths:
+        path = Path(path_str)
+        if not path.exists() or not path.is_file():
+            continue
+
+        ext = path.suffix.lower()
+        stem = path.stem.lower()
+
+        # TXT / MD
+        if ext in (".txt", ".md"):
+            try:
+                text_found = path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
+                result["text_extract_status"] = "ok"
+                result["text_extract_source"] = "txt" if ext == ".txt" else "md"
+                break
+            except Exception as exc:
+                result["text_extract_error"] = str(exc)
+                continue
+
+        # DOCX — standard library zipfile + xml
+        if ext == ".docx":
+            try:
+                text_found = _extract_docx_text_stdlib(path)[:max_chars]
+                result["text_extract_status"] = "ok"
+                result["text_extract_source"] = "docx"
+                break
+            except Exception as exc:
+                result["text_extract_error"] = str(exc)
+                continue
+
+        # PDF — fitz (PyMuPDF)
+        if ext == ".pdf":
+            try:
+                import fitz  # type: ignore
+
+                doc = fitz.open(str(path))
+                pages_text: List[str] = []
+                for page in doc:
+                    pages_text.append(page.get_text())
+                    if sum(len(t) for t in pages_text) >= max_chars:
+                        break
+                doc.close()
+                text_found = "".join(pages_text)[:max_chars]
+                result["text_extract_status"] = "ok"
+                result["text_extract_source"] = "pdf"
+                break
+            except Exception:
+                # fitz not available or PDF unreadable — skip gracefully
+                result["text_extract_status"] = "skipped_unsupported_type"
+                result["text_extract_source"] = "pdf"
+                result["text_extract_error"] = "fitz/PyMuPDF not available or PDF unreadable"
+                continue
+
+    if text_found:
+        result["text_excerpt"] = text_found
+    elif result["text_extract_status"] == "skipped_unsupported_type":
+        # Unsupported type — preserve status and source (set in the loop)
+        pass
+    elif result["text_extract_status"] == "skipped_no_local_file":
+        # No local file found at all — explicitly set
+        result["text_extract_status"] = "skipped_no_local_file"
+        result["text_extract_source"] = "filename_only"
+    else:
+        # Any other failure
+        result["text_extract_status"] = "failed"
+
+    return result
+
+
+def _extract_docx_text_stdlib(path: Path) -> str:
+    """Extract text from a DOCX file using zipfile + xml (no external deps)."""
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    text_parts: List[str] = []
+    with zipfile.ZipFile(str(path), "r") as zf:
+        try:
+            with zf.open("word/document.xml") as xml_file:
+                tree = ET.parse(xml_file)
+                root = tree.getroot()
+                for elem in root.iter(f"{{{ns}}}t"):
+                    if elem.text:
+                        text_parts.append(elem.text)
+        except KeyError:
+            return ""
+    return "".join(text_parts)
 
 
 def _safe_message_id(message_id: str) -> str:
@@ -244,6 +368,18 @@ def _write_wecom_ingestion_staging(manifest: Dict[str, Any]) -> Dict[str, Any]:
             f"- 原始文件名：{file_block}\n"
             f"- 后续处理提示：待 GPT 审核后进入 source-repository 或目标项目\n"
         )
+        # Append text_extract info if available
+        text_extract = manifest.get("text_extract", {})
+        if text_extract and text_extract.get("status") == "ok":
+            quick_content += (
+                f"\n## 正文抽取\n"
+                f"- 抽取状态：{text_extract.get('status', 'unknown')}\n"
+                f"- 抽取来源：{text_extract.get('source', 'unknown')}\n"
+            )
+            excerpt = text_extract.get("excerpt", "")
+            if excerpt:
+                snippet = excerpt[:200].replace("\n", " ").strip()
+                quick_content += f"- 正文摘要片段：{snippet}...\n"
         with open(quick_path, "w", encoding="utf-8") as f:
             f.write(quick_content)
 
@@ -716,11 +852,25 @@ def _classify_subject(text: str, filenames: List[str]) -> Tuple[str, str]:
 def _classify_category(text: str, filenames: List[str]) -> Tuple[str, str]:
     """Classify category code and return (code, label).
 
-    Confidence based on where keyword was found (filename = HIGH).
+    Confidence based on where keyword was found (filename = HIGH, text = MEDIUM).
+
+    Special rule: "简介" class keywords (简介/机构简介/基金会简介/单位简介/中心简介/
+    介绍) take priority over generic DOC keywords (文件/材料) to avoid misclassifying
+    intro/promotional materials as official documents.
     """
     hits: Dict[str, List[str]] = {c: [] for c in _CATEGORY_PRIORITY}
 
-    # AGR
+    # ── Strong PUB signals (简介 class) — checked against both text and filenames ──
+    # These override generic DOC/other category hits.
+    intro_keywords = ("简介", "机构简介", "基金会简介", "单位简介", "中心简介", "介绍")
+    for kw in intro_keywords:
+        if kw in text:
+            hits["PUB"].append("text")
+        for fn in filenames:
+            if kw in fn:
+                hits["PUB"].append("filename")
+
+    # ── AGR (checked first — strongest institutional signals) ───────────────────
     for kw in ("协议", "合同", "合作协议", "备忘录"):
         if kw in text:
             hits["AGR"].append("text")
@@ -728,15 +878,15 @@ def _classify_category(text: str, filenames: List[str]) -> Tuple[str, str]:
             if kw in fn:
                 hits["AGR"].append("filename")
 
-    # DOC
-    for kw in ("制度", "办法", "通知", "文件", "章程", "管理办法"):
+    # ── DOC (specific institutional document types only; no generic "文件/材料") ─
+    for kw in ("制度", "办法", "通知", "章程", "管理办法"):
         if kw in text:
             hits["DOC"].append("text")
         for fn in filenames:
             if kw in fn:
                 hits["DOC"].append("filename")
 
-    # MTG
+    # ── MTG ────────────────────────────────────────────────────────────────────
     for kw in ("会议", "纪要", "会谈", "座谈", "沟通记录"):
         if kw in text:
             hits["MTG"].append("text")
@@ -744,7 +894,7 @@ def _classify_category(text: str, filenames: List[str]) -> Tuple[str, str]:
             if kw in fn:
                 hits["MTG"].append("filename")
 
-    # YEV
+    # ── YEV ───────────────────────────────────────────────────────────────────
     for kw in ("aild", "智能设计大赛", "应急安全", "赛事", "竞赛", "比赛", "青少年"):
         if kw.lower() in text.lower():
             hits["YEV"].append("text")
@@ -752,7 +902,7 @@ def _classify_category(text: str, filenames: List[str]) -> Tuple[str, str]:
             if kw.lower() in fn.lower():
                 hits["YEV"].append("filename")
 
-    # ENT
+    # ── ENT ────────────────────────────────────────────────────────────────────
     for kw in ("创青春", "青年创业", "创业就业", "项目申报", "创业项目"):
         if kw in text:
             hits["ENT"].append("text")
@@ -760,9 +910,9 @@ def _classify_category(text: str, filenames: List[str]) -> Tuple[str, str]:
             if kw in fn:
                 hits["ENT"].append("filename")
 
-    # PUB (check override keywords in filenames first)
-    pub_keywords = ["简介", "宣传", "手册", "展示", "PPT", "画册", "介绍"]
-    for kw in pub_keywords:
+    # ── Generic PUB (other promotional/material keywords — filenames only) ───────
+    pub_other_keywords = ["宣传", "手册", "展示", "PPT", "画册"]
+    for kw in pub_other_keywords:
         for fn in filenames:
             if kw in fn:
                 hits["PUB"].append("filename")
@@ -775,6 +925,20 @@ def _classify_category(text: str, filenames: List[str]) -> Tuple[str, str]:
         if "text" in sources:
             return "MEDIUM"
         return "LOW"
+
+    # ── Special intro override ─────────────────────────────────────────────────
+    # "简介" class keywords in text take priority over generic DOC keywords
+    # ("文件", "材料") to fix the 简介+材料文件 → DOC bug.
+    # Do NOT override when higher-priority categories (AGR, MTG, YEV, ENT) are hit —
+    # those have independent semantic meaning and should win over a generic PUB.
+    # Only block the case where generic weak DOC words cause misclassification.
+    intro_sources = hits.get("PUB", [])
+    if intro_sources and any(s == "text" for s in intro_sources):
+        weak_doc_keywords = ("文件", "材料")
+        if hits.get("DOC") and any(
+            kw in text for kw in weak_doc_keywords
+        ):
+            return ("PUB", confidence(intro_sources))
 
     # Find highest priority category with hits
     for cat in reversed(_CATEGORY_PRIORITY):
@@ -794,12 +958,38 @@ def _analyze_wecom_ingestion_content(
     file_metadata = _extract_wecom_file_metadata_static(body, text, media_urls)
     filenames = file_metadata.get("file_names", [])
 
-    # Title: from appmsg title, then first filename, then first URL name
+    # ── Document text extraction ──────────────────────────────────────────────
+    text_extract = _extract_wecom_document_text_excerpt(file_metadata, max_chars=2000)
+    text_excerpt = text_extract.get("text_excerpt", "")
+
+    # Combined text for classification: original text + document excerpt
+    combined_text = text
+    if text_excerpt:
+        combined_text = f"{text}\n{text_excerpt}" if text else text_excerpt
+
+    # Title strategy:
+    # 1. appmsg title  2. semantic filename  3. document excerpt title  4. URL name  5. text excerpt  6. fallback
     title = ""
     if isinstance(body.get("appmsg"), dict):
         title = str(body.get("appmsg", {}).get("title") or "").strip()
+
+    _semantic_fn_kw = (
+        "通知", "方案", "指南", "计划", "报告", "总结", "申报", "章程",
+        "办法", "协议", "合同", "纪要", "简介", "手册", "材料",
+    )
     if not title and filenames:
-        title = filenames[0]
+        # Use filename as title only if it has clear semantic content
+        fn0 = filenames[0]
+        fn_stem = Path(fn0).stem
+        if any(kw in fn_stem for kw in _semantic_fn_kw) or len(fn_stem) >= 4:
+            title = fn0
+
+    if not title and text_excerpt:
+        # Try first line of document excerpt as title
+        first_line = text_excerpt.strip().split("\n")[0].strip()
+        if first_line and len(first_line) >= 2:
+            title = first_line[:80]
+
     if not title:
         url = _extract_first_url_static(text)
         if url:
@@ -809,10 +999,10 @@ def _analyze_wecom_ingestion_content(
 
     # Keywords
     keywords: List[str] = []
-    subject_code, subject_conf = _classify_subject(text, filenames)
-    category_code, category_conf = _classify_category(text, filenames)
+    subject_code, subject_conf = _classify_subject(combined_text, filenames)
+    category_code, category_conf = _classify_category(combined_text, filenames)
 
-    # Confidence: lower of the two
+    # Confidence: upgrade when text_excerpt contributes to classification
     conf_map = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
     overall_confidence = "HIGH"
     if conf_map.get(subject_conf, 0) < conf_map.get(overall_confidence, 3):
@@ -820,11 +1010,17 @@ def _analyze_wecom_ingestion_content(
     if conf_map.get(category_conf, 0) < conf_map.get(overall_confidence, 3):
         overall_confidence = category_conf
 
+    # Boost confidence when text_excerpt enabled a better classification
+    # that filenames alone could not provide
+    if text_excerpt and overall_confidence == "LOW":
+        if subject_code != "X" or category_code not in ("TMP", "OTH"):
+            overall_confidence = "MEDIUM"
+
     # Basis
     basis: List[str] = []
     if filenames:
         basis.append("filename")
-    if text:
+    if text or text_excerpt:
         basis.append("text_excerpt")
 
     # Suggested path (preliminary, uses subject-category code)
@@ -844,6 +1040,15 @@ def _analyze_wecom_ingestion_content(
     }
     future_location = future_locations.get(subject_code, future_locations["X"])
 
+    lightweight = _build_lightweight_analysis_fields(
+        title=title,
+        text_excerpt=text_excerpt,
+        subject_code=subject_code,
+        category_code=category_code,
+        filenames=filenames,
+        text=text,
+    )
+
     return {
         "title": title,
         "keywords": keywords,
@@ -853,6 +1058,15 @@ def _analyze_wecom_ingestion_content(
         "category_label": _CATEGORY_MAP.get(category_code, "其他"),
         "confidence": overall_confidence,
         "basis": basis,
+        "summary": lightweight["summary"],
+        "content_hint": lightweight["content_hint"],
+        "recommendation": lightweight["recommendation"],
+        "text_extract": {
+            "status": text_extract.get("text_extract_status", "skipped_no_local_file"),
+            "source": text_extract.get("text_extract_source", "filename_only"),
+            "excerpt": text_extract.get("text_excerpt", ""),
+            "error": text_extract.get("text_extract_error", ""),
+        },
         "suggested_path": suggested,
         "future_location": future_location,
     }
@@ -872,6 +1086,62 @@ def _coerce_list(value: Any) -> List[str]:
     if isinstance(value, (list, tuple, set)):
         return [str(item).strip() for item in value if str(item).strip()]
     return [str(value).strip()] if str(value).strip() else []
+
+
+def _build_lightweight_analysis_fields(
+    title: str,
+    text_excerpt: str,
+    subject_code: str,
+    category_code: str,
+    filenames: List[str],
+    text: str,
+) -> Dict[str, str]:
+    """Generate lightweight natural-language analysis fields.
+
+    This replaces fine-grained category classification with a simple
+    content-aware summary — the goal is "what is this roughly" not
+    "which exact bucket does it land in".
+    """
+    combined = f"{text}\n{text_excerpt}".strip()
+
+    # ── content_hint: what the material is about ─────────────────────────────────
+    intro_keywords = ("简介", "机构简介", "基金会简介", "单位简介", "中心简介", "介绍")
+    if any(kw in combined for kw in intro_keywords):
+        content_hint = "机构简介 / 宣传展示类材料"
+    elif "协议" in combined or "合同" in combined:
+        content_hint = "合同协议类文件"
+    elif "纪要" in combined or "会议" in combined:
+        content_hint = "会议纪要 / 座谈记录"
+    elif "通知" in combined:
+        content_hint = "通知类文件"
+    elif "办法" in combined or "制度" in combined or "章程" in combined:
+        content_hint = "制度管理类文件"
+    elif any(kw in combined.lower() for kw in ("aild", "赛事", "竞赛", "比赛")):
+        content_hint = "赛事活动相关资料"
+    elif any(kw in combined for kw in ("创青春", "创业项目", "创业就业")):
+        content_hint = "创业就业相关资料"
+    elif "附件" in "".join(filenames) and len(combined) < 20:
+        content_hint = "低语义文件名资料（请以正文内容为准）"
+    else:
+        content_hint = "一般性资料（建议进入 GPT 审核流程后精确分类）"
+
+    # ── summary: short description of the material ───────────────────────────────
+    if text_excerpt:
+        first_line = text_excerpt.strip().split("\n")[0][:80]
+        summary = first_line
+    elif title and title not in ("未命名资料", ""):
+        summary = title
+    else:
+        summary = "未识别到明确标题，以文件名为准"
+
+    # ── recommendation ──────────────────────────────────────────────────────────
+    recommendation = "先暂存到知识库中转区，后续由 GPT 审核后再归入正式资料库"
+
+    return {
+        "summary": summary,
+        "content_hint": content_hint,
+        "recommendation": recommendation,
+    }
 
 
 def _normalize_entry(raw: str) -> str:
@@ -1741,6 +2011,7 @@ class WeComAdapter(BasePlatformAdapter):
                 "media_ids": file_metadata.get("media_ids", []),
                 "file_sizes": file_metadata.get("file_sizes", []),
                 "mime_types": file_metadata.get("mime_types", []),
+                "local_paths": media_urls,
             },
             "analysis": {
                 "title": analysis["title"],
@@ -1751,6 +2022,7 @@ class WeComAdapter(BasePlatformAdapter):
                 "category_label": analysis["category_label"],
                 "confidence": analysis["confidence"],
                 "basis": analysis["basis"],
+                "text_extract": analysis.get("text_extract", {}),
             },
             "future_location": analysis["future_location"],
         }
@@ -1890,16 +2162,16 @@ class WeComAdapter(BasePlatformAdapter):
     @staticmethod
     def _format_wecom_ingestion_confirmation(pending: Dict[str, Any]) -> str:
         analysis = pending.get("analysis", {})
+        text_excerpt = str(analysis.get("text_extract", {}).get("excerpt") or "").strip()
+        excerpt_hint = text_excerpt[:60] + "…" if len(text_excerpt) > 60 else text_excerpt
+        if not excerpt_hint:
+            excerpt_hint = "（正文未成功抽取，请以实际文件内容为准）"
         return WECOM_INGESTION_CONFIRMATION_TEMPLATE.format(
-            source_label=WECOM_INGESTION_SOURCE_LABELS.get(str(pending.get("source_type")), "未知"),
             title=str(analysis.get("title") or "未命名资料"),
-            subject_label=str(analysis.get("subject_label") or "待判断"),
-            subject_code=str(analysis.get("subject_code") or "X"),
-            category_label=str(analysis.get("category_label") or "其他"),
-            category_code=str(analysis.get("category_code") or "OTH"),
+            content_hint=str(analysis.get("content_hint") or "一般性资料"),
+            excerpt_hint=excerpt_hint,
+            recommendation=str(analysis.get("recommendation") or "建议进入知识库中转区等待 GPT 审核"),
             suggested_path=pending.get("suggested_path", ""),
-            future_location=pending.get("future_location", "待确认"),
-            confidence=str(analysis.get("confidence") or "UNKNOWN"),
         )
 
     @staticmethod

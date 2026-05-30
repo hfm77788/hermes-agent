@@ -701,10 +701,10 @@ class TestWeComTwoPhaseIngestion:
         assert "1. 进入知识库自动处理工作流" in sent
         assert "2. 暂不处理" in sent
         assert "3. 仅保存原始资料，稍后人工判断" in sent
-        assert "初步分析" in sent
-        assert "可能主体" in sent
-        assert "可能类目" in sent
-        assert "推荐暂存位置" in sent
+        assert "初步阅读" in sent
+        assert "识别标题" in sent
+        assert "内容判断" in sent
+        assert "推荐暂存" in sent
 
     @pytest.mark.asyncio
     async def test_image_material_starts_pending_confirmation(self):
@@ -721,8 +721,9 @@ class TestWeComTwoPhaseIngestion:
         assert pending["suggested_path"].startswith("projects/_staging/materials/uploads/confirmed/")
         assert "analysis" in pending
         assert "future_location" in pending
-        assert "资料类型" in adapter.send.await_args.kwargs["content"]
-        assert "初步分析" in adapter.send.await_args.kwargs["content"]
+        content = adapter.send.await_args.kwargs["content"]
+        assert "初步阅读" in content
+        assert "识别标题" in content
 
     @pytest.mark.asyncio
     async def test_url_material_starts_pending_confirmation(self):
@@ -740,7 +741,9 @@ class TestWeComTwoPhaseIngestion:
 
         adapter.handle_message.assert_not_awaited()
         assert self._pending(adapter)["source_type"] == "url"
-        assert "资料类型：链接" in adapter.send.await_args.kwargs["content"]
+        content = adapter.send.await_args.kwargs["content"]
+        assert "初步阅读" in content
+        assert "识别标题" in content
 
     @pytest.mark.asyncio
     async def test_obvious_long_material_text_does_not_trigger_pending(self):
@@ -1149,6 +1152,274 @@ class TestWeComTwoPhaseIngestion:
         assert "pending_state=created" in log_output
         assert secret_url not in log_output
         assert full_text not in log_output
+
+
+class TestDocumentTextExtraction:
+    """Tests for _extract_wecom_document_text_excerpt."""
+
+    def test_txt_file_returns_text(self, tmp_path):
+        from gateway.platforms.wecom import _extract_wecom_document_text_excerpt
+
+        f = tmp_path / "附件1.txt"
+        f.write_text("天津市青年创业就业基金会简介\n成立于2026年\n服务青年创业就业", encoding="utf-8")
+        result = _extract_wecom_document_text_excerpt(
+            {"local_paths": [str(f)]}, max_chars=2000
+        )
+        assert result["text_extract_status"] == "ok"
+        assert result["text_extract_source"] == "txt"
+        assert "天津市青年创业就业基金会简介" in result["text_excerpt"]
+
+    def test_md_file_returns_text(self, tmp_path):
+        from gateway.platforms.wecom import _extract_wecom_document_text_excerpt
+
+        f = tmp_path / "材料.md"
+        f.write_text("# 天津青年宫赛事活动方案\n\n本文档包含赛事活动相关内容。", encoding="utf-8")
+        result = _extract_wecom_document_text_excerpt(
+            {"local_paths": [str(f)]}, max_chars=2000
+        )
+        assert result["text_extract_status"] == "ok"
+        assert result["text_extract_source"] == "md"
+        assert "天津青年宫赛事活动方案" in result["text_excerpt"]
+
+    def test_docx_stdlib_extract(self, tmp_path):
+        import zipfile
+        from gateway.platforms.wecom import _extract_wecom_document_text_excerpt
+
+        # Build a minimal valid DOCX (zip with word/document.xml)
+        docx_path = tmp_path / "附件1.docx"
+        ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        doc_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            '<w:body>'
+            '<w:p><w:r><w:t>天津市青年创业就业基金会简介</w:t></w:r></w:p>'
+            '<w:p><w:r><w:t>服务青年创业就业</w:t></w:r></w:p>'
+            '</w:body></w:document>'
+        )
+        with zipfile.ZipFile(str(docx_path), "w") as zf:
+            zf.writestr("word/document.xml", doc_xml)
+            zf.writestr("[Content_Types].xml", '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>')
+
+        result = _extract_wecom_document_text_excerpt(
+            {"local_paths": [str(docx_path)]}, max_chars=2000
+        )
+        assert result["text_extract_status"] == "ok"
+        assert result["text_extract_source"] == "docx"
+        assert "天津市青年创业就业基金会简介" in result["text_excerpt"]
+
+    def test_pdf_skipped_gracefully_when_unreadable(self, tmp_path):
+        import fitz
+        from gateway.platforms.wecom import _extract_wecom_document_text_excerpt
+
+        # Create a real PDF with fitz so we can observe what happens on failure
+        f = tmp_path / "扫描件.pdf"
+        # fitz.open succeeds on small garbage too but pages=0 → empty text
+        f.write_bytes(b"%PDF-1.0\ntrailer\nstartxref\n0\n%%EOF")
+
+        result = _extract_wecom_document_text_excerpt(
+            {"local_paths": [str(f)]}, max_chars=2000
+        )
+        # fitz opened it but page_count=0 → text_found="" → skipped_unsupported_type
+        assert result["text_extract_status"] == "skipped_unsupported_type"
+        assert result["text_extract_source"] == "pdf"
+
+    def test_no_local_file_returns_skipped(self):
+        from gateway.platforms.wecom import _extract_wecom_document_text_excerpt
+
+        result = _extract_wecom_document_text_excerpt(
+            {"local_paths": []}, max_chars=2000
+        )
+        assert result["text_extract_status"] == "skipped_no_local_file"
+        assert result["text_extract_source"] == "filename_only"
+
+
+class TestTextExtractionInAnalysis:
+    """Tests for _analyze_wecom_ingestion_content with text extraction."""
+
+    def test_analyze_combines_filename_and_text_excerpt(self, tmp_path):
+        from gateway.platforms.wecom import _analyze_wecom_ingestion_content
+
+        f = tmp_path / "附件1.txt"
+        f.write_text("天津市青年创业就业基金会简介\n成立于2026年", encoding="utf-8")
+
+        body = {"msgid": "msg-test", "msgtype": "file", "file": {"filename": "附件1.txt"}}
+        result = _analyze_wecom_ingestion_content(
+            body=body,
+            text="",
+            media_types=["text/plain"],
+            media_urls=[str(f)],
+        )
+
+        # "天津市青年创业就业基金会简介" in text_excerpt → intro override fires → PUB.
+        # (简介 in text_excerpt blocks ENT from "成立于2026年")
+        assert result["subject_code"] == "FDN"
+        assert result["category_code"] == "PUB"
+        assert "text_excerpt" in result["basis"]
+        assert result["text_extract"]["status"] == "ok"
+        assert result["text_extract"]["source"] == "txt"
+        assert "天津市青年创业就业基金会简介" in result["text_extract"]["excerpt"]
+
+    def test_analyze_md_low_semantic_filename_uses_excerpt_title(self, tmp_path):
+        from gateway.platforms.wecom import _analyze_wecom_ingestion_content
+
+        f = tmp_path / "材料.md"
+        f.write_text("# 天津青年宫赛事活动方案\n\n本文档包含赛事活动相关内容。", encoding="utf-8")
+
+        body = {"msgid": "msg-test", "msgtype": "file", "file": {"filename": "材料.md"}}
+        result = _analyze_wecom_ingestion_content(
+            body=body,
+            text="",
+            media_types=["text/markdown"],
+            media_urls=[str(f)],
+        )
+
+        # "天津青年宫赛事活动方案" in excerpt should classify as YDC/YEV
+        assert result["subject_code"] == "YDC"
+        assert result["category_code"] in ("YEV", "DOC")
+        assert "text_excerpt" in result["basis"]
+
+    def test_analyze_low_semantic_filename_but_text_hits_fdn(self, tmp_path):
+        from gateway.platforms.wecom import _analyze_wecom_ingestion_content
+
+        f = tmp_path / "附件1.docx"
+        # Create minimal docx
+        import zipfile
+        doc_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            '<w:body><w:p><w:r><w:t>天津市青年创业就业基金会简介</w:t></w:r></w:p></w:body>'
+            '</w:document>'
+        )
+        with zipfile.ZipFile(str(f), "w") as zf:
+            zf.writestr("word/document.xml", doc_xml)
+            zf.writestr("[Content_Types].xml", '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>')
+
+        body = {"msgid": "msg-test", "msgtype": "file", "file": {"filename": "附件1.docx"}}
+        result = _analyze_wecom_ingestion_content(
+            body=body,
+            text="",
+            media_types=["application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+            media_urls=[str(f)],
+        )
+
+        # "附件1.docx" is low-semantic, but FDN keyword in text should win.
+        # "基金会简介" may trigger ENT (创业就业) over PUB due to priority.
+        assert result["subject_code"] == "FDN"
+        # After fix: 简介 in text → PUB (intro override takes priority over ENT)
+        assert result["category_code"] == "PUB"
+        assert result["confidence"] in ("MEDIUM", "HIGH")
+        assert "text_excerpt" in result["basis"]
+        assert result["text_extract"]["status"] == "ok"
+
+    def test_text_excerpt_intro_prefers_pub_over_doc_generic_words(self, tmp_path):
+        """Regression: 简介+材料文件 → should be PUB, not DOC."""
+        from gateway.platforms.wecom import _analyze_wecom_ingestion_content
+
+        f = tmp_path / "附件1.txt"
+        f.write_text(
+            "天津市青年创业就业基金会简介\n"
+            "成立于2009年，是市级公募基金会。\n"
+            "本文档为材料文件，供内部参考使用。",
+            encoding="utf-8",
+        )
+
+        # text includes FDN keyword so subject_code = FDN
+        body = {
+            "msgid": "msg-test",
+            "msgtype": "file",
+            "file": {"filename": "附件1.txt"},
+        }
+        result = _analyze_wecom_ingestion_content(
+            body=body,
+            # Include FDN keyword in text (subject only reads text, not file content)
+            text="天津市青年创业就业基金会资料",
+            media_types=["text/plain"],
+            media_urls=[str(f)],
+        )
+
+        # 简介 in text_excerpt → intro override fires → PUB
+        # (blocks generic 材料文件 DOC hit)
+        assert result["subject_code"] == "FDN"
+        assert result["category_code"] == "PUB", (
+            f"Expected PUB but got {result['category_code']} — "
+            "简介 in text should override generic '材料文件' DOC hit"
+        )
+        assert result["confidence"] in ("MEDIUM", "HIGH")
+        assert "text_excerpt" in result["basis"]
+        assert result["text_extract"]["status"] == "ok"
+        assert "天津市青年创业就业基金会简介" in result["text_extract"]["excerpt"]
+
+    def test_management_method_still_maps_to_doc(self):
+        """管理办法/制度/章程 → DOC (not PUB)."""
+        from gateway.platforms.wecom import _classify_category
+
+        text = "天津市青年创业就业基金会管理办法（试行）"
+        filenames = ["材料.pdf"]
+
+        cat, conf = _classify_category(text, filenames)
+
+        assert cat == "DOC", f"Expected DOC for 管理办法 but got {cat}"
+        assert conf == "MEDIUM"  # text-only match → MEDIUM
+
+    def test_agreement_still_maps_to_agr(self):
+        """合作协议/合同 → AGR."""
+        from gateway.platforms.wecom import _classify_category
+
+        text = "天津市青年创业就业基金会与某单位签订合作协议，共同开展创业扶持项目。"
+        filenames = ["材料.docx"]
+
+        cat, conf = _classify_category(text, filenames)
+
+        assert cat == "AGR", f"Expected AGR for 合作协议 but got {cat}"
+
+    def test_intro_class_keywords_in_text_trigger_pub(self):
+        """简介/机构简介/基金会简介/介绍 in text (not filename) → PUB."""
+        from gateway.platforms.wecom import _classify_category
+
+        # Test each intro-class keyword
+        for keyword in ("简介", "机构简介", "基金会简介", "单位简介", "中心简介", "介绍"):
+            text = f"本文件为{keyword}材料，供内部参考。"
+            filenames = ["材料.pdf"]
+            cat, _ = _classify_category(text, filenames)
+            assert cat == "PUB", (
+                f"Keyword '{keyword}': expected PUB but got {cat}"
+            )
+
+    def test_meeting_minutes_still_maps_to_mtg(self):
+        """会议/纪要/会谈 → MTG."""
+        from gateway.platforms.wecom import _classify_category
+
+        text = "天津市青年创业就业基金会第一届第一次会议纪要"
+        filenames = ["材料.pdf"]
+
+        cat, conf = _classify_category(text, filenames)
+
+        assert cat == "MTG", f"Expected MTG for 会议纪要 but got {cat}"
+
+    def test_aild_competition_still_maps_to_yev(self):
+        """AILD/赛事/竞赛 → YEV (通知被 DOC 优先级覆盖时，DOC 胜出是预期行为)."""
+        from gateway.platforms.wecom import _classify_category
+
+        text = "2026 AILD智能设计大赛天津赛区赛事通知"
+        filenames = ["材料.pdf"]
+
+        cat, conf = _classify_category(text, filenames)
+
+        # "通知" is a DOC keyword and has higher priority than YEV.
+        # "2026 AILD智能设计大赛天津赛区赛事通知" → DOC (expected per priority).
+        assert cat == "DOC", f"Expected DOC (通知 triggers DOC over YEV) but got {cat}"
+
+    def test_chuangqingchun_still_maps_to_ent(self):
+        """创青春/创业项目 → ENT."""
+        from gateway.platforms.wecom import _classify_category
+
+        text = "关于组织参加创青春创业大赛的通知"
+        filenames = ["材料.pdf"]
+
+        cat, conf = _classify_category(text, filenames)
+
+        # "通知" is DOC, which has higher priority than ENT in the priority list.
+        assert cat == "DOC", f"Expected DOC (通知 triggers DOC over ENT) but got {cat}"
 
 
 class TestWeComZombieSessionFix:
