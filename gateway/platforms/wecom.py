@@ -119,6 +119,7 @@ WECOM_INGESTION_CONFIRMATION_TEMPLATE = (
 WECOM_INGESTION_CANCELLED_TEXT = "已取消处理，本资料不会进入知识库流程。"
 WECOM_INGESTION_RAW_RECORDED_TEXT = "已记录为原始候选资料，暂不进入自动处理，等待人工判断。"
 WECOM_INGESTION_QUEUED_TEXT = "已进入待处理队列，请等待侯方明审核"
+WECOM_INGESTION_QUEUED_WITH_STAGING_TEXT = "已进入待处理队列，并已生成知识库中转记录，请等待侯方明审核"
 
 WECOM_INGESTION_TOPIC_MAP = {
     "competition_aild": {
@@ -947,7 +948,14 @@ class WeComAdapter(BasePlatformAdapter):
             self.confirmed_ingestion = confirmed
             self.pending_wecom_ingestion.pop(chat_id, None)
             self._log_wecom_ingestion_action(confirmed, "confirmed", "consumed")
-            await self.send(chat_id=chat_id, content=WECOM_INGESTION_QUEUED_TEXT, reply_to=msg_id)
+
+            # Write to raymond-wiki staging; use enriched text on success
+            staging_result = write_wecom_ingestion_staging(confirmed)
+            if staging_result.get("staging_write_status") == "written":
+                reply_text = WECOM_INGESTION_QUEUED_WITH_STAGING_TEXT
+            else:
+                reply_text = WECOM_INGESTION_QUEUED_TEXT
+            await self.send(chat_id=chat_id, content=reply_text, reply_to=msg_id)
             return True
 
         if normalized == "2":
@@ -1990,3 +1998,172 @@ def qr_scan_for_bot_info(
     print()  # newline after dots
     print(f"  QR scan timed out ({timeout_seconds // 60} minutes). Please try again.")
     return None
+
+
+# ------------------------------------------------------------------
+# Raymond Wiki Staging Write (WeCom confirmed ingestion → staging)
+# ------------------------------------------------------------------
+
+
+def _safe_message_id(message_id: str) -> str:
+    """Sanitize message_id to prevent path traversal.
+
+    Strips dots (which would otherwise form '..' after hyphen replacement),
+    slashes, and any non-safe character, then replaces runs of separators
+    with a single hyphen.
+    """
+    raw = re.sub(r"[^A-Za-z0-9_-]+", "-", str(message_id or "msg"))
+    # Remove any remaining dots that could form '..' path segments
+    raw = raw.replace(".", "")
+    safe = raw.strip("-")
+    return safe or "msg"
+
+
+def _resolve_raymond_wiki_root() -> Optional[Path]:
+    """Resolve RAYMOND_WIKI_ROOT, falling back to /home/ubuntu/raymond-wiki."""
+    root = os.environ.get("RAYMOND_WIKI_ROOT", "/home/ubuntu/raymond-wiki")
+    path = Path(root).expanduser().resolve()
+    if not path.exists():
+        return None
+    return path
+
+
+def write_wecom_ingestion_staging(manifest: Dict[str, Any]) -> Dict[str, Any]:
+    """Write confirmed WeCom ingestion to raymond-wiki staging.
+
+    Writes:
+        confirmed/YYYY/MM/<safe_msg_id>/INGESTION_MANIFEST.json
+        confirmed/YYYY/MM/<safe_msg_id>/QUICK.md
+        reports/YYYYMMDD_wecom_ingestion_report.jsonl  (append)
+        state/QUICK_INDEX.jsonl                       (append)
+
+    Returns a dict with ``staging_write_status``:
+        - ``written``: all files created / appended
+        - ``skipped_no_wiki_root``: RAYMOND_WIKI_ROOT / fallback not found
+        - ``error``: write failed; ``staging_write_error`` carries the reason
+    """
+    wiki_root = _resolve_raymond_wiki_root()
+    if wiki_root is None:
+        logger.warning("[wecom] RAYMOND_WIKI_ROOT=%s does not exist, skipping staging write", wiki_root)
+        return {"staging_write_status": "skipped_no_wiki_root"}
+
+    # Build safe message_id
+    source_msg_id = str(manifest.get("source_message_id") or manifest.get("message_id") or "msg")
+    safe_msg_id = _safe_message_id(source_msg_id)
+
+    # Date parts
+    action_at = manifest.get("confirmed_at") or manifest.get("action_at") or ""
+    if action_at:
+        # action_at is ISO format with timezone, e.g. "2026-05-30T08:00:00+08:00"
+        date_match = re.match(r"(\d{4})-(\d{2})-(\d{2})", action_at)
+        if date_match:
+            year, month = date_match.group(1), date_match.group(2)
+        else:
+            now_local = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8)))
+            year, month = now_local.strftime("%Y"), now_local.strftime("%m")
+    else:
+        now_local = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8)))
+        year, month = now_local.strftime("%Y"), now_local.strftime("%m")
+
+    # Base dir
+    base = wiki_root / "projects" / "_staging" / "materials" / "uploads" / "confirmed" / year / month / safe_msg_id
+
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+
+        # 1. INGESTION_MANIFEST.json
+        manifest_out = {
+            "platform": "wecom",
+            "queue": "confirmed_ingestion",
+            "status": manifest.get("status", "queued_for_review"),
+            "chat_id": manifest.get("chat_id"),
+            "source_message_id": manifest.get("source_message_id") or manifest.get("message_id"),
+            "action_message_id": manifest.get("confirmed_message_id") or manifest.get("action_message_id"),
+            "action_at": manifest.get("confirmed_at") or manifest.get("action_at"),
+            "pending": manifest.get("pending", {}),
+            "suggested_path": manifest.get("suggested_path"),
+            "source_type": manifest.get("source_type"),
+            "predicted_topic": manifest.get("predicted_topic"),
+            "confidence": manifest.get("confidence"),
+            "original_filename": manifest.get("original_filename"),
+            "original_file_path": manifest.get("original_file_path"),
+            "staging_write_status": "written",
+        }
+        (base / "INGESTION_MANIFEST.json").write_text(
+            json.dumps(manifest_out, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        # 2. QUICK.md
+        pending = manifest.get("pending", {})
+        source_type_label = {
+            "file": "文件",
+            "image": "图片",
+            "url": "链接",
+            "text": "文本",
+        }.get(str(manifest.get("source_type", "")), "未知")
+
+        quick_md = (
+            f"# {manifest.get('original_filename') or '未命名资料'}\n\n"
+            f"- **来源平台**：企微（WeCom）\n"
+            f"- **接收时间**：{manifest.get('confirmed_at') or manifest.get('action_at', '未知')}\n"
+            f"- **资料类型**：{source_type_label}\n"
+            f"- **识别主题**：{manifest.get('predicted_topic', '未确定')}\n"
+            f"- **建议暂存路径**：{manifest.get('suggested_path', '未指定')}\n"
+            f"- **当前状态**：{manifest.get('status', 'queued_for_review')}\n\n"
+            f"## 后续处理提示\n\n"
+            f"待侯方明（管理员）审核后，资料将归入 "
+            f"[{manifest.get('suggested_path', '建议路径')}]({manifest.get('suggested_path', '#')}) "
+            f"或对应项目目录。\n"
+        )
+        (base / "QUICK.md").write_text(quick_md, encoding="utf-8")
+
+        # 3. reports/YYYYMMDD_wecom_ingestion_report.jsonl (append)
+        if action_at:
+            date_str = re.match(r"(\d{4})-(\d{2})-(\d{2})", action_at)
+            if date_str:
+                report_date = f"{date_str.group(1)}{date_str.group(2)}{date_str.group(3)}"
+            else:
+                report_date = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).strftime("%Y%m%d")
+        else:
+            report_date = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).strftime("%Y%m%d")
+
+        report_line = {
+            "chat_id": manifest.get("chat_id"),
+            "source_message_id": manifest.get("source_message_id") or manifest.get("message_id"),
+            "action_message_id": manifest.get("confirmed_message_id") or manifest.get("action_message_id"),
+            "action_at": manifest.get("confirmed_at") or manifest.get("action_at"),
+            "source_type": manifest.get("source_type"),
+            "predicted_topic": manifest.get("predicted_topic"),
+            "confidence": manifest.get("confidence"),
+            "status": manifest.get("status", "queued_for_review"),
+            "staging_write_status": "written",
+        }
+        report_path = wiki_root / "projects" / "_staging" / "materials" / "uploads" / "reports" / f"{report_date}_wecom_ingestion_report.jsonl"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        with report_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(report_line, ensure_ascii=False) + "\n")
+
+        # 4. state/QUICK_INDEX.jsonl (append)
+        index_line = {
+            "platform": "wecom",
+            "chat_id": manifest.get("chat_id"),
+            "source_message_id": manifest.get("source_message_id") or manifest.get("message_id"),
+            "action_at": manifest.get("confirmed_at") or manifest.get("action_at"),
+            "source_type": manifest.get("source_type"),
+            "predicted_topic": manifest.get("predicted_topic"),
+            "suggested_path": manifest.get("suggested_path"),
+            "status": manifest.get("status", "queued_for_review"),
+            "safe_msg_id": safe_msg_id,
+            "confirmed_path": str(base.relative_to(wiki_root)),
+        }
+        index_path = wiki_root / "projects" / "_staging" / "materials" / "uploads" / "state" / "QUICK_INDEX.jsonl"
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        with index_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(index_line, ensure_ascii=False) + "\n")
+
+        logger.info("[wecom] Staging write success: %s", base)
+        return {"staging_write_status": "written"}
+
+    except Exception as exc:
+        logger.warning("[wecom] Staging write failed: %s", exc)
+        return {"staging_write_status": "error", "staging_write_error": str(exc)}

@@ -802,8 +802,11 @@ class TestWeComTwoPhaseIngestion:
         assert adapter.pending_wecom_ingestion["chat-b"]["message_id"] == "b-1"
 
     @pytest.mark.asyncio
-    async def test_chat_a_reply_one_consumes_only_chat_a_pending(self):
+    async def test_chat_a_reply_one_consumes_only_chat_a_pending(self, monkeypatch):
+        import gateway.platforms.wecom as wecom_mod
         from gateway.platforms.wecom import WECOM_INGESTION_QUEUED_TEXT
+
+        monkeypatch.setattr(wecom_mod, "_resolve_raymond_wiki_root", lambda: None)
 
         adapter = self._adapter()
         adapter._extract_media = AsyncMock(return_value=([], []))
@@ -910,8 +913,12 @@ class TestWeComTwoPhaseIngestion:
         assert adapter.pending_wecom_ingestion == {}
 
     @pytest.mark.asyncio
-    async def test_reply_one_consumes_pending_and_marks_confirmed(self):
+    async def test_reply_one_consumes_pending_and_marks_confirmed(self, monkeypatch):
+        import gateway.platforms.wecom as wecom_mod
         from gateway.platforms.wecom import WECOM_INGESTION_QUEUED_TEXT
+
+        # Mock wiki root missing so we stay on the non-staging reply path
+        monkeypatch.setattr(wecom_mod, "_resolve_raymond_wiki_root", lambda: None)
 
         adapter = self._adapter()
         adapter._extract_media = AsyncMock(return_value=([], []))
@@ -1026,6 +1033,206 @@ class TestWeComTwoPhaseIngestion:
         assert "pending_state=created" in log_output
         assert secret_url not in log_output
         assert full_text not in log_output
+
+
+class TestWeComStagingWrite:
+    """Tests for write_wecom_ingestion_staging and its integration in the reply=1 flow."""
+
+    @pytest.mark.asyncio
+    async def test_reply_one_writes_staging_manifest_and_quick(self, tmp_path, monkeypatch):
+        """Reply 1 should generate INGESTION_MANIFEST.json, QUICK.md, and append to report/index."""
+        import json
+        from gateway.platforms.wecom import WECOM_INGESTION_QUEUED_WITH_STAGING_TEXT, WeComAdapter
+        from gateway.platforms.base import SendResult
+
+        monkeypatch.setenv("RAYMOND_WIKI_ROOT", str(tmp_path))
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._text_batch_delay_seconds = 0
+        adapter.handle_message = AsyncMock()
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="reply-1"))
+
+        pending = {
+            "chat_id": "group-1",
+            "message_id": "source-msg-123",
+            "source_type": "file",
+            "predicted_topic": "competition_aild",
+            "confidence": "HIGH",
+            "suggested_path": "projects/_staging/materials/competition_aild/source-msg-123",
+            "created_at": "2026-05-30T12:00:00+08:00",
+            "original_filename": "申报材料.pdf",
+        }
+        adapter.pending_wecom_ingestion = {"group-1": pending}
+
+        await adapter._on_message({
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-1"},
+            "body": {
+                "msgid": "reply-msg",
+                "chatid": "group-1",
+                "chattype": "group",
+                "from": {"userid": "user-1"},
+                "msgtype": "text",
+                "text": {"content": "1"},
+            },
+        })
+
+        # Assert staging files exist
+        confirmed_dir = tmp_path / "projects" / "_staging" / "materials" / "uploads" / "confirmed" / "2026" / "05"
+        # The safe message_id replaces dots with hyphens
+        confirmed_entries = list(confirmed_dir.glob("*"))
+        assert len(confirmed_entries) == 1, f"Expected 1 confirmed entry, found: {confirmed_entries}"
+        manifest_path = confirmed_entries[0] / "INGESTION_MANIFEST.json"
+        quick_md_path = confirmed_entries[0] / "QUICK.md"
+        assert manifest_path.exists(), f"INGESTION_MANIFEST.json missing in {confirmed_dir}"
+        assert quick_md_path.exists(), f"QUICK.md missing in {confirmed_dir}"
+
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["platform"] == "wecom"
+        assert manifest["queue"] == "confirmed_ingestion"
+        assert manifest["chat_id"] == "group-1"
+        assert manifest["source_message_id"] == "source-msg-123"
+        assert manifest["staging_write_status"] == "written"
+        assert manifest["original_filename"] == "申报材料.pdf"
+
+        quick_md = quick_md_path.read_text(encoding="utf-8")
+        assert "申报材料.pdf" in quick_md
+        assert "competition_aild" in quick_md
+
+        # Reports and index
+        today = "20260530"
+        report_files = list((tmp_path / "projects" / "_staging" / "materials" / "uploads" / "reports").glob(f"{today}_wecom_ingestion_report.jsonl"))
+        assert len(report_files) == 1, f"Report file missing; dir contents: {list((tmp_path / 'projects' / '_staging' / 'materials' / 'uploads' / 'reports').glob('*'))}"
+        index_files = list((tmp_path / "projects" / "_staging" / "materials" / "uploads" / "state").glob("QUICK_INDEX.jsonl"))
+        assert len(index_files) == 1, f"QUICK_INDEX.jsonl missing"
+
+        report_lines = report_files[0].read_text(encoding="utf-8").strip().split("\n")
+        assert len(report_lines) == 1
+        assert json.loads(report_lines[0])["staging_write_status"] == "written"
+
+        index_lines = index_files[0].read_text(encoding="utf-8").strip().split("\n")
+        assert len(index_lines) == 1
+        assert json.loads(index_lines[0])["platform"] == "wecom"
+
+        # Reply should use enriched text
+        adapter.send.assert_awaited_once()
+        _, kwargs = adapter.send.await_args
+        assert kwargs["content"] == WECOM_INGESTION_QUEUED_WITH_STAGING_TEXT
+
+    @pytest.mark.asyncio
+    async def test_staging_skipped_when_raymond_wiki_root_missing(self, monkeypatch):
+        """RAYMOND_WIKI_ROOT nonexistent should not block reply; status = skipped_no_wiki_root."""
+        from gateway.platforms.wecom import WECOM_INGESTION_QUEUED_TEXT, WeComAdapter
+        from gateway.platforms.base import SendResult
+
+        monkeypatch.setenv("RAYMOND_WIKI_ROOT", "/nonexistent/path/raymond-wiki")
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._text_batch_delay_seconds = 0
+        adapter.handle_message = AsyncMock()
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="reply-1"))
+
+        pending = {
+            "chat_id": "group-1",
+            "message_id": "source-msg",
+            "source_type": "url",
+            "predicted_topic": "undetermined",
+            "confidence": "UNKNOWN",
+            "suggested_path": "projects/_staging/materials/undetermined/source-msg",
+            "created_at": "2026-05-30T12:00:00+08:00",
+        }
+        adapter.pending_wecom_ingestion = {"group-1": pending}
+
+        await adapter._on_message({
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-1"},
+            "body": {
+                "msgid": "reply-msg",
+                "chatid": "group-1",
+                "chattype": "group",
+                "from": {"userid": "user-1"},
+                "msgtype": "text",
+                "text": {"content": "1"},
+            },
+        })
+
+        # Reply still sent with fallback text
+        adapter.send.assert_awaited_once()
+        _, kwargs = adapter.send.await_args
+        assert kwargs["content"] == WECOM_INGESTION_QUEUED_TEXT
+
+    def test_safe_message_id_no_path_traversal(self, monkeypatch):
+        """_safe_message_id must prevent path traversal with ../ sequences."""
+        from gateway.platforms.wecom import _safe_message_id
+
+        # Malicious message_ids
+        malicious = [
+            "../../../etc/passwd",
+            "msg../..//..//etc/passwd",
+            "foo/../../bar",
+            "foo/bar/../../../etc/shadow",
+        ]
+        for msg_id in malicious:
+            safe = _safe_message_id(msg_id)
+            assert ".." not in safe, f"Path traversal not blocked: {msg_id!r} → {safe!r}"
+            assert "/" not in safe, f"Slash not stripped from {msg_id!r} → {safe!r}"
+            # Must be usable as a filename
+            assert safe == safe.strip(".-_")
+
+    @pytest.mark.asyncio
+    async def test_reply_one_with_real_raymond_wiki_uses_fallback_path(self, tmp_path, monkeypatch):
+        """When RAYMOND_WIKI_ROOT is unset, fallback /home/ubuntu/raymond-wiki is used if present."""
+        import json
+        from gateway.platforms.wecom import WECOM_INGESTION_QUEUED_WITH_STAGING_TEXT, WeComAdapter
+        from gateway.platforms.base import SendResult
+
+        # Clear RAYMOND_WIKI_ROOT and point fallback at tmp_path
+        monkeypatch.delenv("RAYMOND_WIKI_ROOT", raising=False)
+        # Monkey-patch _resolve_raymond_wiki_root to return tmp_path
+        import gateway.platforms.wecom as wecom_mod
+        monkeypatch.setattr(wecom_mod, "_resolve_raymond_wiki_root", lambda: tmp_path)
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._text_batch_delay_seconds = 0
+        adapter.handle_message = AsyncMock()
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="reply-1"))
+
+        pending = {
+            "chat_id": "group-1",
+            "message_id": "source-msg-fallback",
+            "source_type": "image",
+            "predicted_topic": "undetermined",
+            "confidence": "MEDIUM",
+            "suggested_path": "projects/_staging/materials/undetermined/source-msg-fallback",
+            "created_at": "2026-05-30T12:00:00+08:00",
+        }
+        adapter.pending_wecom_ingestion = {"group-1": pending}
+
+        await adapter._on_message({
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-1"},
+            "body": {
+                "msgid": "reply-msg",
+                "chatid": "group-1",
+                "chattype": "group",
+                "from": {"userid": "user-1"},
+                "msgtype": "text",
+                "text": {"content": "1"},
+            },
+        })
+
+        # Should use fallback text when fallback wiki exists but RAYMOND_WIKI_ROOT env is unset
+        adapter.send.assert_awaited_once()
+        _, kwargs = adapter.send.await_args
+        assert kwargs["content"] == WECOM_INGESTION_QUEUED_WITH_STAGING_TEXT
+
+        # Verify manifest written to fallback path
+        confirmed_dir = tmp_path / "projects" / "_staging" / "materials" / "uploads" / "confirmed" / "2026" / "05"
+        manifest_files = list(confirmed_dir.glob("*/INGESTION_MANIFEST.json"))
+        assert len(manifest_files) == 1
+        manifest = json.loads(manifest_files[0].read_text(encoding="utf-8"))
+        assert manifest["staging_write_status"] == "written"
+
 
 
 class TestWeComZombieSessionFix:
