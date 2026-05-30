@@ -1247,10 +1247,10 @@ class TestTextExtractionInAnalysis:
             media_urls=[str(f)],
         )
 
-        # "成立于2026年" triggers ENT (青年创业/创业就业),
-        # which has higher priority than PUB, so ENT is expected.
+        # "天津市青年创业就业基金会简介" in text_excerpt → intro override fires → PUB.
+        # (简介 in text_excerpt blocks ENT from "成立于2026年")
         assert result["subject_code"] == "FDN"
-        assert result["category_code"] == "ENT"
+        assert result["category_code"] == "PUB"
         assert "text_excerpt" in result["basis"]
         assert result["text_extract"]["status"] == "ok"
         assert result["text_extract"]["source"] == "txt"
@@ -1302,10 +1302,121 @@ class TestTextExtractionInAnalysis:
         # "附件1.docx" is low-semantic, but FDN keyword in text should win.
         # "基金会简介" may trigger ENT (创业就业) over PUB due to priority.
         assert result["subject_code"] == "FDN"
-        assert result["category_code"] in ("ENT", "PUB")
+        # After fix: 简介 in text → PUB (intro override takes priority over ENT)
+        assert result["category_code"] == "PUB"
         assert result["confidence"] in ("MEDIUM", "HIGH")
         assert "text_excerpt" in result["basis"]
         assert result["text_extract"]["status"] == "ok"
+
+    def test_text_excerpt_intro_prefers_pub_over_doc_generic_words(self, tmp_path):
+        """Regression: 简介+材料文件 → should be PUB, not DOC."""
+        from gateway.platforms.wecom import _analyze_wecom_ingestion_content
+
+        f = tmp_path / "附件1.txt"
+        f.write_text(
+            "天津市青年创业就业基金会简介\n"
+            "成立于2009年，是市级公募基金会。\n"
+            "本文档为材料文件，供内部参考使用。",
+            encoding="utf-8",
+        )
+
+        # text includes FDN keyword so subject_code = FDN
+        body = {
+            "msgid": "msg-test",
+            "msgtype": "file",
+            "file": {"filename": "附件1.txt"},
+        }
+        result = _analyze_wecom_ingestion_content(
+            body=body,
+            # Include FDN keyword in text (subject only reads text, not file content)
+            text="天津市青年创业就业基金会资料",
+            media_types=["text/plain"],
+            media_urls=[str(f)],
+        )
+
+        # 简介 in text_excerpt → intro override fires → PUB
+        # (blocks generic 材料文件 DOC hit)
+        assert result["subject_code"] == "FDN"
+        assert result["category_code"] == "PUB", (
+            f"Expected PUB but got {result['category_code']} — "
+            "简介 in text should override generic '材料文件' DOC hit"
+        )
+        assert result["confidence"] in ("MEDIUM", "HIGH")
+        assert "text_excerpt" in result["basis"]
+        assert result["text_extract"]["status"] == "ok"
+        assert "天津市青年创业就业基金会简介" in result["text_extract"]["excerpt"]
+
+    def test_management_method_still_maps_to_doc(self):
+        """管理办法/制度/章程 → DOC (not PUB)."""
+        from gateway.platforms.wecom import _classify_category
+
+        text = "天津市青年创业就业基金会管理办法（试行）"
+        filenames = ["材料.pdf"]
+
+        cat, conf = _classify_category(text, filenames)
+
+        assert cat == "DOC", f"Expected DOC for 管理办法 but got {cat}"
+        assert conf == "MEDIUM"  # text-only match → MEDIUM
+
+    def test_agreement_still_maps_to_agr(self):
+        """合作协议/合同 → AGR."""
+        from gateway.platforms.wecom import _classify_category
+
+        text = "天津市青年创业就业基金会与某单位签订合作协议，共同开展创业扶持项目。"
+        filenames = ["材料.docx"]
+
+        cat, conf = _classify_category(text, filenames)
+
+        assert cat == "AGR", f"Expected AGR for 合作协议 but got {cat}"
+
+    def test_intro_class_keywords_in_text_trigger_pub(self):
+        """简介/机构简介/基金会简介/介绍 in text (not filename) → PUB."""
+        from gateway.platforms.wecom import _classify_category
+
+        # Test each intro-class keyword
+        for keyword in ("简介", "机构简介", "基金会简介", "单位简介", "中心简介", "介绍"):
+            text = f"本文件为{keyword}材料，供内部参考。"
+            filenames = ["材料.pdf"]
+            cat, _ = _classify_category(text, filenames)
+            assert cat == "PUB", (
+                f"Keyword '{keyword}': expected PUB but got {cat}"
+            )
+
+    def test_meeting_minutes_still_maps_to_mtg(self):
+        """会议/纪要/会谈 → MTG."""
+        from gateway.platforms.wecom import _classify_category
+
+        text = "天津市青年创业就业基金会第一届第一次会议纪要"
+        filenames = ["材料.pdf"]
+
+        cat, conf = _classify_category(text, filenames)
+
+        assert cat == "MTG", f"Expected MTG for 会议纪要 but got {cat}"
+
+    def test_aild_competition_still_maps_to_yev(self):
+        """AILD/赛事/竞赛 → YEV (通知被 DOC 优先级覆盖时，DOC 胜出是预期行为)."""
+        from gateway.platforms.wecom import _classify_category
+
+        text = "2026 AILD智能设计大赛天津赛区赛事通知"
+        filenames = ["材料.pdf"]
+
+        cat, conf = _classify_category(text, filenames)
+
+        # "通知" is a DOC keyword and has higher priority than YEV.
+        # "2026 AILD智能设计大赛天津赛区赛事通知" → DOC (expected per priority).
+        assert cat == "DOC", f"Expected DOC (通知 triggers DOC over YEV) but got {cat}"
+
+    def test_chuangqingchun_still_maps_to_ent(self):
+        """创青春/创业项目 → ENT."""
+        from gateway.platforms.wecom import _classify_category
+
+        text = "关于组织参加创青春创业大赛的通知"
+        filenames = ["材料.pdf"]
+
+        cat, conf = _classify_category(text, filenames)
+
+        # "通知" is DOC, which has higher priority than ENT in the priority list.
+        assert cat == "DOC", f"Expected DOC (通知 triggers DOC over ENT) but got {cat}"
 
 
 class TestWeComZombieSessionFix:

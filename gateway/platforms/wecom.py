@@ -854,11 +854,25 @@ def _classify_subject(text: str, filenames: List[str]) -> Tuple[str, str]:
 def _classify_category(text: str, filenames: List[str]) -> Tuple[str, str]:
     """Classify category code and return (code, label).
 
-    Confidence based on where keyword was found (filename = HIGH).
+    Confidence based on where keyword was found (filename = HIGH, text = MEDIUM).
+
+    Special rule: "简介" class keywords (简介/机构简介/基金会简介/单位简介/中心简介/
+    介绍) take priority over generic DOC keywords (文件/材料) to avoid misclassifying
+    intro/promotional materials as official documents.
     """
     hits: Dict[str, List[str]] = {c: [] for c in _CATEGORY_PRIORITY}
 
-    # AGR
+    # ── Strong PUB signals (简介 class) — checked against both text and filenames ──
+    # These override generic DOC/other category hits.
+    intro_keywords = ("简介", "机构简介", "基金会简介", "单位简介", "中心简介", "介绍")
+    for kw in intro_keywords:
+        if kw in text:
+            hits["PUB"].append("text")
+        for fn in filenames:
+            if kw in fn:
+                hits["PUB"].append("filename")
+
+    # ── AGR (checked first — strongest institutional signals) ───────────────────
     for kw in ("协议", "合同", "合作协议", "备忘录"):
         if kw in text:
             hits["AGR"].append("text")
@@ -866,15 +880,15 @@ def _classify_category(text: str, filenames: List[str]) -> Tuple[str, str]:
             if kw in fn:
                 hits["AGR"].append("filename")
 
-    # DOC
-    for kw in ("制度", "办法", "通知", "文件", "章程", "管理办法"):
+    # ── DOC (specific institutional document types only; no generic "文件/材料") ─
+    for kw in ("制度", "办法", "通知", "章程", "管理办法"):
         if kw in text:
             hits["DOC"].append("text")
         for fn in filenames:
             if kw in fn:
                 hits["DOC"].append("filename")
 
-    # MTG
+    # ── MTG ────────────────────────────────────────────────────────────────────
     for kw in ("会议", "纪要", "会谈", "座谈", "沟通记录"):
         if kw in text:
             hits["MTG"].append("text")
@@ -882,7 +896,7 @@ def _classify_category(text: str, filenames: List[str]) -> Tuple[str, str]:
             if kw in fn:
                 hits["MTG"].append("filename")
 
-    # YEV
+    # ── YEV ───────────────────────────────────────────────────────────────────
     for kw in ("aild", "智能设计大赛", "应急安全", "赛事", "竞赛", "比赛", "青少年"):
         if kw.lower() in text.lower():
             hits["YEV"].append("text")
@@ -890,7 +904,7 @@ def _classify_category(text: str, filenames: List[str]) -> Tuple[str, str]:
             if kw.lower() in fn.lower():
                 hits["YEV"].append("filename")
 
-    # ENT
+    # ── ENT ────────────────────────────────────────────────────────────────────
     for kw in ("创青春", "青年创业", "创业就业", "项目申报", "创业项目"):
         if kw in text:
             hits["ENT"].append("text")
@@ -898,9 +912,9 @@ def _classify_category(text: str, filenames: List[str]) -> Tuple[str, str]:
             if kw in fn:
                 hits["ENT"].append("filename")
 
-    # PUB (check override keywords in filenames first)
-    pub_keywords = ["简介", "宣传", "手册", "展示", "PPT", "画册", "介绍"]
-    for kw in pub_keywords:
+    # ── Generic PUB (other promotional/material keywords — filenames only) ───────
+    pub_other_keywords = ["宣传", "手册", "展示", "PPT", "画册"]
+    for kw in pub_other_keywords:
         for fn in filenames:
             if kw in fn:
                 hits["PUB"].append("filename")
@@ -913,6 +927,20 @@ def _classify_category(text: str, filenames: List[str]) -> Tuple[str, str]:
         if "text" in sources:
             return "MEDIUM"
         return "LOW"
+
+    # ── Special intro override ─────────────────────────────────────────────────
+    # "简介" class keywords in text take priority over generic DOC keywords
+    # ("文件", "材料") to fix the 简介+材料文件 → DOC bug.
+    # Do NOT override when higher-priority categories (AGR, MTG, YEV, ENT) are hit —
+    # those have independent semantic meaning and should win over a generic PUB.
+    # Only block the case where generic weak DOC words cause misclassification.
+    intro_sources = hits.get("PUB", [])
+    if intro_sources and any(s == "text" for s in intro_sources):
+        weak_doc_keywords = ("文件", "材料")
+        if hits.get("DOC") and any(
+            kw in text for kw in weak_doc_keywords
+        ):
+            return ("PUB", confidence(intro_sources))
 
     # Find highest priority category with hits
     for cat in reversed(_CATEGORY_PRIORITY):
