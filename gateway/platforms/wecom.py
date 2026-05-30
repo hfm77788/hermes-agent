@@ -106,11 +106,14 @@ VOICE_SUPPORTED_MIMES = {"audio/amr"}
 
 WECOM_INGESTION_CONFIRMATION_TEMPLATE = (
     "已检测到一份可能需要进入知识库处理的资料。\n\n"
-    "初步判断：\n"
+    "初步分析：\n"
     "1. 资料类型：{source_label}\n"
-    "2. 可能主题：{topic_label}\n"
-    "3. 建议暂存位置：{suggested_path}\n"
-    "4. 后续可能归入：{future_location}\n\n"
+    "2. 识别标题：{title}\n"
+    "3. 可能主体：{subject_label}（{subject_code}）\n"
+    "4. 可能类目：{category_label}（{category_code}）\n"
+    "5. 推荐暂存位置：{suggested_path}\n"
+    "6. 后续可能归入：{future_location}\n"
+    "7. 置信度：{confidence}\n\n"
     "请选择：\n"
     "1. 进入知识库自动处理工作流\n"
     "2. 暂不处理\n"
@@ -217,40 +220,61 @@ def _write_wecom_ingestion_staging(manifest: Dict[str, Any]) -> Dict[str, Any]:
         # 2. QUICK.md
         quick_path = confirmed_dir / "QUICK.md"
         topic_label = manifest.get("topic_label", topic)
+        analysis = manifest.get("analysis", {})
+        subject_label = analysis.get("subject_label", "待判断")
+        category_label = analysis.get("category_label", "其他")
+        title = analysis.get("title", "(无标题)")
+        suggested = manifest.get("suggested_path", "")
+        future_loc = manifest.get("future_location", "待确认")
         file_list = []
         for fname in (manifest.get("file_names") or []):
             file_list.append(f"- {fname}")
         file_block = "\n".join(file_list) if file_list else "(无附件)"
         quick_content = (
             f"# WeCom 资料待处理\n\n"
-            f"- 主题：{topic_label}\n"
+            f"- 标题：{title}\n"
+            f"- 资料类型：{topic_label}\n"
             f"- 来源：WeCom\n"
             f"- 时间：{action_at or dt.isoformat()}\n"
-            f"- 附件：\n{file_block}\n"
+            f"- 主体：{subject_label}\n"
+            f"- 类目：{category_label}\n"
+            f"- 推荐暂存路径：{suggested}\n"
+            f"- 后续可能归入：{future_loc}\n"
+            f"- 当前状态：待 GPT 审核\n"
+            f"- 原始文件名：{file_block}\n"
+            f"- 后续处理提示：待 GPT 审核后进入 source-repository 或目标项目\n"
         )
         with open(quick_path, "w", encoding="utf-8") as f:
             f.write(quick_content)
 
         # 3. QUICK_INDEX.jsonl (append)
         index_path = state_dir / "QUICK_INDEX.jsonl"
+        analysis = manifest.get("analysis", {})
         index_entry = {
             "type": "wecom_confirmed_ingestion",
             "topic": topic,
             "safe_msg_id": safe_msg_id,
             "confirmed_at": manifest.get("confirmed_at", ""),
             "path": str(confirmed_dir.relative_to(wiki_root)),
+            "title": analysis.get("title", ""),
+            "subject_code": analysis.get("subject_code", "X"),
+            "category_code": analysis.get("category_code", "OTH"),
+            "confidence": analysis.get("confidence", "UNKNOWN"),
         }
         with open(index_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(index_entry, ensure_ascii=False) + "\n")
 
         # 4. Daily ingestion report (append)
         report_path = report_dir / f"{date_str}_wecom_ingestion_report.jsonl"
+        analysis = manifest.get("analysis", {})
         report_entry = {
             "type": "wecom_confirmed_ingestion",
             "topic": topic,
-            "safe_msg_id": safe_msg_id,
             "confirmed_at": manifest.get("confirmed_at", ""),
-            "message_id": source_msg_id,
+            "subject_code": analysis.get("subject_code", "X"),
+            "category_code": analysis.get("category_code", "OTH"),
+            "confidence": analysis.get("confidence", "UNKNOWN"),
+            "message_id": manifest.get("source_message_id", ""),
             "file_count": len(manifest.get("file_names") or []),
         }
         with open(report_path, "a", encoding="utf-8") as f:
@@ -292,6 +316,348 @@ WECOM_INGESTION_SOURCE_LABELS = {
     "text": "文本",
     "unknown": "未知",
 }
+
+# ─── Ingestion-gate helpers ─────────────────────────────────────────────────────
+
+#: Keywords that indicate an explicit intent to save/ingest into knowledge base.
+_INGESTION_INTENT_PHRASES = (
+    # Chinese
+    "保存到知识库",
+    "入库",
+    "留存",
+    "作为 source 保存",
+    "交给爱马仕整理",
+    "这份资料存一下",
+    "归档",
+    "放到资料库",
+    "存到 raymond wiki",
+    "存入 raymond wiki",
+    "录入知识库",
+    "加到知识库",
+    "作为资料保存",
+    # English / Raymond Wiki
+    "save to raymond wiki",
+    "save to wiki",
+    "save to knowledge base",
+    "ingest into knowledge base",
+    "save to knowledge base",
+    "ingest this",
+    "log this",
+)
+
+
+def _has_explicit_ingestion_intent(text: str) -> bool:
+    """Return True if text explicitly expresses intent to ingest into knowledge base.
+
+    Supports:
+    - Chinese intent phrases (original form): 保存到知识库, 入库, 这份资料存一下 ...
+    - English / Raymond Wiki phrases (case-insensitive via .lower()): save to knowledge base,
+      save to raymond wiki, save to wiki, ingest ...
+    """
+    normalized = str(text or "").strip()
+    if not normalized:
+        return False
+    normalized_lower = normalized.lower()
+    return any(
+        phrase in normalized or phrase in normalized_lower
+        for phrase in _INGESTION_INTENT_PHRASES
+    )
+
+
+#: File extensions that count as attachment triggers.
+_ATTACHMENT_EXTENSIONS = {
+    ".pdf", ".doc", ".docx", ".wps",
+    ".ppt", ".pptx",
+    ".xls", ".xlsx",
+    ".txt", ".md", ".rtf",
+    ".zip", ".rar", ".7z", ".tar", ".gz",
+    ".jpg", ".jpeg", ".png", ".heic", ".webp", ".gif", ".bmp", ".tiff",
+    ".mp4", ".mov", ".avi", ".mkv",
+    ".mp3", ".wav", ".flac",
+}
+
+
+def _is_wecom_attachment_or_url(
+    body: Dict[str, Any],
+    text: str,
+    media_urls: List[str],
+    media_types: List[str],
+) -> bool:
+    """Return True if the message carries a file/image attachment or URL."""
+    msgtype = str(body.get("msgtype") or "").lower()
+
+    # Explicit media types
+    if media_types:
+        for mt in media_types:
+            if mt.startswith("image/"):
+                return True
+            if mt.startswith(("application/", "text/")):
+                return True
+
+    # URLs in text
+    if _extract_first_url_static(text):
+        return True
+
+    # Appmsg (WeCom AI Bot file attachments)
+    if msgtype == "appmsg" and isinstance(body.get("appmsg"), dict):
+        return True
+
+    # File / image / video msgtype
+    if msgtype in ("file", "image", "video"):
+        return True
+
+    # Filename from appmsg title
+    if msgtype == "appmsg":
+        appmsg = body.get("appmsg") or {}
+        title = str(appmsg.get("title") or "").strip()
+        if title:
+            ext = Path(title).suffix.lower()
+            if ext in _ATTACHMENT_EXTENSIONS:
+                return True
+
+    # Check filenames in body
+    for name in _extract_filenames_static(body, text):
+        if Path(name).suffix.lower() in _ATTACHMENT_EXTENSIONS:
+            return True
+
+    # Backward-compat: filename-like text (e.g. "项目资料.pdf") in plain-text msgtype
+    if msgtype == "text":
+        for url in re.findall(r"https?://[^\s<>()\"']+", text or ""):
+            name = Path(urlparse(url).path).name
+            if name and "." in name:
+                ext = Path(name).suffix.lower()
+                if ext in _ATTACHMENT_EXTENSIONS:
+                    return True
+
+    return False
+
+
+def _extract_first_url_static(text: str) -> Optional[str]:
+    match = _re.search(r"https?://[^\s<>()]+", text or "")
+    return match.group(0) if match else None
+
+
+def _extract_filenames_static(body: Dict[str, Any], text: str) -> List[str]:
+    names: List[str] = []
+
+    def collect(block: Any) -> None:
+        if not isinstance(block, dict):
+            return
+        for key in ("filename", "file_name", "name", "title"):
+            v = str(block.get(key) or "").strip()
+            if v:
+                names.append(v)
+
+    collect(body.get("file"))
+    collect(body.get("image"))
+    collect(body.get("appmsg"))
+    return names
+
+
+def _should_start_wecom_ingestion_candidate(
+    body: Dict[str, Any],
+    text: str,
+    media_urls: List[str],
+    media_types: List[str],
+) -> bool:
+    """Gate: should this message start an ingestion-candidate flow?"""
+    # 1. Attachment or URL always triggers
+    if _is_wecom_attachment_or_url(body, text, media_urls, media_types):
+        return True
+    # 2. Explicit intent in plain text always triggers
+    if _has_explicit_ingestion_intent(text):
+        return True
+    return False
+
+
+# ─── Content pre-analysis helpers ─────────────────────────────────────────────
+
+#: Subject codes and their Chinese labels.
+_SUBJECT_MAP = {
+    "FDN": "天津市青年创业就业基金会",
+    "YDC": "天津市青年发展促进中心 / 天津青年宫",
+    "C":   "知识库控制域",
+    "X":   "待判断",
+}
+
+#: Category codes and their Chinese labels.
+_CATEGORY_MAP = {
+    "ENT": "青年创业就业",
+    "YEV": "青少年赛事活动",
+    "MTG": "会议洽谈资料",
+    "PUB": "宣传展示资料",
+    "DOC": "重要制度与文件",
+    "AGR": "合作协议",
+    "OTH": "其他",
+    "TMP": "临时资料",
+}
+
+#: Category priority (higher index = higher priority in conflict resolution).
+_CATEGORY_PRIORITY = ["TMP", "OTH", "PUB", "ENT", "YEV", "MTG", "DOC", "AGR"]
+
+
+def _classify_subject(text: str, filenames: List[str]) -> Tuple[str, str]:
+    """Classify subject code and return (code, label).
+
+    Confidence: HIGH when pattern is found in filename, MEDIUM when only in text.
+    """
+    combined = " ".join([text] + filenames)
+    # FDN
+    for kw in ("天津市青年创业就业基金会", "青年创业就业基金会", "基金会"):
+        if kw in combined:
+            return ("FDN", "HIGH" if any(kw in fn for fn in filenames) else "MEDIUM")
+    # YDC
+    for kw in ("天津市青年发展促进中心", "天津青年宫", "青年宫", "青促中心"):
+        if kw in combined:
+            return ("YDC", "HIGH" if any(kw in fn for fn in filenames) else "MEDIUM")
+    # C (control domain)
+    for kw in ("raymond wiki", "知识库规则", "执行端", "爱马仕", "hermes", "codex", "pr ", "runtime", "gateway"):
+        if kw in combined.lower():
+            return ("C", "HIGH" if any(kw in fn.lower() for fn in filenames) else "MEDIUM")
+    return ("X", "LOW")
+
+
+def _classify_category(text: str, filenames: List[str]) -> Tuple[str, str]:
+    """Classify category code and return (code, label).
+
+    Confidence based on where keyword was found (filename = HIGH).
+    """
+    hits: Dict[str, List[str]] = {c: [] for c in _CATEGORY_PRIORITY}
+
+    # AGR
+    for kw in ("协议", "合同", "合作协议", "备忘录"):
+        if kw in text:
+            hits["AGR"].append("text")
+        for fn in filenames:
+            if kw in fn:
+                hits["AGR"].append("filename")
+
+    # DOC
+    for kw in ("制度", "办法", "通知", "文件", "章程", "管理办法"):
+        if kw in text:
+            hits["DOC"].append("text")
+        for fn in filenames:
+            if kw in fn:
+                hits["DOC"].append("filename")
+
+    # MTG
+    for kw in ("会议", "纪要", "会谈", "座谈", "沟通记录"):
+        if kw in text:
+            hits["MTG"].append("text")
+        for fn in filenames:
+            if kw in fn:
+                hits["MTG"].append("filename")
+
+    # YEV
+    for kw in ("aild", "智能设计大赛", "应急安全", "赛事", "竞赛", "比赛", "青少年"):
+        if kw.lower() in text.lower():
+            hits["YEV"].append("text")
+        for fn in filenames:
+            if kw.lower() in fn.lower():
+                hits["YEV"].append("filename")
+
+    # ENT
+    for kw in ("创青春", "青年创业", "创业就业", "项目申报", "创业项目"):
+        if kw in text:
+            hits["ENT"].append("text")
+        for fn in filenames:
+            if kw in fn:
+                hits["ENT"].append("filename")
+
+    # PUB (check override keywords in filenames first)
+    pub_keywords = ["简介", "宣传", "手册", "展示", "PPT", "画册", "介绍"]
+    for kw in pub_keywords:
+        for fn in filenames:
+            if kw in fn:
+                hits["PUB"].append("filename")
+                break
+
+    # Build confidence
+    def confidence(sources: List[str]) -> str:
+        if "filename" in sources:
+            return "HIGH"
+        if "text" in sources:
+            return "MEDIUM"
+        return "LOW"
+
+    # Find highest priority category with hits
+    for cat in reversed(_CATEGORY_PRIORITY):
+        if hits[cat]:
+            return (cat, confidence(hits[cat]))
+
+    return ("TMP", "LOW")
+
+
+def _analyze_wecom_ingestion_content(
+    body: Dict[str, Any],
+    text: str,
+    media_types: List[str],
+) -> Dict[str, Any]:
+    """Extract title, keywords, subject, category, and suggested paths."""
+    filenames = _extract_filenames_static(body, text)
+
+    # Title: from appmsg title, then first filename, then first URL name
+    title = ""
+    if isinstance(body.get("appmsg"), dict):
+        title = str(body.get("appmsg", {}).get("title") or "").strip()
+    if not title and filenames:
+        title = filenames[0]
+    if not title:
+        url = _extract_first_url_static(text)
+        if url:
+            title = Path(urlparse(url).path).name or url
+    if not title:
+        title = text[:80] if text else "未命名资料"
+
+    # Keywords
+    keywords: List[str] = []
+    subject_code, subject_conf = _classify_subject(text, filenames)
+    category_code, category_conf = _classify_category(text, filenames)
+
+    # Confidence: lower of the two
+    conf_map = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+    overall_confidence = "HIGH"
+    if conf_map.get(subject_conf, 0) < conf_map.get(overall_confidence, 3):
+        overall_confidence = subject_conf
+    if conf_map.get(category_conf, 0) < conf_map.get(overall_confidence, 3):
+        overall_confidence = category_conf
+
+    # Basis
+    basis: List[str] = []
+    if filenames:
+        basis.append("filename")
+    if text:
+        basis.append("text_excerpt")
+
+    # Suggested path (preliminary, uses subject-category code)
+    safe_msg_id = "message"
+    msg_id = str(body.get("msgid") or "")
+    if msg_id:
+        safe_msg_id = _re.sub(r"[^A-Za-z0-9_.-]+", "-", msg_id).strip("-")
+
+    suggested = f"projects/_staging/materials/uploads/confirmed/{subject_code}-{category_code}-{safe_msg_id}/"
+
+    # Future location
+    future_locations = {
+        "FDN": "projects/source-repository/YYYY/MM/uploads/（深加工后归入基金会相关项目目录）",
+        "YDC": "projects/source-repository/YYYY/MM/uploads/（深加工后归入青年宫/青促中心相关项目目录）",
+        "C":   "_control/ 相关控制域（必须经 GPT 复核）",
+        "X":   "projects/_staging/materials/uploads/review_required/（待人工判断）",
+    }
+    future_location = future_locations.get(subject_code, future_locations["X"])
+
+    return {
+        "title": title,
+        "keywords": keywords,
+        "subject_code": subject_code,
+        "subject_label": _SUBJECT_MAP.get(subject_code, "待判断"),
+        "category_code": category_code,
+        "category_label": _CATEGORY_MAP.get(category_code, "其他"),
+        "confidence": overall_confidence,
+        "basis": basis,
+        "suggested_path": suggested,
+        "future_location": future_location,
+    }
 
 
 def check_wecom_requirements() -> bool:
@@ -741,6 +1107,8 @@ class WeComAdapter(BasePlatformAdapter):
                 "predicted_topic": ingestion_candidate["predicted_topic"],
                 "confidence": ingestion_candidate["confidence"],
                 "suggested_path": ingestion_candidate["suggested_path"],
+                "analysis": ingestion_candidate.get("analysis", {}),
+                "future_location": ingestion_candidate.get("future_location", ""),
                 "created_at": self._utc8_now_iso(),
             }
             self.pending_wecom_ingestion[chat_id] = pending
@@ -1131,16 +1499,44 @@ class WeComAdapter(BasePlatformAdapter):
         media_types: List[str],
         message_id: str,
     ) -> Optional[Dict[str, Any]]:
+        # Gate: must pass the trigger check first
+        if not _should_start_wecom_ingestion_candidate(body, text, media_urls, media_types):
+            return None
+
         source_type = cls._predict_wecom_source_type(body, text, media_urls, media_types)
         if not source_type:
             return None
 
-        topic, confidence = cls._predict_wecom_topic(body, text)
+        # Pre-analysis
+        analysis = _analyze_wecom_ingestion_content(body, text, media_types)
+
+        # Use old topic for backward compatibility (tests + existing topic map)
+        old_topic, old_confidence = cls._predict_wecom_topic(body, text)
+        # Use new analysis subject_code as predicted_topic for new card format
+        topic = analysis["subject_code"]
+        # Prefer old confidence when old topic is specific (not "undetermined")
+        if old_topic != WECOM_INGESTION_UNDETERMINED_TOPIC:
+            topic = old_topic
+            confidence = old_confidence
+        else:
+            confidence = analysis["confidence"]
+
         return {
             "source_type": source_type,
             "predicted_topic": topic,
             "confidence": confidence,
-            "suggested_path": cls._wecom_staging_path(topic, message_id),
+            "suggested_path": analysis["suggested_path"],
+            "analysis": {
+                "title": analysis["title"],
+                "keywords": analysis["keywords"],
+                "subject_code": analysis["subject_code"],
+                "subject_label": analysis["subject_label"],
+                "category_code": analysis["category_code"],
+                "category_label": analysis["category_label"],
+                "confidence": analysis["confidence"],
+                "basis": analysis["basis"],
+            },
+            "future_location": analysis["future_location"],
         }
 
     @classmethod
@@ -1171,6 +1567,8 @@ class WeComAdapter(BasePlatformAdapter):
 
         if msgtype in {"file", "appmsg"} or media_urls:
             return "file"
+        if _has_explicit_ingestion_intent(text):
+            return "text"
         if cls._looks_like_material_text(text):
             return "text"
         return None
@@ -1275,13 +1673,17 @@ class WeComAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _format_wecom_ingestion_confirmation(pending: Dict[str, Any]) -> str:
-        topic = str(pending.get("predicted_topic") or WECOM_INGESTION_UNDETERMINED_TOPIC)
-        topic_info = WECOM_INGESTION_TOPIC_MAP.get(topic, {})
+        analysis = pending.get("analysis", {})
         return WECOM_INGESTION_CONFIRMATION_TEMPLATE.format(
             source_label=WECOM_INGESTION_SOURCE_LABELS.get(str(pending.get("source_type")), "未知"),
-            topic_label=str(topic_info.get("label") or "未确定"),
-            suggested_path=pending["suggested_path"],
-            future_location=str(topic_info.get("existing_path") or "待确认"),
+            title=str(analysis.get("title") or "未命名资料"),
+            subject_label=str(analysis.get("subject_label") or "待判断"),
+            subject_code=str(analysis.get("subject_code") or "X"),
+            category_label=str(analysis.get("category_label") or "其他"),
+            category_code=str(analysis.get("category_code") or "OTH"),
+            suggested_path=pending.get("suggested_path", ""),
+            future_location=pending.get("future_location", "待确认"),
+            confidence=str(analysis.get("confidence") or "UNKNOWN"),
         )
 
     @staticmethod
@@ -1305,6 +1707,7 @@ class WeComAdapter(BasePlatformAdapter):
     ) -> Dict[str, Any]:
         action_at = self._utc8_now_iso()
         pending_snapshot = dict(pending)
+        analysis = pending_snapshot.get("analysis", {})
         manifest = {
             "platform": "wecom",
             "queue": queue_name,
@@ -1320,6 +1723,7 @@ class WeComAdapter(BasePlatformAdapter):
             action_message_id_key: action_message_id,
             action_at_key: action_at,
             "queue_manifest": manifest,
+            "topic_label": analysis.get("category_label", "其他"),
         }
 
     def _log_wecom_ingestion_action(
