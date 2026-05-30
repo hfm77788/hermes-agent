@@ -128,6 +128,132 @@ WECOM_INGESTION_QUEUED_WITH_STAGING_TEXT = "已进入待处理队列，并已生
 # ─── Staging helpers (module-level, no class needed) ─────────────────────────
 
 import re as _re
+import zipfile
+import xml.etree.ElementTree as ET
+
+
+def _extract_wecom_document_text_excerpt(
+    file_metadata: Dict[str, Any],
+    max_chars: int = 2000,
+) -> Dict[str, Any]:
+    """Extract text excerpt from a supported document file.
+
+    Supports:
+    - TXT / MD: direct UTF-8 read
+    - DOCX: standard library zipfile + xml (no python-docx required)
+    - PDF: uses fitz (PyMuPDF) if available; skipped otherwise
+
+    Returns:
+        {
+            "text_excerpt": "...",
+            "text_extract_status": "ok / skipped_no_local_file / skipped_unsupported_type / failed",
+            "text_extract_source": "pdf / docx / txt / md / filename_only",
+            "text_extract_error": ""
+        }
+    """
+    result: Dict[str, Any] = {
+        "text_excerpt": "",
+        "text_extract_status": "skipped_no_local_file",
+        "text_extract_source": "filename_only",
+        "text_extract_error": "",
+    }
+
+    # Look for local paths in various metadata fields
+    local_paths: List[str] = []
+    for key in ("local_paths", "cached_paths", "download_paths", "media_urls"):
+        paths = file_metadata.get(key, [])
+        if isinstance(paths, list):
+            local_paths.extend(paths)
+
+    if not local_paths:
+        return result
+
+    text_found = ""
+
+    for path_str in local_paths:
+        path = Path(path_str)
+        if not path.exists() or not path.is_file():
+            continue
+
+        ext = path.suffix.lower()
+        stem = path.stem.lower()
+
+        # TXT / MD
+        if ext in (".txt", ".md"):
+            try:
+                text_found = path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
+                result["text_extract_status"] = "ok"
+                result["text_extract_source"] = "txt" if ext == ".txt" else "md"
+                break
+            except Exception as exc:
+                result["text_extract_error"] = str(exc)
+                continue
+
+        # DOCX — standard library zipfile + xml
+        if ext == ".docx":
+            try:
+                text_found = _extract_docx_text_stdlib(path)[:max_chars]
+                result["text_extract_status"] = "ok"
+                result["text_extract_source"] = "docx"
+                break
+            except Exception as exc:
+                result["text_extract_error"] = str(exc)
+                continue
+
+        # PDF — fitz (PyMuPDF)
+        if ext == ".pdf":
+            try:
+                import fitz  # type: ignore
+
+                doc = fitz.open(str(path))
+                pages_text: List[str] = []
+                for page in doc:
+                    pages_text.append(page.get_text())
+                    if sum(len(t) for t in pages_text) >= max_chars:
+                        break
+                doc.close()
+                text_found = "".join(pages_text)[:max_chars]
+                result["text_extract_status"] = "ok"
+                result["text_extract_source"] = "pdf"
+                break
+            except Exception:
+                # fitz not available or PDF unreadable — skip gracefully
+                result["text_extract_status"] = "skipped_unsupported_type"
+                result["text_extract_source"] = "pdf"
+                result["text_extract_error"] = "fitz/PyMuPDF not available or PDF unreadable"
+                continue
+
+    if text_found:
+        result["text_excerpt"] = text_found
+    elif result["text_extract_status"] == "skipped_unsupported_type":
+        # Unsupported type — preserve status and source (set in the loop)
+        pass
+    elif result["text_extract_status"] == "skipped_no_local_file":
+        # No local file found at all — explicitly set
+        result["text_extract_status"] = "skipped_no_local_file"
+        result["text_extract_source"] = "filename_only"
+    else:
+        # Any other failure
+        result["text_extract_status"] = "failed"
+
+    return result
+
+
+def _extract_docx_text_stdlib(path: Path) -> str:
+    """Extract text from a DOCX file using zipfile + xml (no external deps)."""
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    text_parts: List[str] = []
+    with zipfile.ZipFile(str(path), "r") as zf:
+        try:
+            with zf.open("word/document.xml") as xml_file:
+                tree = ET.parse(xml_file)
+                root = tree.getroot()
+                for elem in root.iter(f"{{{ns}}}t"):
+                    if elem.text:
+                        text_parts.append(elem.text)
+        except KeyError:
+            return ""
+    return "".join(text_parts)
 
 
 def _safe_message_id(message_id: str) -> str:
@@ -244,6 +370,18 @@ def _write_wecom_ingestion_staging(manifest: Dict[str, Any]) -> Dict[str, Any]:
             f"- 原始文件名：{file_block}\n"
             f"- 后续处理提示：待 GPT 审核后进入 source-repository 或目标项目\n"
         )
+        # Append text_extract info if available
+        text_extract = manifest.get("text_extract", {})
+        if text_extract and text_extract.get("status") == "ok":
+            quick_content += (
+                f"\n## 正文抽取\n"
+                f"- 抽取状态：{text_extract.get('status', 'unknown')}\n"
+                f"- 抽取来源：{text_extract.get('source', 'unknown')}\n"
+            )
+            excerpt = text_extract.get("excerpt", "")
+            if excerpt:
+                snippet = excerpt[:200].replace("\n", " ").strip()
+                quick_content += f"- 正文摘要片段：{snippet}...\n"
         with open(quick_path, "w", encoding="utf-8") as f:
             f.write(quick_content)
 
@@ -794,12 +932,38 @@ def _analyze_wecom_ingestion_content(
     file_metadata = _extract_wecom_file_metadata_static(body, text, media_urls)
     filenames = file_metadata.get("file_names", [])
 
-    # Title: from appmsg title, then first filename, then first URL name
+    # ── Document text extraction ──────────────────────────────────────────────
+    text_extract = _extract_wecom_document_text_excerpt(file_metadata, max_chars=2000)
+    text_excerpt = text_extract.get("text_excerpt", "")
+
+    # Combined text for classification: original text + document excerpt
+    combined_text = text
+    if text_excerpt:
+        combined_text = f"{text}\n{text_excerpt}" if text else text_excerpt
+
+    # Title strategy:
+    # 1. appmsg title  2. semantic filename  3. document excerpt title  4. URL name  5. text excerpt  6. fallback
     title = ""
     if isinstance(body.get("appmsg"), dict):
         title = str(body.get("appmsg", {}).get("title") or "").strip()
+
+    _semantic_fn_kw = (
+        "通知", "方案", "指南", "计划", "报告", "总结", "申报", "章程",
+        "办法", "协议", "合同", "纪要", "简介", "手册", "材料",
+    )
     if not title and filenames:
-        title = filenames[0]
+        # Use filename as title only if it has clear semantic content
+        fn0 = filenames[0]
+        fn_stem = Path(fn0).stem
+        if any(kw in fn_stem for kw in _semantic_fn_kw) or len(fn_stem) >= 4:
+            title = fn0
+
+    if not title and text_excerpt:
+        # Try first line of document excerpt as title
+        first_line = text_excerpt.strip().split("\n")[0].strip()
+        if first_line and len(first_line) >= 2:
+            title = first_line[:80]
+
     if not title:
         url = _extract_first_url_static(text)
         if url:
@@ -809,10 +973,10 @@ def _analyze_wecom_ingestion_content(
 
     # Keywords
     keywords: List[str] = []
-    subject_code, subject_conf = _classify_subject(text, filenames)
-    category_code, category_conf = _classify_category(text, filenames)
+    subject_code, subject_conf = _classify_subject(combined_text, filenames)
+    category_code, category_conf = _classify_category(combined_text, filenames)
 
-    # Confidence: lower of the two
+    # Confidence: upgrade when text_excerpt contributes to classification
     conf_map = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
     overall_confidence = "HIGH"
     if conf_map.get(subject_conf, 0) < conf_map.get(overall_confidence, 3):
@@ -820,11 +984,17 @@ def _analyze_wecom_ingestion_content(
     if conf_map.get(category_conf, 0) < conf_map.get(overall_confidence, 3):
         overall_confidence = category_conf
 
+    # Boost confidence when text_excerpt enabled a better classification
+    # that filenames alone could not provide
+    if text_excerpt and overall_confidence == "LOW":
+        if subject_code != "X" or category_code not in ("TMP", "OTH"):
+            overall_confidence = "MEDIUM"
+
     # Basis
     basis: List[str] = []
     if filenames:
         basis.append("filename")
-    if text:
+    if text or text_excerpt:
         basis.append("text_excerpt")
 
     # Suggested path (preliminary, uses subject-category code)
@@ -853,6 +1023,12 @@ def _analyze_wecom_ingestion_content(
         "category_label": _CATEGORY_MAP.get(category_code, "其他"),
         "confidence": overall_confidence,
         "basis": basis,
+        "text_extract": {
+            "status": text_extract.get("text_extract_status", "skipped_no_local_file"),
+            "source": text_extract.get("text_extract_source", "filename_only"),
+            "excerpt": text_extract.get("text_excerpt", ""),
+            "error": text_extract.get("text_extract_error", ""),
+        },
         "suggested_path": suggested,
         "future_location": future_location,
     }
@@ -1741,6 +1917,7 @@ class WeComAdapter(BasePlatformAdapter):
                 "media_ids": file_metadata.get("media_ids", []),
                 "file_sizes": file_metadata.get("file_sizes", []),
                 "mime_types": file_metadata.get("mime_types", []),
+                "local_paths": media_urls,
             },
             "analysis": {
                 "title": analysis["title"],
@@ -1751,6 +1928,7 @@ class WeComAdapter(BasePlatformAdapter):
                 "category_label": analysis["category_label"],
                 "confidence": analysis["confidence"],
                 "basis": analysis["basis"],
+                "text_extract": analysis.get("text_extract", {}),
             },
             "future_location": analysis["future_location"],
         }
