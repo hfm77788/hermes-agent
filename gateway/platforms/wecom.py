@@ -119,6 +119,151 @@ WECOM_INGESTION_CONFIRMATION_TEMPLATE = (
 WECOM_INGESTION_CANCELLED_TEXT = "已取消处理，本资料不会进入知识库流程。"
 WECOM_INGESTION_RAW_RECORDED_TEXT = "已记录为原始候选资料，暂不进入自动处理，等待人工判断。"
 WECOM_INGESTION_QUEUED_TEXT = "已进入待处理队列，请等待侯方明审核"
+WECOM_INGESTION_QUEUED_WITH_STAGING_TEXT = "已进入待处理队列，并已生成知识库中转记录，请等待侯方明审核"
+
+
+# ─── Staging helpers (module-level, no class needed) ─────────────────────────
+
+import re as _re
+
+
+def _safe_message_id(message_id: str) -> str:
+    """Sanitize message_id to prevent path traversal.
+
+    Strips dots (which would otherwise form '..' after hyphen replacement),
+    slashes, and any non-safe character, then replaces runs of separators
+    with a single hyphen.
+    """
+    sanitized = _re.sub(r"[\./\\]+", "-", message_id)
+    sanitized = _re.sub(r"[^a-zA-Z0-9_\-]+", "-", sanitized)
+    sanitized = _re.sub(r"-+", "-", sanitized)
+    return sanitized.strip("-")
+
+
+def _resolve_raymond_wiki_root() -> Optional[Path]:
+    """Resolve RAYMOND_WIKI_ROOT, falling back to /home/ubuntu/raymond-wiki."""
+    root = os.environ.get("RAYMOND_WIKI_ROOT", "/home/ubuntu/raymond-wiki")
+    path = Path(root).expanduser().resolve()
+    if not path.exists():
+        return None
+    return path
+
+
+def _write_wecom_ingestion_staging(manifest: Dict[str, Any]) -> Dict[str, Any]:
+    """Write confirmed WeCom ingestion to raymond-wiki staging.
+
+    Writes:
+        confirmed/YYYY/MM/<safe_msg_id>/INGESTION_MANIFEST.json
+        confirmed/YYYY/MM/<safe_msg_id>/QUICK.md
+        state/QUICK_INDEX.jsonl   (append)
+        reports/YYYYMMDD_wecom_ingestion_report.jsonl   (append)
+
+    Returns {"staging_write_status": "written"|"skipped_no_wiki_root"|"skipped_write_error"}
+    """
+    wiki_root = _resolve_raymond_wiki_root()
+    if wiki_root is None:
+        logger.warning(
+            "[wecom] RAYMOND_WIKI_ROOT=%s does not exist, skipping staging write",
+            os.environ.get("RAYMOND_WIKI_ROOT", "/home/ubuntu/raymond-wiki"),
+        )
+        return {"staging_write_status": "skipped_no_wiki_root"}
+
+    # Build safe message_id
+    source_msg_id = (
+        manifest.get("confirmed_message_id")
+        or manifest.get("action_message_id")
+        or manifest.get("message_id")
+        or "unknown"
+    )
+    safe_msg_id = _safe_message_id(str(source_msg_id))
+
+    # Date parts from confirmed_at / action_at
+    action_at = manifest.get("confirmed_at") or manifest.get("action_at") or ""
+    if action_at:
+        # action_at is ISO format with timezone, e.g. "2026-05-30T08:00:00+08:00"
+        try:
+            dt = datetime.fromisoformat(action_at)
+        except ValueError:
+            dt = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8)))
+    else:
+        dt = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8)))
+    year = dt.strftime("%Y")
+    month = dt.strftime("%m")
+    day = dt.strftime("%d")
+    date_str = dt.strftime("%Y%m%d")
+
+    # Topic / safe_topic
+    topic = manifest.get("topic", "unknown")
+    normalized_topic = _re.sub(r"[^a-zA-Z0-9_\-]+", "-", topic.lower()).strip("-")
+
+    # Safe message id (reuse)
+    base = wiki_root / "projects" / "_staging" / "materials" / "uploads"
+    confirmed_dir = base / "confirmed" / year / month / safe_msg_id
+    state_dir = base / "state"
+    report_dir = base / "reports"
+
+    try:
+        confirmed_dir.mkdir(parents=True, exist_ok=True)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        report_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. INGESTION_MANIFEST.json
+        manifest_path = confirmed_dir / "INGESTION_MANIFEST.json"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+        # 2. QUICK.md
+        quick_path = confirmed_dir / "QUICK.md"
+        topic_label = manifest.get("topic_label", topic)
+        file_list = []
+        for fname in (manifest.get("file_names") or []):
+            file_list.append(f"- {fname}")
+        file_block = "\n".join(file_list) if file_list else "(无附件)"
+        quick_content = (
+            f"# WeCom 资料待处理\n\n"
+            f"- 主题：{topic_label}\n"
+            f"- 来源：WeCom\n"
+            f"- 时间：{action_at or dt.isoformat()}\n"
+            f"- 附件：\n{file_block}\n"
+        )
+        with open(quick_path, "w", encoding="utf-8") as f:
+            f.write(quick_content)
+
+        # 3. QUICK_INDEX.jsonl (append)
+        index_path = state_dir / "QUICK_INDEX.jsonl"
+        index_entry = {
+            "type": "wecom_confirmed_ingestion",
+            "topic": topic,
+            "safe_msg_id": safe_msg_id,
+            "confirmed_at": manifest.get("confirmed_at", ""),
+            "path": str(confirmed_dir.relative_to(wiki_root)),
+        }
+        with open(index_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(index_entry, ensure_ascii=False) + "\n")
+
+        # 4. Daily ingestion report (append)
+        report_path = report_dir / f"{date_str}_wecom_ingestion_report.jsonl"
+        report_entry = {
+            "type": "wecom_confirmed_ingestion",
+            "topic": topic,
+            "safe_msg_id": safe_msg_id,
+            "confirmed_at": manifest.get("confirmed_at", ""),
+            "message_id": source_msg_id,
+            "file_count": len(manifest.get("file_names") or []),
+        }
+        with open(report_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(report_entry, ensure_ascii=False) + "\n")
+
+        logger.info(
+            "[wecom] Staging written: %s",
+            confirmed_dir.relative_to(wiki_root),
+        )
+        return {"staging_write_status": "written", "path": str(confirmed_dir)}
+
+    except Exception as exc:
+        logger.warning("[wecom] Staging write failed: %s", exc)
+        return {"staging_write_status": "skipped_write_error", "error": str(exc)}
+
 
 WECOM_INGESTION_TOPIC_MAP = {
     "competition_aild": {
@@ -947,7 +1092,12 @@ class WeComAdapter(BasePlatformAdapter):
             self.confirmed_ingestion = confirmed
             self.pending_wecom_ingestion.pop(chat_id, None)
             self._log_wecom_ingestion_action(confirmed, "confirmed", "consumed")
-            await self.send(chat_id=chat_id, content=WECOM_INGESTION_QUEUED_TEXT, reply_to=msg_id)
+            staging_result = _write_wecom_ingestion_staging(confirmed)
+            if staging_result.get("staging_write_status") == "written":
+                reply_text = WECOM_INGESTION_QUEUED_WITH_STAGING_TEXT
+            else:
+                reply_text = WECOM_INGESTION_QUEUED_TEXT
+            await self.send(chat_id=chat_id, content=reply_text, reply_to=msg_id)
             return True
 
         if normalized == "2":
