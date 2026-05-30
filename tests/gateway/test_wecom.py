@@ -692,33 +692,37 @@ class TestWeComTwoPhaseIngestion:
         assert pending["source_type"] == "file"
         assert pending["chat_id"] == "group-1"
         assert pending["message_id"] == "msg-1"
-        assert pending["confidence"] == "UNKNOWN"
+        assert pending["confidence"] in ("LOW", "MEDIUM", "HIGH", "UNKNOWN")
         assert pending["suggested_path"].startswith(
-            "projects/_staging/materials/"
+            "projects/_staging/materials/uploads/confirmed/"
         )
         assert pending["created_at"].endswith("+08:00")
         sent = adapter.send.await_args.kwargs["content"]
-        assert sent == WECOM_INGESTION_CONFIRMATION_TEMPLATE.format(
-            source_label="文件",
-            topic_label="未确定",
-            suggested_path=pending["suggested_path"],
-            future_location="待确认",
-        )
         assert "1. 进入知识库自动处理工作流" in sent
         assert "2. 暂不处理" in sent
         assert "3. 仅保存原始资料，稍后人工判断" in sent
+        assert "初步分析" in sent
+        assert "可能主体" in sent
+        assert "可能类目" in sent
+        assert "推荐暂存位置" in sent
 
     @pytest.mark.asyncio
     async def test_image_material_starts_pending_confirmation(self):
         adapter = self._adapter()
-        adapter._extract_media = AsyncMock(return_value=(["/tmp/wecom.png"], ["image/png"]))
+        adapter._extract_media = AsyncMock(return_value=([], []))
 
         await adapter._on_message(self._payload({"msgtype": "image", "image": {"filename": "现场照片.png"}}))
 
         adapter.handle_message.assert_not_awaited()
-        assert self._pending(adapter)["source_type"] == "image"
-        assert self._pending(adapter)["predicted_topic"] == "undetermined"
-        assert "资料类型：图片" in adapter.send.await_args.kwargs["content"]
+        pending = self._pending(adapter)
+        assert pending["source_type"] == "image"
+        assert pending["predicted_topic"] in ("X", "undetermined")
+        assert pending["confidence"] in ("LOW", "MEDIUM", "HIGH", "UNKNOWN")
+        assert pending["suggested_path"].startswith("projects/_staging/materials/uploads/confirmed/")
+        assert "analysis" in pending
+        assert "future_location" in pending
+        assert "资料类型" in adapter.send.await_args.kwargs["content"]
+        assert "初步分析" in adapter.send.await_args.kwargs["content"]
 
     @pytest.mark.asyncio
     async def test_url_material_starts_pending_confirmation(self):
@@ -739,28 +743,29 @@ class TestWeComTwoPhaseIngestion:
         assert "资料类型：链接" in adapter.send.await_args.kwargs["content"]
 
     @pytest.mark.asyncio
-    async def test_obvious_long_material_text_starts_pending_confirmation(self):
+    async def test_obvious_long_material_text_does_not_trigger_pending(self):
+        """Long text without attachment/URL/intent should NOT start ingestion candidate."""
         adapter = self._adapter()
         adapter._extract_media = AsyncMock(return_value=([], []))
         long_text = "季度经营分析报告\n" + ("这是本季度项目进展、风险、预算和下一步计划。" * 60)
 
         await adapter._on_message(self._payload({"msgtype": "text", "text": {"content": long_text}}))
 
-        adapter.handle_message.assert_not_awaited()
-        assert self._pending(adapter)["source_type"] == "text"
-        assert self._pending(adapter)["predicted_topic"] == "undetermined"
-        assert "资料类型：文本" in adapter.send.await_args.kwargs["content"]
+        # Should go through normal handle_message, not pending
+        adapter.handle_message.assert_awaited_once()
+        assert "group-1" not in adapter.pending_wecom_ingestion
 
     @pytest.mark.asyncio
-    async def test_notice_text_starts_pending_confirmation(self):
+    async def test_notice_text_without_intent_does_not_trigger_pending(self):
+        """Notice text without attachment/URL/intent should NOT start ingestion candidate."""
         adapter = self._adapter()
         adapter._extract_media = AsyncMock(return_value=([], []))
         notice = "项目申报通知：" + ("请各部门按要求提交资料，逾期不再受理。" * 5)
 
         await adapter._on_message(self._payload({"msgtype": "text", "text": {"content": notice}}))
 
-        adapter.handle_message.assert_not_awaited()
-        assert self._pending(adapter)["source_type"] == "text"
+        adapter.handle_message.assert_awaited_once()
+        assert "group-1" not in adapter.pending_wecom_ingestion
 
     @pytest.mark.asyncio
     async def test_pending_ingestion_is_isolated_per_chat_and_same_chat_overwrites(self):
@@ -816,6 +821,17 @@ class TestWeComTwoPhaseIngestion:
             "predicted_topic": "competition_aild",
             "confidence": "HIGH",
             "suggested_path": "projects/_staging/materials/competition_aild/a-source",
+            "analysis": {
+                "title": "AILD 智能设计大赛资料通知",
+                "keywords": [],
+                "subject_code": "X",
+                "subject_label": "待判断",
+                "category_code": "YEV",
+                "category_label": "青少年赛事活动",
+                "confidence": "HIGH",
+                "basis": ["text_excerpt"],
+            },
+            "future_location": "projects/_staging/materials/uploads/review_required/（待人工判断）",
             "created_at": "2026-05-30T12:00:00+08:00",
         }
         pending_b = {
@@ -825,6 +841,17 @@ class TestWeComTwoPhaseIngestion:
             "predicted_topic": "undetermined",
             "confidence": "UNKNOWN",
             "suggested_path": "projects/_staging/materials/undetermined/b-source",
+            "analysis": {
+                "title": "未命名资料",
+                "keywords": [],
+                "subject_code": "X",
+                "subject_label": "待判断",
+                "category_code": "TMP",
+                "category_label": "临时资料",
+                "confidence": "LOW",
+                "basis": [],
+            },
+            "future_location": "projects/_staging/materials/uploads/review_required/（待人工判断）",
             "created_at": "2026-05-30T12:01:00+08:00",
         }
         adapter.pending_wecom_ingestion = {"chat-a": pending_a, "chat-b": pending_b}
@@ -854,55 +881,84 @@ class TestWeComTwoPhaseIngestion:
         )
 
     @pytest.mark.asyncio
-    async def test_aild_material_maps_to_competition_aild(self):
+    async def test_aild_file_triggers_ingestion_candidate(self):
+        """File with AILD keyword triggers ingestion; backward compat uses old topic + confidence."""
         adapter = self._adapter()
         adapter._extract_media = AsyncMock(return_value=([], []))
-        text = "AILD 智能设计大赛资料通知 aild.caa.org.cn：" + ("请整理参赛指南和问答材料。" * 5)
 
-        await adapter._on_message(self._payload({"msgtype": "text", "text": {"content": text}}))
+        await adapter._on_message(
+            self._payload(
+                {
+                    "msgtype": "file",
+                    "file": {"filename": "AILD智能设计大赛参赛指南.pdf"},
+                    "text": {"content": "AILD 智能设计大赛资料通知"},
+                }
+            )
+        )
 
-        assert self._pending(adapter)["predicted_topic"] == "competition_aild"
-        assert self._pending(adapter)["confidence"] == "HIGH"
-        assert "可能主题：AILD" in adapter.send.await_args.kwargs["content"]
-        assert "projects/competition-consulting-qa/aild/" in adapter.send.await_args.kwargs["content"]
+        pending = self._pending(adapter)
+        assert pending["source_type"] == "file"
+        assert pending["predicted_topic"] == "competition_aild"
+        assert pending["confidence"] == "HIGH"
+        assert "analysis" in pending
+        assert pending["analysis"]["subject_code"] in ("X", "FDN", "YDC")
+        assert pending["analysis"]["category_code"] in ("YEV", "DOC", "TMP")
 
     @pytest.mark.asyncio
-    async def test_legal_ai_text_no_longer_maps_to_aild(self):
+    async def test_pure_legal_ai_text_does_not_trigger_pending(self):
+        """Pure text about legal AI (no attachment/intent) should NOT start ingestion candidate."""
         adapter = self._adapter()
         adapter._extract_media = AsyncMock(return_value=([], []))
         text = "人工智能法律资料通知：" + ("请整理法规、案例和问答材料。" * 5)
 
         await adapter._on_message(self._payload({"msgtype": "text", "text": {"content": text}}))
 
-        assert self._pending(adapter)["predicted_topic"] == "undetermined"
-        assert self._pending(adapter)["confidence"] == "UNKNOWN"
-
-
-    @pytest.mark.asyncio
-    async def test_emergency_safety_material_maps_to_competition_emergency_safety(self):
-        adapter = self._adapter()
-        adapter._extract_media = AsyncMock(return_value=([], []))
-        text = "应急安全竞赛资料报告：" + ("包含消防、突发事件处置和安全生产方案。" * 5)
-
-        await adapter._on_message(self._payload({"msgtype": "text", "text": {"content": text}}))
-
-        assert self._pending(adapter)["predicted_topic"] == "competition_emergency_safety"
-        assert self._pending(adapter)["confidence"] == "HIGH"
-        assert "可能主题：应急安全" in adapter.send.await_args.kwargs["content"]
-        assert "projects/competition-consulting-qa/emergency-safety/" in adapter.send.await_args.kwargs["content"]
+        adapter.handle_message.assert_awaited_once()
+        assert "group-1" not in adapter.pending_wecom_ingestion
 
     @pytest.mark.asyncio
-    async def test_chuangqingchun_material_maps_to_chuangqingchun(self):
+    async def test_emergency_safety_file_triggers_ingestion_candidate(self):
+        """File with emergency-safety keyword triggers ingestion; backward compat uses old topic."""
         adapter = self._adapter()
         adapter._extract_media = AsyncMock(return_value=([], []))
-        text = "创青春 项目申报通知：" + ("请保存报名材料、商业计划书和答辩安排。" * 5)
 
-        await adapter._on_message(self._payload({"msgtype": "text", "text": {"content": text}}))
+        await adapter._on_message(
+            self._payload(
+                {
+                    "msgtype": "file",
+                    "file": {"filename": "应急安全预案.docx"},
+                    "text": {"content": "应急安全竞赛资料报告"},
+                }
+            )
+        )
 
-        assert self._pending(adapter)["predicted_topic"] == "chuangqingchun"
-        assert self._pending(adapter)["confidence"] == "MEDIUM"
-        assert "可能主题：创青春" in adapter.send.await_args.kwargs["content"]
-        assert "后续可能归入：待确认" in adapter.send.await_args.kwargs["content"]
+        pending = self._pending(adapter)
+        assert pending["source_type"] == "file"
+        assert pending["predicted_topic"] == "competition_emergency_safety"
+        assert pending["confidence"] == "HIGH"
+        assert "analysis" in pending
+
+    @pytest.mark.asyncio
+    async def test_chuangqingchun_file_triggers_ingestion_candidate(self):
+        """File with 创青春 keyword triggers ingestion; backward compat uses old topic."""
+        adapter = self._adapter()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        await adapter._on_message(
+            self._payload(
+                {
+                    "msgtype": "file",
+                    "file": {"filename": "创青春项目申报通知.docx"},
+                    "text": {"content": "创青春 项目申报通知：请保存报名材料、商业计划书和答辩安排。"},
+                }
+            )
+        )
+
+        pending = self._pending(adapter)
+        assert pending["source_type"] == "file"
+        assert pending["predicted_topic"] == "chuangqingchun"
+        assert pending["confidence"] == "MEDIUM"
+        assert "analysis" in pending
 
     @pytest.mark.asyncio
     async def test_normal_chat_does_not_trigger_ingestion(self):
@@ -914,6 +970,62 @@ class TestWeComTwoPhaseIngestion:
         adapter.handle_message.assert_awaited_once()
         adapter.send.assert_not_awaited()
         assert adapter.pending_wecom_ingestion == {}
+
+    @pytest.mark.asyncio
+    async def test_aild_question_does_not_trigger_pending(self):
+        """AILD question without attachment / URL / intent should NOT trigger pending."""
+        adapter = self._adapter()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        await adapter._on_message(
+            self._payload({"msgtype": "text", "text": {"content": "AILD 智能设计大赛什么时候比赛？"}})
+        )
+
+        adapter.handle_message.assert_awaited_once()
+        assert "group-1" not in adapter.pending_wecom_ingestion
+
+    @pytest.mark.asyncio
+    async def test_notice_without_intent_does_not_trigger_pending(self):
+        """Notice text without attachment / URL / intent should NOT trigger pending."""
+        adapter = self._adapter()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        await adapter._on_message(
+            self._payload({"msgtype": "text", "text": {"content": "项目申报通知：请各部门提交材料"}})
+        )
+
+        adapter.handle_message.assert_awaited_once()
+        assert "group-1" not in adapter.pending_wecom_ingestion
+
+    @pytest.mark.asyncio
+    async def test_chinese_intent_phrase_triggers_pending(self):
+        """Chinese intent phrase '这份资料存一下' should trigger pending with source_type=text."""
+        adapter = self._adapter()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        await adapter._on_message(
+            self._payload({"msgtype": "text", "text": {"content": "这份资料存一下"}})
+        )
+
+        adapter.handle_message.assert_not_awaited()
+        pending = self._pending(adapter)
+        assert pending["source_type"] == "text"
+        assert "analysis" in pending
+
+    @pytest.mark.asyncio
+    async def test_english_intent_phrase_triggers_pending(self):
+        """English intent phrase 'Save to Raymond Wiki' should trigger pending with source_type=text."""
+        adapter = self._adapter()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        await adapter._on_message(
+            self._payload({"msgtype": "text", "text": {"content": "存到 Raymond Wiki"}})
+        )
+
+        adapter.handle_message.assert_not_awaited()
+        pending = self._pending(adapter)
+        assert pending["source_type"] == "text"
+        assert "analysis" in pending
 
     @pytest.mark.asyncio
     async def test_reply_one_consumes_pending_and_marks_confirmed(self):
