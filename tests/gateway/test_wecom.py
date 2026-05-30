@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import importlib
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -804,6 +805,7 @@ class TestWeComTwoPhaseIngestion:
     @pytest.mark.asyncio
     async def test_chat_a_reply_one_consumes_only_chat_a_pending(self):
         from gateway.platforms.wecom import WECOM_INGESTION_QUEUED_TEXT
+        from unittest.mock import patch
 
         adapter = self._adapter()
         adapter._extract_media = AsyncMock(return_value=([], []))
@@ -827,16 +829,20 @@ class TestWeComTwoPhaseIngestion:
         }
         adapter.pending_wecom_ingestion = {"chat-a": pending_a, "chat-b": pending_b}
 
-        await adapter._on_message(
-            self._payload(
-                {
-                    "chatid": "chat-a",
-                    "msgid": "a-reply",
-                    "msgtype": "text",
-                    "text": {"content": "1"},
-                }
+        with patch(
+            "gateway.platforms.wecom._write_wecom_ingestion_staging",
+            return_value={"staging_write_status": "skipped_no_wiki_root"},
+        ):
+            await adapter._on_message(
+                self._payload(
+                    {
+                        "chatid": "chat-a",
+                        "msgid": "a-reply",
+                        "msgtype": "text",
+                        "text": {"content": "1"},
+                    }
+                )
             )
-        )
 
         adapter.handle_message.assert_not_awaited()
         assert adapter.pending_wecom_ingestion == {"chat-b": pending_b}
@@ -912,6 +918,7 @@ class TestWeComTwoPhaseIngestion:
     @pytest.mark.asyncio
     async def test_reply_one_consumes_pending_and_marks_confirmed(self):
         from gateway.platforms.wecom import WECOM_INGESTION_QUEUED_TEXT
+        from unittest.mock import patch
 
         adapter = self._adapter()
         adapter._extract_media = AsyncMock(return_value=([], []))
@@ -926,7 +933,11 @@ class TestWeComTwoPhaseIngestion:
         }
         adapter.pending_wecom_ingestion = {"group-1": pending}
 
-        await adapter._on_message(self._payload({"msgid": "reply-msg", "msgtype": "text", "text": {"content": "1"}}))
+        with patch(
+            "gateway.platforms.wecom._write_wecom_ingestion_staging",
+            return_value={"staging_write_status": "skipped_no_wiki_root"},
+        ):
+            await adapter._on_message(self._payload({"msgid": "reply-msg", "msgtype": "text", "text": {"content": "1"}}))
 
         adapter.handle_message.assert_not_awaited()
         assert adapter.pending_wecom_ingestion == {}
@@ -1305,3 +1316,123 @@ class TestTextBatchFlushRace:
         assert adapter._pending_text_batches.get(key) is None, (
             "active task must pop the event after processing"
         )
+
+
+# ─── Tests for WeCom staging write ───────────────────────────────────────────
+
+from unittest.mock import AsyncMock, patch, MagicMock
+import json
+import os
+import tempfile
+from pathlib import Path
+
+
+class TestWeComStagingWrite:
+    """Test the raymond-wiki staging write path triggered on reply=1."""
+
+    def _make_manifest(self, msg_id="msg-123", topic="competition_aild"):
+        return {
+            "message_id": msg_id,
+            "topic": topic,
+            "topic_label": "AILD",
+            "confirmed_message_id": f"confirmed-{msg_id}",
+            "confirmed_at": "2026-05-30T10:00:00+08:00",
+            "action": "1",
+            "file_names": ["test.pdf"],
+        }
+
+    def test_safe_message_id_strips_dots_and_slashes(self):
+        from gateway.platforms.wecom import _safe_message_id
+        assert _safe_message_id("a/b/c.txt") == "a-b-c-txt"
+        # dots → hyphens, then consecutive runs collapsed to one
+        assert _safe_message_id("a..b") == "a-b"
+        assert _safe_message_id("a\\b") == "a-b"
+        assert _safe_message_id("normal-id-123") == "normal-id-123"
+
+    def test_safe_message_id_prevents_path_traversal(self):
+        from gateway.platforms.wecom import _safe_message_id
+        result = _safe_message_id("../../../etc/passwd")
+        assert ".." not in result
+        assert result == "etc-passwd"
+
+    def test_resolve_raymond_wiki_root_from_env(self, tmp_path):
+        # Patch env BEFORE import so the function sees the patched value
+        with patch.dict(os.environ, {"RAYMOND_WIKI_ROOT": str(tmp_path)}):
+            # Re-import to pick up fresh module state with patched env
+            import importlib
+            import gateway.platforms.wecom as _wecom
+            importlib.reload(_wecom)
+            from gateway.platforms.wecom import _resolve_raymond_wiki_root
+            result = _resolve_raymond_wiki_root()
+            assert result == tmp_path.resolve()
+
+    def test_resolve_raymond_wiki_root_fallback_skips_nonexistent(self, tmp_path):
+        nonexistent = tmp_path / "nonexistent-wiki"
+        with patch.dict(os.environ, {"RAYMOND_WIKI_ROOT": str(nonexistent)}):
+            import importlib
+            import gateway.platforms.wecom as _wecom
+            importlib.reload(_wecom)
+            from gateway.platforms.wecom import _resolve_raymond_wiki_root
+            result = _resolve_raymond_wiki_root()
+            assert result is None
+
+    def test_resolve_raymond_wiki_root_returns_none_for_nonexistent(self, tmp_path):
+        fake = tmp_path / "nonexistent-wiki"
+        with patch.dict(os.environ, {"RAYMOND_WIKI_ROOT": str(fake)}):
+            import importlib
+            import gateway.platforms.wecom as _wecom
+            importlib.reload(_wecom)
+            from gateway.platforms.wecom import _resolve_raymond_wiki_root
+            assert _resolve_raymond_wiki_root() is None
+
+    def test_write_wecom_ingestion_staging_writes_files(self, tmp_path):
+        manifest = self._make_manifest("abc-123", "competition_aild")
+        with patch.dict(os.environ, {"RAYMOND_WIKI_ROOT": str(tmp_path)}):
+            import importlib
+            import gateway.platforms.wecom as _wecom
+            importlib.reload(_wecom)
+            from gateway.platforms.wecom import _write_wecom_ingestion_staging
+            result = _write_wecom_ingestion_staging(manifest)
+        # safe_msg_id = _safe_message_id(confirmed_message_id) = "confirmed-abc-123"
+        confirmed = tmp_path / "projects" / "_staging" / "materials" / "uploads" / "confirmed" / "2026" / "05" / "confirmed-abc-123"
+        assert result["staging_write_status"] == "written"
+        assert (confirmed / "INGESTION_MANIFEST.json").exists()
+        assert (confirmed / "QUICK.md").exists()
+        assert (tmp_path / "projects" / "_staging" / "materials" / "uploads" / "state" / "QUICK_INDEX.jsonl").exists()
+        report_file = tmp_path / "projects" / "_staging" / "materials" / "uploads" / "reports" / "20260530_wecom_ingestion_report.jsonl"
+        assert report_file.exists()
+        with open(confirmed / "INGESTION_MANIFEST.json") as f:
+            saved = json.load(f)
+        assert saved["topic"] == "competition_aild"
+        assert saved["confirmed_message_id"] == "confirmed-abc-123"
+        assert saved["staging_write_status"] == "written"
+        assert saved["staging_path"] == "projects/_staging/materials/uploads/confirmed/2026/05/confirmed-abc-123"
+
+    def test_write_wecom_ingestion_staging_skipped_when_no_wiki_root(self, tmp_path):
+        fake = tmp_path / "nonexistent"
+        with patch.dict(os.environ, {"RAYMOND_WIKI_ROOT": str(fake)}):
+            import importlib
+            import gateway.platforms.wecom as _wecom
+            importlib.reload(_wecom)
+            from gateway.platforms.wecom import _write_wecom_ingestion_staging
+            result = _write_wecom_ingestion_staging(self._make_manifest())
+        assert result["staging_write_status"] == "skipped_no_wiki_root"
+
+    def test_write_wecom_ingestion_staging_handles_write_error(self, tmp_path):
+        manifest = self._make_manifest()
+        readonly = tmp_path / "read-only-staging"
+        readonly.mkdir()
+        readonly.chmod(0o444)
+        (tmp_path / "projects").mkdir()
+        (tmp_path / "projects").chmod(0o444)
+        try:
+            with patch.dict(os.environ, {"RAYMOND_WIKI_ROOT": str(tmp_path)}):
+                import importlib
+                import gateway.platforms.wecom as _wecom
+                importlib.reload(_wecom)
+                from gateway.platforms.wecom import _write_wecom_ingestion_staging
+                result = _write_wecom_ingestion_staging(manifest)
+            assert result["staging_write_status"] == "skipped_write_error"
+        finally:
+            (tmp_path / "projects").chmod(0o755)
+            readonly.chmod(0o755)
