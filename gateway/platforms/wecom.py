@@ -106,14 +106,12 @@ VOICE_SUPPORTED_MIMES = {"audio/amr"}
 
 WECOM_INGESTION_CONFIRMATION_TEMPLATE = (
     "已检测到一份可能需要进入知识库处理的资料。\n\n"
-    "初步分析：\n"
-    "1. 资料类型：{source_label}\n"
-    "2. 识别标题：{title}\n"
-    "3. 可能主体：{subject_label}（{subject_code}）\n"
-    "4. 可能类目：{category_label}（{category_code}）\n"
-    "5. 推荐暂存位置：{suggested_path}\n"
-    "6. 后续可能归入：{future_location}\n"
-    "7. 置信度：{confidence}\n\n"
+    "初步阅读：\n"
+    "1. 识别标题：{title}\n"
+    "2. 内容判断：{content_hint}\n"
+    "3. 主要线索：{excerpt_hint}\n"
+    "4. 建议处理：{recommendation}\n"
+    "5. 推荐暂存：{suggested_path}\n\n"
     "请选择：\n"
     "1. 进入知识库自动处理工作流\n"
     "2. 暂不处理\n"
@@ -1042,6 +1040,15 @@ def _analyze_wecom_ingestion_content(
     }
     future_location = future_locations.get(subject_code, future_locations["X"])
 
+    lightweight = _build_lightweight_analysis_fields(
+        title=title,
+        text_excerpt=text_excerpt,
+        subject_code=subject_code,
+        category_code=category_code,
+        filenames=filenames,
+        text=text,
+    )
+
     return {
         "title": title,
         "keywords": keywords,
@@ -1051,6 +1058,9 @@ def _analyze_wecom_ingestion_content(
         "category_label": _CATEGORY_MAP.get(category_code, "其他"),
         "confidence": overall_confidence,
         "basis": basis,
+        "summary": lightweight["summary"],
+        "content_hint": lightweight["content_hint"],
+        "recommendation": lightweight["recommendation"],
         "text_extract": {
             "status": text_extract.get("text_extract_status", "skipped_no_local_file"),
             "source": text_extract.get("text_extract_source", "filename_only"),
@@ -1076,6 +1086,62 @@ def _coerce_list(value: Any) -> List[str]:
     if isinstance(value, (list, tuple, set)):
         return [str(item).strip() for item in value if str(item).strip()]
     return [str(value).strip()] if str(value).strip() else []
+
+
+def _build_lightweight_analysis_fields(
+    title: str,
+    text_excerpt: str,
+    subject_code: str,
+    category_code: str,
+    filenames: List[str],
+    text: str,
+) -> Dict[str, str]:
+    """Generate lightweight natural-language analysis fields.
+
+    This replaces fine-grained category classification with a simple
+    content-aware summary — the goal is "what is this roughly" not
+    "which exact bucket does it land in".
+    """
+    combined = f"{text}\n{text_excerpt}".strip()
+
+    # ── content_hint: what the material is about ─────────────────────────────────
+    intro_keywords = ("简介", "机构简介", "基金会简介", "单位简介", "中心简介", "介绍")
+    if any(kw in combined for kw in intro_keywords):
+        content_hint = "机构简介 / 宣传展示类材料"
+    elif "协议" in combined or "合同" in combined:
+        content_hint = "合同协议类文件"
+    elif "纪要" in combined or "会议" in combined:
+        content_hint = "会议纪要 / 座谈记录"
+    elif "通知" in combined:
+        content_hint = "通知类文件"
+    elif "办法" in combined or "制度" in combined or "章程" in combined:
+        content_hint = "制度管理类文件"
+    elif any(kw in combined.lower() for kw in ("aild", "赛事", "竞赛", "比赛")):
+        content_hint = "赛事活动相关资料"
+    elif any(kw in combined for kw in ("创青春", "创业项目", "创业就业")):
+        content_hint = "创业就业相关资料"
+    elif "附件" in "".join(filenames) and len(combined) < 20:
+        content_hint = "低语义文件名资料（请以正文内容为准）"
+    else:
+        content_hint = "一般性资料（建议进入 GPT 审核流程后精确分类）"
+
+    # ── summary: short description of the material ───────────────────────────────
+    if text_excerpt:
+        first_line = text_excerpt.strip().split("\n")[0][:80]
+        summary = first_line
+    elif title and title not in ("未命名资料", ""):
+        summary = title
+    else:
+        summary = "未识别到明确标题，以文件名为准"
+
+    # ── recommendation ──────────────────────────────────────────────────────────
+    recommendation = "先暂存到知识库中转区，后续由 GPT 审核后再归入正式资料库"
+
+    return {
+        "summary": summary,
+        "content_hint": content_hint,
+        "recommendation": recommendation,
+    }
 
 
 def _normalize_entry(raw: str) -> str:
@@ -2096,16 +2162,16 @@ class WeComAdapter(BasePlatformAdapter):
     @staticmethod
     def _format_wecom_ingestion_confirmation(pending: Dict[str, Any]) -> str:
         analysis = pending.get("analysis", {})
+        text_excerpt = str(analysis.get("text_extract", {}).get("excerpt") or "").strip()
+        excerpt_hint = text_excerpt[:60] + "…" if len(text_excerpt) > 60 else text_excerpt
+        if not excerpt_hint:
+            excerpt_hint = "（正文未成功抽取，请以实际文件内容为准）"
         return WECOM_INGESTION_CONFIRMATION_TEMPLATE.format(
-            source_label=WECOM_INGESTION_SOURCE_LABELS.get(str(pending.get("source_type")), "未知"),
             title=str(analysis.get("title") or "未命名资料"),
-            subject_label=str(analysis.get("subject_label") or "待判断"),
-            subject_code=str(analysis.get("subject_code") or "X"),
-            category_label=str(analysis.get("category_label") or "其他"),
-            category_code=str(analysis.get("category_code") or "OTH"),
+            content_hint=str(analysis.get("content_hint") or "一般性资料"),
+            excerpt_hint=excerpt_hint,
+            recommendation=str(analysis.get("recommendation") or "建议进入知识库中转区等待 GPT 审核"),
             suggested_path=pending.get("suggested_path", ""),
-            future_location=pending.get("future_location", "待确认"),
-            confidence=str(analysis.get("confidence") or "UNKNOWN"),
         )
 
     @staticmethod

@@ -701,10 +701,10 @@ class TestWeComTwoPhaseIngestion:
         assert "1. 进入知识库自动处理工作流" in sent
         assert "2. 暂不处理" in sent
         assert "3. 仅保存原始资料，稍后人工判断" in sent
-        assert "初步分析" in sent
-        assert "可能主体" in sent
-        assert "可能类目" in sent
-        assert "推荐暂存位置" in sent
+        assert "初步阅读" in sent
+        assert "识别标题" in sent
+        assert "内容判断" in sent
+        assert "推荐暂存" in sent
 
     @pytest.mark.asyncio
     async def test_image_material_starts_pending_confirmation(self):
@@ -721,8 +721,9 @@ class TestWeComTwoPhaseIngestion:
         assert pending["suggested_path"].startswith("projects/_staging/materials/uploads/confirmed/")
         assert "analysis" in pending
         assert "future_location" in pending
-        assert "资料类型" in adapter.send.await_args.kwargs["content"]
-        assert "初步分析" in adapter.send.await_args.kwargs["content"]
+        content = adapter.send.await_args.kwargs["content"]
+        assert "初步阅读" in content
+        assert "识别标题" in content
 
     @pytest.mark.asyncio
     async def test_url_material_starts_pending_confirmation(self):
@@ -740,7 +741,9 @@ class TestWeComTwoPhaseIngestion:
 
         adapter.handle_message.assert_not_awaited()
         assert self._pending(adapter)["source_type"] == "url"
-        assert "资料类型：链接" in adapter.send.await_args.kwargs["content"]
+        content = adapter.send.await_args.kwargs["content"]
+        assert "初步阅读" in content
+        assert "识别标题" in content
 
     @pytest.mark.asyncio
     async def test_obvious_long_material_text_does_not_trigger_pending(self):
