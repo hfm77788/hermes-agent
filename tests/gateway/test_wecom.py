@@ -1430,13 +1430,234 @@ class TestTextBatchFlushRace:
         )
 
 
-# ─── Tests for WeCom staging write ───────────────────────────────────────────
+# ─── Tests for WeCom file metadata extraction ─────────────────────────────────
 
 from unittest.mock import AsyncMock, patch, MagicMock
 import json
 import os
 import tempfile
 from pathlib import Path
+
+
+class TestWeComFileMetadataExtraction:
+    """Verify that filenames are extracted from all WeCom payload blocks and drive pre-analysis."""
+
+    def _adapter(self):
+        from gateway.platforms.wecom import WeComAdapter
+        from gateway.config import PlatformConfig
+        return WeComAdapter(PlatformConfig(enabled=True))
+
+    # ── Test 1: filename from body.file ───────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_docx_filename_from_file_block_drives_fdn_pub_analysis(self):
+        adapter = self._adapter()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        body = {
+            "msgtype": "file",
+            "file": {
+                "filename": "天津市青年创业就业基金会简介（2026.5）.docx",
+                "media_id": "media-file-001",
+            },
+        }
+
+        result = adapter._detect_wecom_ingestion_candidate(
+            body=body,
+            text="",
+            media_urls=[],
+            media_types=["application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+            message_id="test-file-block",
+        )
+        assert result is not None, "DOCX file should trigger ingestion candidate"
+        # filename must appear in candidate
+        assert "天津市青年创业就业基金会简介（2026.5）.docx" in result.get("file_names", [])
+        # pre-analysis must recognise FDN + PUB from filename
+        assert result["analysis"]["subject_code"] == "FDN"
+        assert result["analysis"]["category_code"] == "PUB"
+        assert result["analysis"]["confidence"] == "HIGH"
+        # file_metadata must be populated
+        assert result["file_metadata"].get("media_ids") == ["media-file-001"]
+
+    # ── Test 2: filename from body.appmsg.title ───────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_docx_filename_from_appmsg_title_drives_fdn_pub_analysis(self):
+        adapter = self._adapter()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        body = {
+            "msgtype": "appmsg",
+            "appmsg": {
+                "title": "天津市青年创业就业基金会简介（2026.5）.docx",
+                "des": "这是一个docx文件",
+            },
+        }
+
+        result = adapter._detect_wecom_ingestion_candidate(
+            body=body,
+            text="",
+            media_urls=[],
+            media_types=["application/msword"],
+            message_id="test-appmsg-title",
+        )
+        assert result is not None, "appmsg with docx title should trigger candidate"
+        assert "天津市青年创业就业基金会简介（2026.5）.docx" in result.get("file_names", [])
+        assert result["analysis"]["subject_code"] == "FDN"
+        assert result["analysis"]["category_code"] == "PUB"
+        assert result["analysis"]["confidence"] == "HIGH"
+
+    # ── Test 3: filename from mixed.msg_item ──────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_filename_from_mixed_msg_item_drives_analysis(self):
+        adapter = self._adapter()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        body = {
+            "msgtype": "mixed",
+            "mixed": {
+                "msg_item": [
+                    {
+                        "msgtype": "file",
+                        "file": {
+                            "filename": "2026年项目申报指南.pdf",
+                            "media_id": "media-pdf-002",
+                        },
+                    },
+                    {"msgtype": "text", "content": "请查收"},
+                ]
+            },
+        }
+
+        result = adapter._detect_wecom_ingestion_candidate(
+            body=body,
+            text="请查收",
+            media_urls=[],
+            media_types=["application/pdf"],
+            message_id="test-mixed",
+        )
+        assert result is not None, "mixed msg_item with file should trigger candidate"
+        assert "2026年项目申报指南.pdf" in result.get("file_names", [])
+        # 2026年项目申报指南.pdf → subject=X (no FDN/YDC/C keyword), category=ENT from 项目申报
+        assert result["analysis"]["subject_code"] == "X"
+        assert result["analysis"]["category_code"] in ("YEV", "ENT", "TMP")
+
+    # ── Test 4: filename from cached media path ───────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_cached_media_path_filename_drives_analysis(self):
+        adapter = self._adapter()
+        # Simulate _extract_media returning a local cache path with Chinese filename
+        adapter._extract_media = AsyncMock(
+            return_value=(["/tmp/天津市青年创业就业基金会简介（2026.5）.docx"], ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"])
+        )
+
+        body = {"msgtype": "file"}
+
+        result = adapter._detect_wecom_ingestion_candidate(
+            body=body,
+            text="",
+            media_urls=["/tmp/天津市青年创业就业基金会简介（2026.5）.docx"],
+            media_types=["application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+            message_id="test-metadata",
+        )
+        assert result is not None, "cached media path with filename should trigger candidate"
+        assert "天津市青年创业就业基金会简介（2026.5）.docx" in result.get("file_names", [])
+        assert result["analysis"]["subject_code"] == "FDN"
+        assert result["analysis"]["category_code"] == "PUB"
+
+    # ── Test 5: manifest preserves file_names + file_metadata after reply=1 ─────
+
+    @pytest.mark.asyncio
+    async def test_pending_manifest_preserves_file_names_and_metadata(self):
+        from gateway.platforms.wecom import WeComAdapter
+        from gateway.config import PlatformConfig
+        import importlib
+        import gateway.platforms.wecom as _wecom
+        importlib.reload(_wecom)
+        from gateway.platforms.wecom import _write_wecom_ingestion_staging
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        body = {
+            "msgtype": "file",
+            "file": {
+                "filename": "天津市青年创业就业基金会简介（2026.5）.docx",
+                "media_id": "media-file-001",
+            },
+        }
+
+        result = adapter._detect_wecom_ingestion_candidate(
+            body=body,
+            text="",
+            media_urls=[],
+            media_types=["application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+            message_id="test-file-block",
+        )
+        assert result is not None
+
+        # Simulate pending → reply=1 → manifest
+        pending = {
+            "chat_id": "chat-test",
+            "message_id": "msg-metadata-test",
+            "source_type": result["source_type"],
+            "predicted_topic": result["predicted_topic"],
+            "confidence": result["confidence"],
+            "suggested_path": result["suggested_path"],
+            "file_names": result.get("file_names", []),
+            "file_metadata": result.get("file_metadata", {}),
+            "analysis": result.get("analysis", {}),
+            "future_location": result.get("future_location", ""),
+            "created_at": "2026-05-30T12:00:00+08:00",
+        }
+
+        manifest = adapter._build_wecom_ingestion_manifest(
+            pending=pending,
+            action_message_id="confirmed-metadata-test",
+            action_at_key="confirmed_at",
+            action_message_id_key="confirmed_message_id",
+            queue_name="wecom_ingestion",
+            status="confirmed",
+        )
+
+        # file_names must survive the manifest build
+        assert "file_names" in manifest, "manifest must contain file_names"
+        assert "天津市青年创业就业基金会简介（2026.5）.docx" in manifest["file_names"]
+        # file_metadata must survive
+        assert "file_metadata" in manifest
+        assert "media_ids" in manifest["file_metadata"]
+        # analysis must survive
+        assert manifest.get("analysis", {}).get("subject_code") == "FDN"
+        assert manifest.get("analysis", {}).get("category_code") == "PUB"
+
+    # ── Test 6: display_name / media_name also usable ─────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_display_name_extracted_as_filename(self):
+        adapter = self._adapter()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        body = {
+            "msgtype": "appmsg",
+            "appmsg": {
+                "display_name": "天津市青年创业就业基金会简介（2026.5）.docx",
+                "des": "简介文件",
+            },
+        }
+
+        result = adapter._detect_wecom_ingestion_candidate(
+            body=body,
+            text="",
+            media_urls=[],
+            media_types=[],
+            message_id="test-display-name",
+        )
+        assert result is not None
+        assert "天津市青年创业就业基金会简介（2026.5）.docx" in result.get("file_names", [])
+        assert result["analysis"]["subject_code"] == "FDN"
+        assert result["analysis"]["category_code"] == "PUB"
 
 
 class TestWeComStagingWrite:

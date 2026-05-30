@@ -416,7 +416,7 @@ def _is_wecom_attachment_or_url(
                 return True
 
     # Check filenames in body
-    for name in _extract_filenames_static(body, text):
+    for name in _extract_wecom_file_metadata_static(body, text).get("file_names", []):
         if Path(name).suffix.lower() in _ATTACHMENT_EXTENSIONS:
             return True
 
@@ -437,21 +437,195 @@ def _extract_first_url_static(text: str) -> Optional[str]:
     return match.group(0) if match else None
 
 
-def _extract_filenames_static(body: Dict[str, Any], text: str) -> List[str]:
-    names: List[str] = []
+#: Keys to try when extracting a filename from a dict block.
+_FILENAME_KEYS = (
+    "filename",
+    "file_name",
+    "name",
+    "title",
+    "display_name",
+    "fileName",
+    "file_name_utf8",
+    "attachment_name",
+    "media_name",
+    "document_name",
+)
 
-    def collect(block: Any) -> None:
+#: Block paths to scan for file metadata.
+_FILE_BLOCK_PATHS = (
+    "file",
+    "image",
+    "video",
+    "voice",
+    "appmsg",
+    "attachment",
+    "attachments",
+    "mixed",
+    "doc",
+    "document",
+)
+
+
+def _collect_metadata_from_block(block: Any) -> Dict[str, Any]:
+    """Extract all file metadata fields from a single dict block.
+
+    Returns a dict with keys: file_name, media_id, file_size, mime_type.
+    Empty strings / None are treated as absent.
+    """
+    if not isinstance(block, dict):
+        return {}
+    result: Dict[str, Any] = {}
+    # filename / name / title
+    for key in _FILENAME_KEYS:
+        val = block.get(key)
+        if val and isinstance(val, str):
+            result["file_name"] = val.strip()
+            break
+    # media_id
+    for key in ("media_id", "mediaid", "fileid", "file_id"):
+        val = block.get(key)
+        if val and isinstance(val, str):
+            result["media_id"] = str(val).strip()
+            break
+    # file_size
+    for key in ("file_size", "size", "fileSize", "length"):
+        val = block.get(key)
+        if val is not None:
+            try:
+                result["file_size"] = int(val)
+            except (ValueError, TypeError):
+                pass
+            break
+    # mime_type / content_type
+    for key in ("mime_type", "content_type", "contentType", "file_type"):
+        val = block.get(key)
+        if val and isinstance(val, str):
+            result["mime_type"] = str(val).strip()
+            break
+    return result
+
+
+def _extract_wecom_file_metadata_static(
+    body: Dict[str, Any],
+    text: str,
+    media_urls: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Extract comprehensive file metadata from a WeCom message body.
+
+    Searches these block paths:
+        body.file, body.image, body.video, body.voice, body.appmsg,
+        body.appmsg.file, body.attachment, body.attachments,
+        body.mixed.msg_item[*], body.doc, body.document
+
+    Also derives filenames from media_urls (URL path component or local cache path).
+
+    Returns:
+        {
+            "file_names": [...],
+            "media_ids": [...],
+            "file_sizes": [...],
+            "mime_types": [...],
+            "media_urls": [...],   # enriched / deduplicated
+        }
+    """
+    file_names: List[str] = []
+    media_ids: List[str] = []
+    file_sizes: List[int] = []
+    mime_types: List[str] = []
+    seen_urls: set = set()
+
+    def collect_from_block(block: Any) -> None:
         if not isinstance(block, dict):
             return
-        for key in ("filename", "file_name", "name", "title"):
-            v = str(block.get(key) or "").strip()
-            if v:
-                names.append(v)
+        meta = _collect_metadata_from_block(block)
+        if meta.get("file_name"):
+            file_names.append(meta["file_name"])
+        if meta.get("media_id"):
+            media_ids.append(meta["media_id"])
+        if "file_size" in meta:
+            file_sizes.append(meta["file_size"])
+        if meta.get("mime_type"):
+            mime_types.append(meta["mime_type"])
 
-    collect(body.get("file"))
-    collect(body.get("image"))
-    collect(body.get("appmsg"))
-    return names
+    # Scan top-level and nested blocks
+    for path in _FILE_BLOCK_PATHS:
+        if path == "attachments":
+            # body.attachments is a list of attachment dicts
+            attachments = body.get("attachments")
+            if isinstance(attachments, list):
+                for item in attachments:
+                    collect_from_block(item)
+        elif path == "mixed":
+            # body.mixed.msg_item is a list
+            mixed = body.get("mixed")
+            if isinstance(mixed, dict):
+                items = mixed.get("msg_item")
+                if isinstance(items, list):
+                    for item in items:
+                        # Each msg_item may contain file/image/appmsg sub-blocks
+                        collect_from_block(item)
+                        for sub_key in ("file", "image", "appmsg"):
+                            sub = item.get(sub_key) if isinstance(item, dict) else None
+                            collect_from_block(sub)
+        elif path == "appmsg":
+            # body.appmsg and body.appmsg.file / body.appmsg.appmsg (nested)
+            appmsg = body.get("appmsg")
+            if isinstance(appmsg, dict):
+                collect_from_block(appmsg)
+                # Some payloads nest another appmsg inside appmsg
+                nested = appmsg.get("appmsg")
+                if isinstance(nested, dict):
+                    collect_from_block(nested)
+                # appmsg.file
+                collect_from_block(appmsg.get("file"))
+                # appmsg.image
+                collect_from_block(appmsg.get("image"))
+        else:
+            block = body.get(path)
+            collect_from_block(block)
+
+    # Derive filenames from media_urls (local cache paths / URL path components)
+    for url in (media_urls or []):
+        if not url:
+            continue
+        # Skip non-file URLs (http images, etc.)
+        parsed = urlparse(url)
+        path_part = parsed.path or ""
+        if path_part:
+            name = Path(path_part).name
+            # Only treat as a file if it has an extension
+            if name and "." in name:
+                file_names.append(name)
+                seen_urls.add(url)
+        else:
+            # Local cache path — e.g. /tmp/wecom_media_xxx.docx
+            name = Path(url).name
+            if name and ("." in name or len(name) > 4):
+                file_names.append(name)
+                seen_urls.add(url)
+
+    # Deduplicate, preserving order
+    seen_names: set = set()
+    unique_names: List[str] = []
+    for n in file_names:
+        if n and n not in seen_names:
+            seen_names.add(n)
+            unique_names.append(n)
+
+    logger.debug(
+        "[wecom] file metadata: file_names=%d media_ids=%d mime_types=%d",
+        len(unique_names),
+        len(media_ids),
+        len(mime_types),
+    )
+
+    return {
+        "file_names": unique_names,
+        "media_ids": list(dict.fromkeys(media_ids)),
+        "file_sizes": list(dict.fromkeys(file_sizes)),
+        "mime_types": list(dict.fromkeys(mime_types)),
+        "media_urls": list(seen_urls),
+    }
 
 
 def _should_start_wecom_ingestion_candidate(
@@ -493,7 +667,7 @@ _CATEGORY_MAP = {
 }
 
 #: Category priority (higher index = higher priority in conflict resolution).
-_CATEGORY_PRIORITY = ["TMP", "OTH", "PUB", "ENT", "YEV", "MTG", "DOC", "AGR"]
+_CATEGORY_PRIORITY = ["TMP", "OTH", "ENT", "PUB", "YEV", "MTG", "DOC", "AGR"]
 
 
 def _classify_subject(text: str, filenames: List[str]) -> Tuple[str, str]:
@@ -592,9 +766,11 @@ def _analyze_wecom_ingestion_content(
     body: Dict[str, Any],
     text: str,
     media_types: List[str],
+    media_urls: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Extract title, keywords, subject, category, and suggested paths."""
-    filenames = _extract_filenames_static(body, text)
+    file_metadata = _extract_wecom_file_metadata_static(body, text, media_urls)
+    filenames = file_metadata.get("file_names", [])
 
     # Title: from appmsg title, then first filename, then first URL name
     title = ""
@@ -1107,6 +1283,8 @@ class WeComAdapter(BasePlatformAdapter):
                 "predicted_topic": ingestion_candidate["predicted_topic"],
                 "confidence": ingestion_candidate["confidence"],
                 "suggested_path": ingestion_candidate["suggested_path"],
+                "file_names": ingestion_candidate.get("file_names", []),
+                "file_metadata": ingestion_candidate.get("file_metadata", {}),
                 "analysis": ingestion_candidate.get("analysis", {}),
                 "future_location": ingestion_candidate.get("future_location", ""),
                 "created_at": self._utc8_now_iso(),
@@ -1507,8 +1685,18 @@ class WeComAdapter(BasePlatformAdapter):
         if not source_type:
             return None
 
-        # Pre-analysis
-        analysis = _analyze_wecom_ingestion_content(body, text, media_types)
+        # Pre-analysis: enrich with extended file metadata first
+        file_metadata = _extract_wecom_file_metadata_static(body, text, media_urls)
+        file_names = file_metadata.get("file_names", [])
+
+        logger.info(
+            "[wecom] file metadata keys: msgtype=%s file_names=%s media_ids=%d",
+            str(body.get("msgtype") or ""),
+            file_names,
+            len(file_metadata.get("media_ids", [])),
+        )
+
+        analysis = _analyze_wecom_ingestion_content(body, text, media_types, media_urls)
 
         # Use old topic for backward compatibility (tests + existing topic map)
         old_topic, old_confidence = cls._predict_wecom_topic(body, text)
@@ -1526,6 +1714,12 @@ class WeComAdapter(BasePlatformAdapter):
             "predicted_topic": topic,
             "confidence": confidence,
             "suggested_path": analysis["suggested_path"],
+            "file_names": file_names,
+            "file_metadata": {
+                "media_ids": file_metadata.get("media_ids", []),
+                "file_sizes": file_metadata.get("file_sizes", []),
+                "mime_types": file_metadata.get("mime_types", []),
+            },
             "analysis": {
                 "title": analysis["title"],
                 "keywords": analysis["keywords"],
