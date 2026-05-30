@@ -856,6 +856,13 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
         result = bridge.respond_to_approval(id, decision)
         return json.dumps(result, indent=2)
 
+    try:
+        from app.tools.ssh_tools import register_ssh_tools
+
+        register_ssh_tools(mcp)
+    except Exception as exc:
+        logger.debug("SSH capability extension unavailable: %s", exc)
+
     return mcp
 
 
