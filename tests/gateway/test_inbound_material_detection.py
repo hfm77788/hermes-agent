@@ -9,6 +9,7 @@ import pytest
 import gateway.run as gateway_run
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.wecom import WeComAdapter
 from gateway.session import SessionSource
 
 
@@ -253,3 +254,15 @@ def test_contains_github_resource_url():
     ]
     for text in negatives:
         assert not gateway_run._contains_github_resource_url(text), f"Expected False for: {text}"
+
+
+def test_wecom_text_plain_does_not_derive_document():
+    body = {"msgtype": "text"}
+    assert WeComAdapter._derive_message_type(body, "hello", ["text/plain"]) == MessageType.TEXT
+    assert WeComAdapter._derive_message_type(body, "hello", ["text/plain; charset=utf-8"]) == MessageType.TEXT
+
+
+def test_wecom_real_document_mime_types_still_derive_document():
+    body = {"msgtype": "text"}
+    assert WeComAdapter._derive_message_type(body, "notes", ["text/markdown"]) == MessageType.DOCUMENT
+    assert WeComAdapter._derive_message_type(body, "notes", ["application/pdf"]) == MessageType.DOCUMENT

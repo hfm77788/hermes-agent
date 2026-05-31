@@ -838,7 +838,15 @@ class WeComAdapter(BasePlatformAdapter):
     @staticmethod
     def _derive_message_type(body: Dict[str, Any], text: str, media_types: List[str]) -> MessageType:
         """Choose the normalized inbound message type."""
-        if any(mtype.startswith(("application/", "text/")) for mtype in media_types):
+        document_types = (
+            "application/",
+            "text/markdown",
+            "text/x-python",
+            "text/html",
+            "text/xml",
+            "text/csv",
+        )
+        if any(mtype.startswith(document_types) for mtype in media_types):
             return MessageType.DOCUMENT
         if any(mtype.startswith("image/") for mtype in media_types):
             return MessageType.TEXT if text else MessageType.PHOTO
