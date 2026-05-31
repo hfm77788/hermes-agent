@@ -34,6 +34,37 @@ _SILENCE_NARRATION = re.compile(
     re.IGNORECASE,
 )
 
+# Forbidden phrases that indicate LLM hallucinated admin-review steps.
+# These MUST NOT appear in any outbound message.
+# Caught patterns (Chinese):
+#   等待/等候 + 侯方明/管理员/人工 + 审核/确认/批准/复核
+#   已进入/已进入 + 待处理队列/待审核队列/待确认队列/审核队列
+#   正在等待/排队等待/侯方明确认中/管理员审核中
+#   人工审核中/审核队列中/待审核状态/待确认状态
+# Caught patterns (English):
+#   pending admin review / awaiting admin review / in review queue /
+#   in approval queue / awaiting approval / admin review in progress /
+#   has entered review queue / waiting in queue / pending approval
+_FORBIDDEN_PHRASES = re.compile(
+    r'等待侯方明审核|等候侯方明审核|侯方明审核中|侯方明确认中'
+    r'|等待管理员审核|等候管理员审核|管理员审核中|管理员确认中'
+    r'|等待人工审核|等候人工审核|人工审核中'
+    r'|已进入待处理队列|已进入待审核队列|已进入待确认队列'
+    r'|已进入审核队列|进入审核队列|进入待审核队列'
+    r'|待审核状态|待确认状态|待处理状态'
+    r'|等待审核|等候审核|等待复核|等候复核'
+    r'|等待批准|等候批准|等待确认|等候确认'
+    r'|正在等待审核|正在等待确认|排队等待审核|排队审核中'
+    r'|审核队列中|确认队列中'
+    r'|pending.admin.review|awaiting.admin.review|admin.review.in.progress'
+    r'|has.entered.review.queue|has.entered.approval.queue|in.review.queue|in.approval.queue'
+    r'|waiting.in.queue|pending.approval|awaiting.approval|awaiting.confirmation'
+    r'|waiting.admin.review|admin.approval.pending',
+    re.IGNORECASE,
+)
+
+MATERIAL_INGESTION_REPLY = "已确认分类，资料处理中，完成后将生成 PR，等待您复核合并。"
+
 
 def _is_silence_narration(content: Optional[str]) -> bool:
     """Return True when ``content`` is *only* a silence-narration token.
@@ -400,6 +431,19 @@ class DeliveryRouter:
                 send_metadata["telegram_dm_topic_reply_fallback"] = True
             elif "thread_id" not in send_metadata and "message_thread_id" not in send_metadata and not has_explicit_direct_topic:
                 send_metadata["thread_id"] = target_thread_id
+
+        # Anti-hallucination guard: strip forbidden admin-review phrases before delivery.
+        # These indicate LLM drifted from the skill into fake pending queues.
+        # Replace with the correct material-ingestion confirmation reply.
+        if _FORBIDDEN_PHRASES.search(content):
+            logger.warning(
+                "Stripped forbidden phrase from outbound to %s (chat=%s): %r",
+                target.platform.value,
+                target.chat_id,
+                content[:80],
+            )
+            content = MATERIAL_INGESTION_REPLY
+
         result = await adapter.send(target.chat_id, content, metadata=send_metadata or None)
         if _send_result_failed(result):
             if (

@@ -38,6 +38,11 @@ from utils import base_url_host_matches, base_url_hostname
 
 logger = logging.getLogger(__name__)
 
+_TOOL_CALL_BRACKET_RE = re.compile(
+    r"\[TOOL_CALL\]\s*(.*?)\s*\[/TOOL_CALL\]",
+    re.DOTALL | re.IGNORECASE,
+)
+
 
 def _ra():
     """Lazy ``run_agent`` reference.
@@ -48,6 +53,89 @@ def _ra():
     """
     import run_agent
     return run_agent
+
+
+def _make_bracket_tool_call(agent, tool_name: str, arguments: str, index: int) -> SimpleNamespace:
+    """Build a synthetic tool_call object from a text-encoded bridge tag."""
+    call_id = agent._deterministic_call_id(tool_name, arguments, index)
+    return SimpleNamespace(
+        id=call_id,
+        call_id=call_id,
+        response_item_id=None,
+        type="function",
+        function=SimpleNamespace(name=tool_name, arguments=arguments),
+    )
+
+
+def _extract_bracket_tool_calls(agent, content: str) -> tuple[list[SimpleNamespace], str]:
+    """Parse ``[TOOL_CALL]...[/TOOL_CALL]`` blocks into structured tool calls.
+
+    The bridge format is intentionally narrow:
+    - plain text payloads are treated as terminal commands
+    - JSON payloads may carry an explicit ``name`` and ``arguments``
+
+    Any extracted blocks are removed from the visible assistant content so
+    messaging surfaces do not echo the control text back to the user.
+    """
+    if not content:
+        return [], ""
+
+    extracted: list[SimpleNamespace] = []
+    consumed_spans: list[tuple[int, int]] = []
+
+    for match in _TOOL_CALL_BRACKET_RE.finditer(content):
+        raw_payload = match.group(1).strip()
+        if not raw_payload:
+            consumed_spans.append((match.start(), match.end()))
+            continue
+
+        tool_name = "terminal"
+        arguments: Any = {"command": raw_payload}
+
+        if raw_payload.startswith("{"):
+            try:
+                parsed = json.loads(raw_payload)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                parsed_name = parsed.get("name")
+                parsed_arguments = parsed.get("arguments", {})
+                if isinstance(parsed_name, str) and parsed_name.strip():
+                    tool_name = parsed_name.strip()
+                    arguments = parsed_arguments
+                elif isinstance(parsed.get("command"), str) and parsed.get("command").strip():
+                    arguments = {"command": str(parsed.get("command")).strip()}
+
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+
+        extracted.append(
+            _make_bracket_tool_call(agent, tool_name, arguments, len(extracted))
+        )
+        consumed_spans.append((match.start(), match.end()))
+
+    if not consumed_spans:
+        return extracted, content.strip()
+
+    consumed_spans.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in consumed_spans:
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+
+    cleaned_parts: list[str] = []
+    cursor = 0
+    for start, end in merged:
+        if cursor < start:
+            cleaned_parts.append(content[cursor:start])
+        cursor = max(cursor, end)
+    if cursor < len(content):
+        cleaned_parts.append(content[cursor:])
+
+    cleaned = "\n".join(part.strip() for part in cleaned_parts if part and part.strip()).strip()
+    return extracted, cleaned
 
 
 def estimate_request_context_tokens(api_payload: Any) -> int:
@@ -854,6 +942,10 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
         from agent.redact import redact_sensitive_text
         _san_content = redact_sensitive_text(_san_content)
 
+    bridge_tool_calls: list[SimpleNamespace] = []
+    if isinstance(_san_content, str) and _san_content:
+        bridge_tool_calls, _san_content = _extract_bracket_tool_calls(agent, _san_content)
+
     msg = {
         "role": "assistant",
         "content": _san_content,
@@ -936,6 +1028,10 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     codex_message_items = getattr(assistant_message, "codex_message_items", None)
     if codex_message_items:
         msg["codex_message_items"] = codex_message_items
+
+    if bridge_tool_calls:
+        assistant_tool_calls = list(assistant_tool_calls or [])
+        assistant_tool_calls.extend(bridge_tool_calls)
 
     if assistant_tool_calls:
         tool_calls = []
@@ -1750,12 +1846,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # call starting at the same index and redirect it to a fresh slot.
         _last_id_at_idx: dict = {}      # raw_index -> last seen non-empty id
         _active_slot_by_idx: dict = {}  # raw_index -> current slot in tool_calls_acc
-        # Per-slot latch: set once a slot is positively identified as a
-        # cumulative-resend stream (a delta that is a strict superset of the
-        # accumulated buffer).  Until latched, deltas are appended normally;
-        # after latching, the buffer is replaced and exact-duplicate deltas
-        # are dropped.  See the argument-accumulation block below (#35592).
-        _cumulative_args_slot: set = set()
         finish_reason = None
         model_name = None
         role = "assistant"
@@ -1873,44 +1963,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             # Vercel AI patterns) is immune to this.
                             entry["function"]["name"] = tc_delta.function.name
                         if tc_delta.function.arguments:
-                            # Argument deltas are normally incremental
-                            # fragments (OpenAI spec), so the default is to
-                            # concatenate.  But some OpenAI-compatible
-                            # providers (DeepSeek / Baidu Qianfan, #35592)
-                            # operate in *cumulative* mode: each chunk
-                            # resends the full arguments-so-far instead of
-                            # the new fragment.  Blind += turns that into
-                            # '{...}{...}{...}', corrupting the tool call.
-                            #
-                            # Detect cumulative mode per-slot: in cumulative
-                            # mode the new delta is a superset that starts
-                            # with everything accumulated so far (monotonic
-                            # growth), and an exact resend equals it.
-                            # Incremental fragments are JSON suffixes that do
-                            # NOT restate the accumulated prefix, so this is
-                            # unambiguous on the full buffer (not a partial
-                            # per-chunk guess).
-                            _new = tc_delta.function.arguments
-                            _prev = entry["function"]["arguments"]
-                            if not _prev:
-                                entry["function"]["arguments"] = _new
-                            elif len(_new) > len(_prev) and _new.startswith(_prev):
-                                # Strict superset of the accumulated buffer —
-                                # the unambiguous cumulative-resend signature.
-                                # Latch the slot and replace (don't append).
-                                _cumulative_args_slot.add(idx)
-                                entry["function"]["arguments"] = _new
-                            elif idx in _cumulative_args_slot and _new == _prev:
-                                # Already a confirmed cumulative slot and this
-                                # is an exact full resend — drop the duplicate.
-                                pass
-                            else:
-                                # Incremental fragment — normal append.  Note
-                                # an exact-equal delta on a NON-latched slot is
-                                # treated as a real fragment, never silently
-                                # dropped, so genuine incremental streams are
-                                # untouched.
-                                entry["function"]["arguments"] = _prev + _new
+                            entry["function"]["arguments"] += tc_delta.function.arguments
                     extra = getattr(tc_delta, "extra_content", None)
                     if extra is None and hasattr(tc_delta, "model_extra"):
                         extra = (tc_delta.model_extra or {}).get("extra_content")
