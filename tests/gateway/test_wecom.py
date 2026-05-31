@@ -260,6 +260,21 @@ class TestExtractText:
         assert text == "spoken text"
         assert reply_text == "quoted"
 
+    def test_extracts_appmsg_title_and_url(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        body = {
+            "msgtype": "appmsg",
+            "appmsg": {
+                "title": "GitHub PR #42",
+                "url": "https://github.com/example/repo/pull/42",
+            },
+        }
+        text, reply_text = WeComAdapter._extract_text(body)
+        assert "GitHub PR #42" in text
+        assert "https://github.com/example/repo/pull/42" in text
+        assert reply_text is None
+
 
 class TestCallbackDispatch:
     @pytest.mark.asyncio
@@ -665,7 +680,7 @@ class TestWeComZombieSessionFix:
         assert a._device_id != b._device_id
 
     @pytest.mark.asyncio
-    async def test_open_connection_includes_device_id_in_subscribe(self):
+    async def test_open_connection_includes_device_id_in_subscribe(self, monkeypatch):
         from gateway.platforms.wecom import APP_CMD_SUBSCRIBE, WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
@@ -702,6 +717,7 @@ class TestWeComZombieSessionFix:
         adapter._cleanup_ws = _fake_cleanup
         adapter._wait_for_handshake = _fake_handshake
 
+        monkeypatch.setattr("gateway.platforms.wecom.aiohttp", SimpleNamespace(ClientSession=_FakeSession), raising=False)
         with patch("gateway.platforms.wecom.aiohttp.ClientSession", _FakeSession):
             await adapter._open_connection()
 

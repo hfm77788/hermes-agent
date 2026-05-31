@@ -66,6 +66,7 @@ AUTHOR_MAP = {
     "3540493+kpadilha@users.noreply.github.com": "kpadilha",
     "40378218+chaconne67@users.noreply.github.com": "chaconne67",
     "Pluviobyte@users.noreply.github.com": "Pluviobyte",
+    "hfm77788@users.noreply.github.com": "hfm77788",
     "sanghyuk_seo@nexcubecorp.com": "sanghyuk-seo-nexcube",
     "subrtt@gmail.com": "Brixyy",
     "wangpuv@hotmail.com": "wangpuv",
@@ -1027,6 +1028,7 @@ AUTHOR_MAP = {
     "26782336+cixuuz@users.noreply.github.com": "cixuuz",
     "aleksandr.pasevin@openzeppelin.com": "pasevin",
     "ubuntu@localhost.localdomain": "holynn-q",
+    "ubuntu@localhost": "hfm77788",  # CI attribution
     "holynn@placeholder.local": "holynn-q",
     "agent@hermes.local": "jacdevos",
     "sunsky.lau@gmail.com": "liuhao1024",
