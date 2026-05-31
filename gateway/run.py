@@ -594,15 +594,15 @@ def _should_add_material_context(event: "MessageEvent", message_text: str) -> bo
     links unless the user explicitly asks for material handling.
     """
     text = (message_text or "").strip()
-    if not text:
-        return False
     if _looks_like_material_ingest_intent(text):
         return True
-    if _contains_github_resource_url(text):
-        return False
     media_urls = getattr(event, "media_urls", None) or []
     if media_urls and getattr(event, "message_type", None) == MessageType.DOCUMENT:
         return True
+    if not text:
+        return False
+    if _contains_github_resource_url(text):
+        return False
     return False
 
 

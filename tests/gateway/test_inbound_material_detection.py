@@ -33,6 +33,48 @@ def _make_source():
     )
 
 
+class TestShouldAddMaterialContext:
+    def test_captionless_document_gets_material_context(self):
+        """Captionless document attachment -> True, even when event.text is empty."""
+        event = MessageEvent(
+            text="",
+            message_type=MessageType.DOCUMENT,
+            media_urls=["https://example.com/file.pdf"],
+        )
+
+        assert gateway_run._should_add_material_context(event, "") is True
+
+    def test_document_with_github_url_caption_still_gets_material_context(self):
+        """Document + GitHub caption -> True because document takes priority."""
+        event = MessageEvent(
+            text="Please review https://github.com/user/repo/pull/123",
+            message_type=MessageType.DOCUMENT,
+            media_urls=["https://example.com/doc.md"],
+        )
+
+        assert gateway_run._should_add_material_context(event, event.text) is True
+
+    def test_plain_github_url_no_attachment_returns_false(self):
+        """Plain GitHub URL with no attachment -> False (exemption applies)."""
+        event = MessageEvent(
+            text="see https://github.com/user/repo/pull/123",
+            message_type=MessageType.TEXT,
+            media_urls=[],
+        )
+
+        assert gateway_run._should_add_material_context(event, event.text) is False
+
+    def test_empty_text_no_media_returns_false(self):
+        """Empty text, no media -> False."""
+        event = MessageEvent(
+            text="",
+            message_type=MessageType.TEXT,
+            media_urls=[],
+        )
+
+        assert gateway_run._should_add_material_context(event, "") is False
+
+
 # ----------------------------------------------------------------------
 # Helper: assert plain text passes through unchanged (no material context)
 # ----------------------------------------------------------------------
