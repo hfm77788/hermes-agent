@@ -1032,6 +1032,9 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     if bridge_tool_calls:
         assistant_tool_calls = list(assistant_tool_calls or [])
         assistant_tool_calls.extend(bridge_tool_calls)
+        # Write back so the caller's _execute_tool_calls also sees them
+        # (it reads assistant_message.tool_calls, not the returned dict)
+        assistant_message.tool_calls = assistant_tool_calls
 
     if assistant_tool_calls:
         tool_calls = []
