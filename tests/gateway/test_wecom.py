@@ -260,6 +260,21 @@ class TestExtractText:
         assert text == "spoken text"
         assert reply_text == "quoted"
 
+    def test_extracts_appmsg_title_and_url(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        body = {
+            "msgtype": "appmsg",
+            "appmsg": {
+                "title": "GitHub PR #42",
+                "url": "https://github.com/example/repo/pull/42",
+            },
+        }
+        text, reply_text = WeComAdapter._extract_text(body)
+        assert "GitHub PR #42" in text
+        assert "https://github.com/example/repo/pull/42" in text
+        assert reply_text is None
+
 
 class TestCallbackDispatch:
     @pytest.mark.asyncio
