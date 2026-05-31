@@ -521,7 +521,7 @@ class WeComAdapter(BasePlatformAdapter):
         if is_group and text:
             text = re.sub(r"^@\S+\s*", "", text).strip()
         media_urls, media_types = await self._extract_media(body)
-        message_type = self._derive_message_type(body, text, media_types)
+        message_type = self._derive_message_type(body, text, media_types, media_urls)
         has_reply_context = bool(reply_text and (text or media_urls))
 
         if not text and reply_text and not media_urls:
@@ -836,7 +836,12 @@ class WeComAdapter(BasePlatformAdapter):
         return name
 
     @staticmethod
-    def _derive_message_type(body: Dict[str, Any], text: str, media_types: List[str]) -> MessageType:
+    def _derive_message_type(
+        body: Dict[str, Any],
+        text: str,
+        media_types: List[str],
+        media_urls: Optional[List[str]] = None,
+    ) -> MessageType:
         """Choose the normalized inbound message type."""
         document_types = (
             "application/",
@@ -848,6 +853,10 @@ class WeComAdapter(BasePlatformAdapter):
         )
         if any(mtype.startswith(document_types) for mtype in media_types):
             return MessageType.DOCUMENT
+        if any(mtype.startswith("text/plain") for mtype in media_types):
+            if media_urls:
+                return MessageType.DOCUMENT
+            return MessageType.TEXT
         if any(mtype.startswith("image/") for mtype in media_types):
             return MessageType.TEXT if text else MessageType.PHOTO
         if str(body.get("msgtype") or "").lower() == "voice":

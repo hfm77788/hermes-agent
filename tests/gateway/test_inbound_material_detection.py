@@ -298,7 +298,17 @@ def test_contains_github_resource_url():
         assert not gateway_run._contains_github_resource_url(text), f"Expected False for: {text}"
 
 
-def test_wecom_text_plain_does_not_derive_document():
+def test_wecom_text_plain_attachment_gets_document_context():
+    body = {"msgtype": "text"}
+    media_urls = ["/tmp/notes.txt"]
+    assert WeComAdapter._derive_message_type(body, "hello", ["text/plain"], media_urls) == MessageType.DOCUMENT
+    assert (
+        WeComAdapter._derive_message_type(body, "hello", ["text/plain; charset=utf-8"], media_urls)
+        == MessageType.DOCUMENT
+    )
+
+
+def test_wecom_plain_text_message_still_gets_text():
     body = {"msgtype": "text"}
     assert WeComAdapter._derive_message_type(body, "hello", ["text/plain"]) == MessageType.TEXT
     assert WeComAdapter._derive_message_type(body, "hello", ["text/plain; charset=utf-8"]) == MessageType.TEXT
