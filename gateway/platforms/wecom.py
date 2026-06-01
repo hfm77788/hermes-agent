@@ -68,6 +68,10 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_image_from_bytes,
 )
+from gateway.platforms.we_com_material_ingestion import (
+    batch_id_from_message,
+    create_material_pr,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +170,7 @@ class WeComAdapter(BasePlatformAdapter):
         self._group_policy = str(extra.get("group_policy") or os.getenv("WECOM_GROUP_POLICY", "open")).strip().lower()
         self._group_allow_from = _coerce_list(extra.get("group_allow_from") or extra.get("groupAllowFrom"))
         self._groups = extra.get("groups") if isinstance(extra.get("groups"), dict) else {}
+        self._ingestion_group_id = os.getenv("WECOM_INGESTION_GROUP_ID", "").strip()
 
         self._session: Optional["aiohttp.ClientSession"] = None
         self._ws: Optional["aiohttp.ClientWebSocketResponse"] = None
@@ -556,7 +561,59 @@ class WeComAdapter(BasePlatformAdapter):
         if message_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
             self._enqueue_text_event(event)
         else:
+            if (
+                self._ingestion_group_id
+                and chat_id == self._ingestion_group_id
+                and event.media_urls
+                and message_type != MessageType.TEXT
+            ):
+                asyncio.create_task(
+                    self._handle_material_ingestion(
+                        event=event,
+                        batch_id=batch_id_from_message(msg_id, self._ingestion_group_id),
+                    )
+                )
             await self.handle_message(event)
+
+    async def _handle_material_ingestion(self, event: MessageEvent, batch_id: str) -> None:
+        """
+        Background task that turns a staged WeCom file into a PR.
+        """
+        try:
+            await asyncio.sleep(1.0)
+
+            staging_base = Path("/home/ubuntu/raymond-wiki/projects/_staging/materials")
+            batch_dirs = list(staging_base.rglob(f"*{batch_id}*"))
+            staging_path = batch_dirs[-1] if batch_dirs else staging_base
+
+            result = create_material_pr(
+                batch_id=batch_id,
+                topic_key="unknown",
+                topic_name="待判断",
+                sender=event.source.user_id or "wecom_user",
+                message_id=event.message_id or "",
+                file_count=len(event.media_urls),
+                confidence="LOW",
+                staging_path=staging_path,
+            )
+
+            if result["success"]:
+                reply = (
+                    f"资料已创建 PR：#{result['pr_number']}\n"
+                    f"链接：{result['pr_url']}\n"
+                    f"HEAD：{result['head_sha'][:8]}\n"
+                    f"变更文件：{len(result['changed_files'])} 个"
+                )
+            else:
+                reply = (
+                    "资料录入失败\n"
+                    f"阶段：{result.get('stage', 'unknown')}\n"
+                    f"原因：{result.get('error', 'unknown error')}"
+                )
+
+            await self.send(chat_id=event.source.chat_id, content=reply)
+        except Exception as exc:
+            logger.exception("[%s] Material ingestion job failed: %s", self.name, exc)
 
     # ------------------------------------------------------------------
     # Text message aggregation (handles WeCom client-side splits)
