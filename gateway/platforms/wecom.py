@@ -584,7 +584,13 @@ class WeComAdapter(BasePlatformAdapter):
 
             staging_base = Path("/home/ubuntu/raymond-wiki/projects/_staging/materials")
             batch_dirs = list(staging_base.rglob(f"*{batch_id}*"))
-            staging_path = batch_dirs[-1] if batch_dirs else staging_base
+            if not batch_dirs:
+                await self.send(
+                    chat_id=event.source.chat_id,
+                    content="资料录入失败\n阶段：batch_lookup\n原因：batch directory not found",
+                )
+                return
+            staging_path = batch_dirs[-1]
 
             result = create_material_pr(
                 batch_id=batch_id,
