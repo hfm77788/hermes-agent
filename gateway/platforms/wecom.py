@@ -920,7 +920,7 @@ class WeComAdapter(BasePlatformAdapter):
         name = Path(urlparse(url).path).name or "document"
         # Reject servlet URLs to avoid ENAMETOOLONG
         if "servlet" in url.lower():
-            name = "document"
+            name = "wecom_file"
         if "." not in name:
             ext = mimetypes.guess_extension(content_type) or ".bin"
             name = f"{name}{ext}"
