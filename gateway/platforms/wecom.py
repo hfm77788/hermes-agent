@@ -529,6 +529,12 @@ class WeComAdapter(BasePlatformAdapter):
             media_urls, media_types = await self._extract_media(body)
         except Exception as exc:
             logger.warning("[%s] Failed to extract media: %s", self.name, exc)
+            result = await self.send(
+                chat_id=chat_id,
+                content="文件接收失败\n阶段：extract_media\n原因：文件名过长或文件缓存失败",
+            )
+            if not result.success:
+                logger.warning("[%s] Failed to send extract_media error reply: %s", self.name, result.error)
             media_urls, media_types = [], []
         message_type = self._derive_message_type(body, text, media_types)
         has_reply_context = bool(reply_text and (text or media_urls))
@@ -899,22 +905,30 @@ class WeComAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _guess_filename(url: str, content_disposition: Optional[str], content_type: str) -> str:
-        def _truncate_with_ext(name: str, max_len: int) -> str:
-            """Truncate name to max_len while preserving extension."""
-            if len(name) <= max_len:
+        def _truncate_with_ext(name: str, max_bytes: int) -> str:
+            """Truncate name to max_bytes while preserving extension (UTF-8 safe)."""
+            if len(name.encode("utf-8", errors="ignore")) <= max_bytes:
                 return name
             if "." in name:
                 ext = name[name.rfind("."):]
-                max_base_len = max_len - len(ext)
-                if max_base_len > 0:
-                    return name[:max_base_len] + ext
-            return name[:max_len]
+                ext_bytes = ext.encode("utf-8", errors="ignore")
+                stem_bytes = name[:name.rfind(".")].encode("utf-8", errors="ignore")
+                max_stem_bytes = max_bytes - len(ext_bytes)
+                if max_stem_bytes > 0:
+                    return stem_bytes[:max_stem_bytes].decode("utf-8", errors="ignore") + ext
+                # Extension alone already exceeds budget — drop extension
+                return stem_bytes[:max_stem_bytes].decode("utf-8", errors="ignore")
+            return name.encode("utf-8", errors="ignore")[:max_bytes].decode("utf-8", errors="ignore")
+
+        MAX_FILENAME_BYTES = 180
 
         if content_disposition:
             match = re.search(r'filename="?([^";]+)"?', content_disposition)
             if match:
                 name = match.group(1)
-                name = _truncate_with_ext(name, 180)
+                name_bytes = name.encode("utf-8", errors="ignore")
+                if len(name_bytes) > MAX_FILENAME_BYTES:
+                    name = _truncate_with_ext(name, MAX_FILENAME_BYTES)
                 return name
 
         name = Path(urlparse(url).path).name or "document"
@@ -924,8 +938,8 @@ class WeComAdapter(BasePlatformAdapter):
         if "." not in name:
             ext = mimetypes.guess_extension(content_type) or ".bin"
             name = f"{name}{ext}"
-        if len(name) > 180:
-            name = _truncate_with_ext(name, 180)
+        if len(name.encode("utf-8", errors="ignore")) > MAX_FILENAME_BYTES:
+            name = _truncate_with_ext(name, MAX_FILENAME_BYTES)
         return name
 
     @staticmethod

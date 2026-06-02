@@ -941,13 +941,26 @@ class TestTextBatchFlushRace:
 class TestGuessFilename:
     """Tests for _guess_filename ENAMETOOLONG fix."""
 
-    def test_guess_filename_caps_at_180_chars(self):
+    def test_guess_filename_caps_at_180_bytes(self):
+        """Basename must be capped at 180 UTF-8 bytes, not characters."""
         from gateway.platforms.wecom import WeComAdapter
 
-        long_name = "a" * 200 + ".pdf"
-        url = f"https://example.com/{long_name}"
+        # ASCII: 200 'a' chars = 200 bytes + .pdf (4 bytes) = 204 bytes → truncate stem
+        long_ascii = "a" * 200 + ".pdf"
+        url = f"https://example.com/{long_ascii}"
         result = WeComAdapter._guess_filename(url, None, "application/pdf")
-        assert len(result) == 180
+        assert len(result.encode("utf-8")) <= 180
+        assert result.endswith(".pdf")
+
+    def test_guess_filename_caps_chinese_at_180_bytes(self):
+        """Chinese chars are 3 bytes each in UTF-8; must be capped by bytes, not chars."""
+        from gateway.platforms.wecom import WeComAdapter
+
+        # 70 Chinese chars ≈ 210 bytes + .pdf (4 bytes) → stem must be truncated
+        chinese_name = "中" * 70 + ".pdf"
+        url = f"https://example.com/{chinese_name}"
+        result = WeComAdapter._guess_filename(url, None, "application/pdf")
+        assert len(result.encode("utf-8")) <= 180
         assert result.endswith(".pdf")
 
     def test_guess_filename_rejects_servlet_urls(self):
@@ -993,10 +1006,16 @@ class TestExtractMediaErrorHandling:
     @pytest.mark.asyncio
     async def test_on_message_handles_extract_media_failure(self):
         from gateway.platforms.wecom import WeComAdapter
+        from typing import NamedTuple
+
+        class MockSendResult(NamedTuple):
+            success: bool
+            error: str = ""
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
         adapter._text_batch_delay_seconds = 0
         adapter.handle_message = AsyncMock()
+        adapter.send = AsyncMock(return_value=MockSendResult(success=True))
 
         # Simulate _extract_media raising an exception
         adapter._extract_media = AsyncMock(side_effect=RuntimeError("media extraction failed"))
@@ -1014,8 +1033,14 @@ class TestExtractMediaErrorHandling:
             },
         }
 
-        # Should not raise, media_urls should be empty
+        # Should not raise; should send error reply and set media_urls to []
         await adapter._on_message(payload)
+        # Verify error reply was sent
+        adapter.send.assert_awaited_once_with(
+            chat_id="chat-1",
+            content="文件接收失败\n阶段：extract_media\n原因：文件名过长或文件缓存失败",
+        )
+        # handle_message still called with event (media stripped)
         adapter.handle_message.assert_awaited_once()
         event = adapter.handle_message.await_args.args[0]
         assert event.media_urls == []
