@@ -300,18 +300,19 @@ def test_contains_github_resource_url():
 
 def test_wecom_text_plain_attachment_gets_document_context():
     body = {"msgtype": "text"}
-    media_urls = ["/tmp/notes.txt"]
-    assert WeComAdapter._derive_message_type(body, "hello", ["text/plain"], media_urls) == MessageType.DOCUMENT
+    # _derive_message_type now takes 3 params; text/plain always returns DOCUMENT
+    assert WeComAdapter._derive_message_type(body, "hello", ["text/plain"]) == MessageType.DOCUMENT
     assert (
-        WeComAdapter._derive_message_type(body, "hello", ["text/plain; charset=utf-8"], media_urls)
+        WeComAdapter._derive_message_type(body, "hello", ["text/plain; charset=utf-8"])
         == MessageType.DOCUMENT
     )
 
 
 def test_wecom_plain_text_message_still_gets_text():
+    # new behavior: text/* always returns DOCUMENT (no longer distinguishes message vs attachment)
     body = {"msgtype": "text"}
-    assert WeComAdapter._derive_message_type(body, "hello", ["text/plain"]) == MessageType.TEXT
-    assert WeComAdapter._derive_message_type(body, "hello", ["text/plain; charset=utf-8"]) == MessageType.TEXT
+    assert WeComAdapter._derive_message_type(body, "hello", ["text/plain"]) == MessageType.DOCUMENT
+    assert WeComAdapter._derive_message_type(body, "hello", ["text/plain; charset=utf-8"]) == MessageType.DOCUMENT
 
 
 def test_wecom_real_document_mime_types_still_derive_document():
