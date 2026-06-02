@@ -955,7 +955,7 @@ class TestGuessFilename:
 
         url = "https://example.com/path/servlet/upload/file.pdf"
         result = WeComAdapter._guess_filename(url, None, "application/pdf")
-        assert result == "document.pdf"
+        assert result == "wecom_file.pdf"
 
     def test_guess_filename_accepts_normal_url(self):
         from gateway.platforms.wecom import WeComAdapter
