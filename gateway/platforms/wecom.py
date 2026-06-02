@@ -736,12 +736,15 @@ class WeComAdapter(BasePlatformAdapter):
                 if voice_text:
                     text_parts.append(voice_text)
 
-            # Extract appmsg title (filename) for WeCom AI Bot attachments
+            # Extract appmsg title (filename) and URL/link for WeCom AI Bot attachments
             if msgtype == "appmsg":
                 appmsg = body.get("appmsg") if isinstance(body.get("appmsg"), dict) else {}
                 title = str(appmsg.get("title") or "").strip()
                 if title:
                     text_parts.append(title)
+                url = str(appmsg.get("url") or appmsg.get("link") or "").strip()
+                if url:
+                    text_parts.append(url)
 
         quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
         quote_type = str(quote.get("msgtype") or "").lower()
