@@ -35,6 +35,47 @@ _SILENCE_NARRATION = re.compile(
 )
 
 
+# Forbidden phrase groups for material-ingestion output guard.
+#
+# Group 1 — always-block (Chinese / name-specific):
+#   These are never legitimate in any outbound message for this use case.
+#   LLM drifts from skill into fake "waiting for admin review" steps.
+#
+# Group 2 — context-conditional (generic English):
+#   These appear in legitimate CI/cron/approval-notification contexts.
+#   Only rewrite when material-ingestion context is also present.
+_FORBIDDEN_ALWAYS = re.compile(
+    r'等待侯方明审核|等候侯方明审核|侯方明审核中|侯方明确认中'
+    r'|等待管理员审核|等候管理员审核|管理员审核中|管理员确认中'
+    r'|等待人工审核|等候人工审核|人工审核中'
+    r'|已进入待处理队列|已进入待审核队列|已进入待确认队列'
+    r'|已进入审核队列|进入审核队列|进入待审核队列'
+    r'|待审核状态|待确认状态|待处理状态'
+    r'|等待审核|等候审核|等待复核|等候复核'
+    r'|等待批准|等候批准|等待确认|等候确认'
+    r'|正在等待审核|正在等待确认|排队等待审核|排队审核中'
+    r'|审核队列中|确认队列中',
+    re.IGNORECASE,
+)
+
+# Generic English forbidden phrases — only active when metadata["skill"] == "material-ingestion".
+# These are scoped narrowly; the metadata gate is the primary context signal.
+_FORBIDDEN_IF_MATERIAL_CTX = re.compile(
+    r'pending\s*admin\s*review|awaiting\s*admin\s*review'
+    r'|admin\s*review\s*in\s*progress'
+    r'|has\s*entered\s*review\s*queue|has\s*entered\s*approval\s*queue'
+    r'|in\s*review\s*queue|in\s*approval\s*queue'
+    r'|waiting\s*in\s*queue|waiting\s*admin\s*review'
+    r'|pending\s*approval|approval\s*pending'
+    r'|review\s*in\s*progress'
+    r'|awaiting\s*approval|awaiting\s*confirmation'
+    r'|admin\s*approval\s*pending',
+    re.IGNORECASE,
+)
+
+MATERIAL_INGESTION_REPLY = "已确认分类，资料处理中，完成后将生成 PR，等待您复核合并。"
+
+
 def _is_silence_narration(content: Optional[str]) -> bool:
     """Return True when ``content`` is *only* a silence-narration token.
 
@@ -400,6 +441,30 @@ class DeliveryRouter:
                 send_metadata["telegram_dm_topic_reply_fallback"] = True
             elif "thread_id" not in send_metadata and "message_thread_id" not in send_metadata and not has_explicit_direct_topic:
                 send_metadata["thread_id"] = target_thread_id
+
+        # Anti-hallucination guard: strip forbidden admin-review phrases before delivery.
+        # These indicate the LLM drifted from the skill into fake pending queues.
+        # Replace with the correct material-ingestion confirmation reply.
+        #
+        # Group 1 (Chinese / name-specific): always block — never legitimate.
+        # Group 2 (generic English): ONLY block when send_metadata explicitly signals
+        #   material-ingestion context via skill == "material-ingestion".
+        #   No content-based heuristics (Chinese, commas, sentence position) are used
+        #   as context proxies per P2 requirement.
+        should_rewrite = bool(_FORBIDDEN_ALWAYS.search(content))
+        if not should_rewrite:
+            # Group2: requires explicit material-ingestion context marker in metadata
+            if send_metadata.get("skill") == "material-ingestion":
+                should_rewrite = bool(_FORBIDDEN_IF_MATERIAL_CTX.search(content))
+        if should_rewrite:
+            logger.warning(
+                "Stripped forbidden phrase from outbound to %s (chat=%s): %r",
+                target.platform.value,
+                target.chat_id,
+                content[:80],
+            )
+            content = MATERIAL_INGESTION_REPLY
+
         result = await adapter.send(target.chat_id, content, metadata=send_metadata or None)
         if _send_result_failed(result):
             if (
