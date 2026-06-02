@@ -67,6 +67,7 @@ AUTHOR_MAP = {
     "40378218+chaconne67@users.noreply.github.com": "chaconne67",
     "Pluviobyte@users.noreply.github.com": "Pluviobyte",
     "hfm77788@users.noreply.github.com": "hfm77788",
+    "hfm77788@gmail.com": "hfm77788",
     "sanghyuk_seo@nexcubecorp.com": "sanghyuk-seo-nexcube",
     "subrtt@gmail.com": "Brixyy",
     "wangpuv@hotmail.com": "wangpuv",

@@ -525,7 +525,17 @@ class WeComAdapter(BasePlatformAdapter):
         # Mirrors what the Telegram adapter does (re.sub @botname).
         if is_group and text:
             text = re.sub(r"^@\S+\s*", "", text).strip()
-        media_urls, media_types = await self._extract_media(body)
+        try:
+            media_urls, media_types = await self._extract_media(body)
+        except Exception as exc:
+            logger.warning("[%s] Failed to extract media: %s", self.name, exc)
+            result = await self.send(
+                chat_id=chat_id,
+                content="文件接收失败\n阶段：extract_media\n原因：文件名过长或文件缓存失败",
+            )
+            if not result.success:
+                logger.warning("[%s] Failed to send extract_media error reply: %s", self.name, result.error)
+            media_urls, media_types = [], []
         message_type = self._derive_message_type(body, text, media_types)
         has_reply_context = bool(reply_text and (text or media_urls))
 
@@ -822,7 +832,11 @@ class WeComAdapter(BasePlatformAdapter):
                     return None
 
             filename = str(media.get("filename") or media.get("name") or "wecom_file")
-            return cache_document_from_bytes(raw, filename), mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            try:
+                return cache_document_from_bytes(raw, filename), mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            except Exception as exc:
+                logger.warning("[%s] Failed to cache document from bytes: %s", self.name, exc)
+                return None
 
         url = str(media.get("url") or "").strip()
         if not url:
@@ -852,7 +866,11 @@ class WeComAdapter(BasePlatformAdapter):
                 return None
 
         filename = self._guess_filename(url, headers.get("content-disposition"), content_type)
-        return cache_document_from_bytes(raw, filename), content_type
+        try:
+            return cache_document_from_bytes(raw, filename), content_type
+        except Exception as exc:
+            logger.warning("[%s] Failed to cache document from bytes for %s: %s", self.name, url, exc)
+            return None
 
     @staticmethod
     def _decode_base64(data: str) -> bytes:
@@ -887,15 +905,41 @@ class WeComAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _guess_filename(url: str, content_disposition: Optional[str], content_type: str) -> str:
+        def _truncate_with_ext(name: str, max_bytes: int) -> str:
+            """Truncate name to max_bytes while preserving extension (UTF-8 safe)."""
+            if len(name.encode("utf-8", errors="ignore")) <= max_bytes:
+                return name
+            if "." in name:
+                ext = name[name.rfind("."):]
+                ext_bytes = ext.encode("utf-8", errors="ignore")
+                stem_bytes = name[:name.rfind(".")].encode("utf-8", errors="ignore")
+                max_stem_bytes = max_bytes - len(ext_bytes)
+                if max_stem_bytes > 0:
+                    return stem_bytes[:max_stem_bytes].decode("utf-8", errors="ignore") + ext
+                # Extension alone already exceeds budget — drop extension
+                return stem_bytes[:max_stem_bytes].decode("utf-8", errors="ignore")
+            return name.encode("utf-8", errors="ignore")[:max_bytes].decode("utf-8", errors="ignore")
+
+        MAX_FILENAME_BYTES = 180
+
         if content_disposition:
             match = re.search(r'filename="?([^";]+)"?', content_disposition)
             if match:
-                return match.group(1)
+                name = match.group(1)
+                name_bytes = name.encode("utf-8", errors="ignore")
+                if len(name_bytes) > MAX_FILENAME_BYTES:
+                    name = _truncate_with_ext(name, MAX_FILENAME_BYTES)
+                return name
 
         name = Path(urlparse(url).path).name or "document"
+        # Reject servlet URLs to avoid ENAMETOOLONG
+        if "servlet" in url.lower():
+            name = "wecom_file"
         if "." not in name:
             ext = mimetypes.guess_extension(content_type) or ".bin"
             name = f"{name}{ext}"
+        if len(name.encode("utf-8", errors="ignore")) > MAX_FILENAME_BYTES:
+            name = _truncate_with_ext(name, MAX_FILENAME_BYTES)
         return name
 
     @staticmethod
