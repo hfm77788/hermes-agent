@@ -3122,7 +3122,7 @@ class FeishuAdapter(BasePlatformAdapter):
             is_bot=is_bot,
         )
         # Resolve auto_skill: per-chat override → default fallback (mirrors Telegram).
-        # Fall back to None if settings were never applied (e.g. test mocks).
+        # Defensive: fall back to None if settings were never applied (e.g. test mocks).
         _chat_skills: Dict = getattr(self, "_chat_skills", {})
         _default_skill = getattr(self, "_default_skill", None)
         _auto_skill: Optional[str | list[str]] = (
