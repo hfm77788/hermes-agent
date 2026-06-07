@@ -245,6 +245,7 @@ _FEISHU_REACTION_FAILURE = "CrossMark"
 # drain on completion; the cap is a safeguard against unbounded growth from
 # delete-failures, not a capacity plan.
 _FEISHU_PROCESSING_REACTION_CACHE_SIZE = 1024
+_FEISHU_MESSAGE_TEXT_CACHE_SIZE = 512       # LRU cap for reply-context message text lookups
 
 # QR onboarding constants
 _ONBOARD_ACCOUNTS_URLS = {
@@ -399,6 +400,11 @@ class FeishuAdapterSettings:
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
+    # Skill auto-loading: chat_id -> skill name or list of skill names.
+    # Resolved at MessageEvent construction time, then consumed by run.py:8648.
+    chat_skills: Dict[str, str | list[str]] = field(default_factory=dict)
+    # Default skill loaded for any chat_id that has no explicit entry in chat_skills.
+    default_skill: Optional[str | list[str]] = None
 
 
 @dataclass
@@ -1457,7 +1463,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._sent_message_ids_to_chat: Dict[str, str] = {}  # message_id → chat_id (for reaction routing)
         self._sent_message_id_order: List[str] = []  # LRU order for _sent_message_ids_to_chat
         self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
-        self._message_text_cache: Dict[str, Optional[str]] = {}
+        self._message_text_cache: "OrderedDict[str, Optional[str]]" = OrderedDict()
         self._app_lock_identity: Optional[str] = None
         self._text_batch_state = FeishuBatchState()
         self._pending_text_batches = self._text_batch_state.events
@@ -1577,6 +1583,8 @@ class FeishuAdapter(BasePlatformAdapter):
             require_mention=_to_boolean(
                 extra.get("require_mention", os.getenv("FEISHU_REQUIRE_MENTION", "true"))
             ),
+            chat_skills=extra.get("chat_skills", {}),
+            default_skill=extra.get("default_skill"),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1609,6 +1617,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_ping_timeout = settings.ws_ping_timeout
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
+        self._chat_skills: Dict[str, str | list[str]] = settings.chat_skills
+        self._default_skill: Optional[str | list[str]] = settings.default_skill
 
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
@@ -1634,6 +1644,10 @@ class FeishuAdapter(BasePlatformAdapter):
             .register_p2_customized_event(
                 "drive.notice.comment_add_v1",
                 self._on_drive_comment_event,
+            )
+            .register_p2_customized_event(
+                "vc.bot.meeting_invited_v1",
+                self._on_meeting_invited_event,
             )
             .build()
         )
@@ -2485,6 +2499,16 @@ class FeishuAdapter(BasePlatformAdapter):
             handle_drive_comment_event(self._client, data, self_open_id=self._bot_open_id),
         )
 
+    def _on_meeting_invited_event(self, data: Any) -> None:
+        """Handle VC bot meeting invitation notification (vc.bot.meeting_invited_v1)."""
+        from gateway.platforms.feishu_meeting_invite import handle_meeting_invited_event
+
+        loop = self._loop
+        if not self._loop_accepts_callbacks(loop):
+            logger.warning("[Feishu] Dropping meeting invite event before adapter loop is ready")
+            return
+        self._submit_on_loop(loop, handle_meeting_invited_event(self, data))
+
     def _on_reaction_event(self, event_type: str, data: Any) -> None:
         """Route user reactions on bot messages as synthetic text events."""
         event = getattr(data, "event", None)
@@ -3109,6 +3133,14 @@ class FeishuAdapter(BasePlatformAdapter):
             user_id_alt=sender_profile["user_id_alt"],
             is_bot=is_bot,
         )
+        # Resolve auto_skill: per-chat override → default fallback (mirrors Telegram).
+        # Defensive: fall back to None if settings were never applied (e.g. test mocks).
+        _chat_skills: Dict = getattr(self, "_chat_skills", {})
+        _default_skill = getattr(self, "_default_skill", None)
+        _auto_skill: Optional[str | list[str]] = (
+            _chat_skills.get(chat_id) or _default_skill
+        )
+
         normalized = MessageEvent(
             text=text,
             message_type=inbound_type,
@@ -3120,6 +3152,7 @@ class FeishuAdapter(BasePlatformAdapter):
             reply_to_message_id=reply_to_message_id,
             reply_to_text=reply_to_text,
             timestamp=datetime.now(),
+            auto_skill=_auto_skill,
         )
         await self._dispatch_inbound_event(normalized)
 
@@ -3366,6 +3399,8 @@ class FeishuAdapter(BasePlatformAdapter):
             self._on_card_action_trigger(data)
         elif event_type == "drive.notice.comment_add_v1":
             self._on_drive_comment_event(data)
+        elif event_type == "vc.bot.meeting_invited_v1":
+            self._on_meeting_invited_event(data)
         else:
             logger.debug("[Feishu] Ignoring webhook event type: %s", event_type or "unknown")
         return web.json_response({"code": 0, "msg": "ok"})
@@ -3971,6 +4006,7 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client or not message_id:
             return None
         if message_id in self._message_text_cache:
+            self._message_text_cache.move_to_end(message_id)
             return self._message_text_cache[message_id]
         try:
             request = self._build_get_message_request(message_id)
@@ -3992,6 +4028,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 mentions=parent_mentions,
             )
             self._message_text_cache[message_id] = text
+            while len(self._message_text_cache) > _FEISHU_MESSAGE_TEXT_CACHE_SIZE:
+                self._message_text_cache.popitem(last=False)
             return text
         except Exception:
             logger.warning("[Feishu] Failed to fetch parent message %s", message_id, exc_info=True)
@@ -4427,17 +4465,20 @@ class FeishuAdapter(BasePlatformAdapter):
             )
             request = self._build_create_message_request("thread_id", body)
         else:
+            receive_id = chat_id
+            receive_id_type = "chat_id"
+            if chat_id.startswith("feishu_user_id:"):
+                receive_id = chat_id.split(":", 1)[1]
+                receive_id_type = "user_id"
+            elif chat_id.startswith("ou_"):
+                receive_id_type = "open_id"
+
             body = self._build_create_message_body(
-                receive_id=chat_id,
+                receive_id=receive_id,
                 msg_type=msg_type,
                 content=payload,
                 uuid_value=str(uuid.uuid4()),
             )
-            # Detect whether chat_id is a user open_id (DM) or a chat_id (group).
-            if chat_id.startswith("ou_"):
-                receive_id_type = "open_id"
-            else:
-                receive_id_type = "chat_id"
             request = self._build_create_message_request(receive_id_type, body)
         return await asyncio.to_thread(self._client.im.v1.message.create, request)
 
