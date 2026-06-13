@@ -2341,6 +2341,24 @@ class FeishuAdapter(BasePlatformAdapter):
         during startup/restart or network-flap reconnect), the event is queued
         for replay instead of dropped.
         """
+        # [DEBUG 2026-06-11] dump raw event header so we can see whether Feishu
+        # actually pushed file events at all. Remove once file-event reception
+        # is verified.
+        try:
+            event = getattr(data, "event", None)
+            ev_sender = getattr(event, "sender", None)
+            ev_sender_id = getattr(ev_sender, "sender_id", None)
+            ev_message = getattr(event, "message", None)
+            logger.info(
+                "[Feishu][DEBUG] raw inbound: chat_id=%s sender_open_id=%s message_id=%s message_type=%r chat_type=%s",
+                getattr(event, "chat_id", "?"),
+                getattr(ev_sender_id, "open_id", "?"),
+                getattr(ev_message, "message_id", "?"),
+                getattr(ev_message, "message_type", "?"),
+                getattr(event, "chat_type", "?"),
+            )
+        except Exception as _dbg_exc:
+            logger.warning("[Feishu][DEBUG] dump failed: %r", _dbg_exc)
         loop = self._loop
         if not self._loop_accepts_callbacks(loop):
             start_drainer = self._enqueue_pending_inbound_event(data)
@@ -2483,7 +2501,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         reason = self._admit(sender, message)
         if reason is not None:
-            logger.debug("[Feishu] dropping inbound event: %s", reason)
+            logger.info("[Feishu] dropping inbound event: %s message_type=%s", reason, getattr(message, "message_type", "?"))
             return
 
         chat_type = getattr(message, "chat_type", "p2p")

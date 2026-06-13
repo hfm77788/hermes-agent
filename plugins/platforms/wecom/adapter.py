@@ -524,6 +524,16 @@ class WeComAdapter(BasePlatformAdapter):
         self._remember_chat_req_id(chat_id, self._payload_req_id(payload))
 
         text, reply_text = self._extract_text(body)
+        if is_group:
+            logger.info(
+                "[%s] Inbound group callback: chat=%s sender=%s msgtype=%s text=%r media_keys=%s",
+                self.name,
+                chat_id,
+                sender_id or "unknown",
+                str(body.get("msgtype") or "").lower() or "unknown",
+                (text or reply_text or "")[:160],
+                sorted(k for k in body.keys() if k not in {"content", "text"})[:20],
+            )
         # Strip leading @mention in group chats so slash commands like
         # "@BotName /approve" are correctly recognized as "/approve".
         # Mirrors what the Telegram adapter does (re.sub @botname).

@@ -999,6 +999,9 @@ async def vision_analyze_tool(
         
         # Determine if this is a local file path or a remote URL
         # Strip file:// scheme so file URIs resolve as local paths.
+        # NOTE (2026-06-07 铁律): 远程走 Google API 链路长期报 invalid (vision_analyze_tool 实际不可用概率高),
+        # 收到图片/扫描件时优先 `mmx vision describe` (M3 native vision) 而不是本工具.
+        # 本函数只作为 M3 失败时的备选 2️⃣. OCR (pymupdf + tesseract/marker) 是最后的 3️⃣ 兜底.
         resolved_url = image_url
         if resolved_url.startswith("file://"):
             resolved_url = resolved_url[len("file://"):]

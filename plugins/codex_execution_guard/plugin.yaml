@@ -1,0 +1,30 @@
+name: codex_execution_guard
+version: 1.0.0
+description: |
+  Hard execution guard: when the user explicitly requests Codex as the
+  execution agent ("用 Codex / Codex 执行 / 你是 Codex 执行端"), this plugin
+  blocks Hermes native tools (write_file, patch, terminal git-writes) from
+  executing directly and redirects to a real `codex exec` terminal call.
+
+  The guard is session-scoped: once a Codex trigger phrase is seen in the
+  conversation, all mutating tool calls are blocked until a `codex exec`
+  terminal call has been observed.  The block resets on a new conversation
+  turn so a fresh session starts clean.
+
+triggers:
+  - phrase: "用 Codex"
+  - phrase: "Codex 执行"
+  - phrase: "你是 Codex 执行端"
+  - phrase: "指定执行端：Codex"
+  - phrase: "codex 任务"
+  - phrase: "OpenAI Codex"
+blocks:
+  - write_file
+  - patch
+  - terminal  # only when the command contains git write operations
+requires:
+  config_section: null
+env_vars: []
+entry_point: __init__.py
+hooks:
+  - pre_tool_call
