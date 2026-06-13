@@ -29,6 +29,11 @@ data/
 .pytest_cache/
 test_durations.json
 .pytest-cache/
+
+# 本地状态 / 调试日志（绝不该 commit，2026-06-13 phase 5 治理）
+state.db
+.playwright-mcp/
+_dream/
 tmp/
 temp_vision_images/
 hermes-*/*
