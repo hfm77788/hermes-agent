@@ -68,6 +68,10 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_image_from_bytes,
 )
+from gateway.platforms.we_com_material_ingestion import (
+    batch_id_from_message,
+    create_material_pr,
+)
 from utils import env_float
 
 logger = logging.getLogger(__name__)
@@ -175,6 +179,7 @@ class WeComAdapter(BasePlatformAdapter):
         self._group_policy = str(extra.get("group_policy") or os.getenv("WECOM_GROUP_POLICY", "pairing")).strip().lower()
         self._group_allow_from = _coerce_list(extra.get("group_allow_from") or extra.get("groupAllowFrom"))
         self._groups = extra.get("groups") if isinstance(extra.get("groups"), dict) else {}
+        self._ingestion_group_id = os.getenv("WECOM_INGESTION_GROUP_ID", "").strip()
 
         self._session: Optional["aiohttp.ClientSession"] = None
         self._ws: Optional["aiohttp.ClientWebSocketResponse"] = None
@@ -575,7 +580,38 @@ class WeComAdapter(BasePlatformAdapter):
         if message_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
             self._enqueue_text_event(event)
         else:
+            if (
+                self._ingestion_group_id
+                and chat_id == self._ingestion_group_id
+                and event.media_urls
+                and message_type != MessageType.TEXT
+            ):
+                asyncio.create_task(
+                    self._handle_material_ingestion(
+                        event=event,
+                        batch_id=batch_id_from_message(msg_id, self._ingestion_group_id),
+                    )
+                )
             await self.handle_message(event)
+
+    async def _handle_material_ingestion(self, event, batch_id):
+        try:
+            await asyncio.sleep(1.0)
+            staging_base = Path("/home/ubuntu/raymond-wiki/projects/_staging/materials")
+            batch_dirs = list(staging_base.rglob(f"*{batch_id}*"))
+            if not batch_dirs:
+                await self.send(chat_id=event.source.chat_id, content="资料录入失败: batch dir not found")
+                return
+            result = create_material_pr(batch_id=batch_id, topic_key="unknown", topic_name="待判断",
+                sender=event.source.user_id or "wecom_user", message_id=event.message_id or "",
+                file_count=len(event.media_urls), confidence="LOW", staging_path=batch_dirs[-1])
+            if result["success"]:
+                reply = f"PR #{result['pr_number']} created: {result['pr_url']}"
+            else:
+                reply = f"Failed: {result.get('error', 'unknown')}"
+            await self.send(chat_id=event.source.chat_id, content=reply)
+        except Exception as exc:
+            logger.exception("[%s] Material ingestion failed: %s", self.name, exc)
 
     # ------------------------------------------------------------------
     # Text message aggregation (handles WeCom client-side splits)
