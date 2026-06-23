@@ -136,12 +136,25 @@ def build_footer_line(
     Returns the footer text (empty string when disabled or no data).  Callers
     append this to the final response themselves, preserving a single blank
     line of separation.
+
+    The *model* label prefers the configured ``model_display_name`` from
+    ``user_config`` (which reflects the intended default) over the agent's
+    session-stored model (which can be stale after a /model switch during
+    the session).
     """
     cfg = resolve_footer_config(user_config, platform_key)
     if not cfg.get("enabled"):
         return ""
+    # Prefer configured display name over session-stored model
+    display_model = model
+    try:
+        mc = (user_config or {}).get("model") if isinstance(user_config, dict) else None
+        if isinstance(mc, dict):
+            display_model = mc.get("model_display_name") or mc.get("model") or model
+    except Exception:
+        pass
     return format_runtime_footer(
-        model=model,
+        model=display_model,
         context_tokens=context_tokens,
         context_length=context_length,
         cwd=cwd,
