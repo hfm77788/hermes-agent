@@ -52,6 +52,9 @@ try:
         read_skill_bundle as _skill_read_bundle,
         read_skill_file_chunked as _skill_read_file_chunked,
         smoke_skill_access as _skill_smoke_skill_access,
+        get_preauthorization_profile as _skill_get_preauth_profile,
+        run_preauthorized_skill_patch as _skill_run_preauth_patch,
+        rollback_skill_patch as _skill_rollback_patch,
     )
     _SKILL_TOOLS_AVAILABLE = True
 except ImportError:
@@ -972,6 +975,28 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
             """
             result = _skill_smoke_skill_access(skill_name)
             return json.dumps(result, indent=2)
+
+        # Phase 2: Preauthorized write tools
+
+        @mcp.tool()
+        def get_preauthorization_profile() -> str:
+            """Return the preauthorization profile. P3_PR_CREATE is policy_declared_only."""
+            return json.dumps(_skill_get_preauth_profile(), indent=2)
+
+        @mcp.tool()
+        def run_preauthorized_skill_patch(manifest: str) -> str:
+            """Execute a preauthorized skill file patch.
+            Args: manifest JSON with skill_name, file_path, new_content."""
+            try:
+                manifest_dict = json.loads(manifest)
+            except json.JSONDecodeError as e:
+                return json.dumps({"error": f"Invalid JSON manifest: {e}"})
+            return json.dumps(_skill_run_preauth_patch(manifest_dict), indent=2)
+
+        @mcp.tool()
+        def rollback_skill_patch(backup_path: str) -> str:
+            """Rollback a skill patch to a previous backup."""
+            return json.dumps(_skill_rollback_patch(backup_path), indent=2)
 
     return mcp
 
