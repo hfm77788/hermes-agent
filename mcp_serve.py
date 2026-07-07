@@ -985,8 +985,10 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 
         @mcp.tool()
         def run_preauthorized_skill_patch(manifest: str) -> str:
-            """Execute a preauthorized skill file patch.
-            Args: manifest JSON with skill_name, file_path, new_content."""
+            """Execute or dry-run a preauthorized skill file patch.
+            Args: manifest JSON with skill_name, file_path, new_content,
+                  action, and optional dry_run (bool, default false).
+            Dry-run: validates + shows diff without writing."""
             try:
                 manifest_dict = json.loads(manifest)
             except json.JSONDecodeError as e:
@@ -1005,8 +1007,23 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 # Entry point
 # ---------------------------------------------------------------------------
 
-def run_mcp_server(verbose: bool = False) -> None:
-    """Start the Hermes MCP server on stdio."""
+def run_mcp_server(
+    verbose: bool = False,
+    transport: str = "stdio",
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    mount_path: str = "/",
+) -> None:
+    """Start the Hermes MCP server.
+
+    Args:
+        verbose: Enable debug logging.
+        transport: Transport mode - "stdio" (default) or "sse".
+                   SSE transport allows HTTP clients like ChatGPT to connect.
+        host: Listen address for SSE transport (default: 127.0.0.1).
+        port: Listen port for SSE transport (default: 8000).
+        mount_path: Mount path for SSE app (default: "/").
+    """
     if not _MCP_SERVER_AVAILABLE:
         print(
             "Error: MCP server requires the 'mcp' package.\n"
@@ -1027,13 +1044,32 @@ def run_mcp_server(verbose: bool = False) -> None:
 
     import asyncio
 
-    async def _run():
-        try:
-            await server.run_stdio_async()
-        finally:
-            bridge.stop()
+    if transport == "sse":
+        server.settings.host = host
+        server.settings.port = port
 
-    try:
-        asyncio.run(_run())
-    except KeyboardInterrupt:
-        bridge.stop()
+        async def _run_sse():
+            try:
+                print(
+                    f"Hermes MCP SSE server listening on http://{host}:{port}{mount_path}",
+                    file=sys.stderr,
+                )
+                await server.run_sse_async(mount_path=mount_path)
+            finally:
+                bridge.stop()
+
+        try:
+            asyncio.run(_run_sse())
+        except KeyboardInterrupt:
+            bridge.stop()
+    else:
+        async def _run_stdio():
+            try:
+                await server.run_stdio_async()
+            finally:
+                bridge.stop()
+
+        try:
+            asyncio.run(_run_stdio())
+        except KeyboardInterrupt:
+            bridge.stop()

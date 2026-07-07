@@ -867,6 +867,18 @@ def _create_backup_metadata(
     }
 
 
+def _compute_diff(file_path: str, old_content: str, new_content: str) -> str:
+    """Compute a redacted unified diff between old and new content."""
+    return _redact_diff(
+        "\n".join(difflib.unified_diff(
+            old_content.splitlines(keepends=True),
+            new_content.splitlines(keepends=True),
+            fromfile=f"a/{file_path}",
+            tofile=f"b/{file_path}",
+        ))
+    )
+
+
 def run_preauthorized_skill_patch(manifest: Dict[str, Any]) -> Dict[str, Any]:
     """Execute a preauthorized skill file patch.
 
@@ -874,13 +886,15 @@ def run_preauthorized_skill_patch(manifest: Dict[str, Any]) -> Dict[str, Any]:
     1. Validate file_path (relative, no .., no hidden segments, no forbidden)
     2. Determine if target exists (existed_before)
     3. Create backup metadata regardless
-    4. Write new content
+    4. Write new content (skip if dry_run=true)
     5. Return redacted diff + smoke check
+    6. Dry-run mode: validate + diff + smoke, no write, no backup
     """
     skill_name = manifest.get("skill_name", "")
     file_path = manifest.get("file_path", "SKILL.md")
     new_content = manifest.get("new_content", "")
     action = manifest.get("action", "replace")
+    dry_run = manifest.get("dry_run", False)
 
     if not skill_name:
         return {"error_code": "skill_uri_not_found", "error": "skill_name is required"}
@@ -942,6 +956,28 @@ def run_preauthorized_skill_patch(manifest: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as e:
             return {"error_code": "skill_read_stream_interrupted", "error": str(e)}
 
+    # === Compute diff (always, even for dry-run) ===
+    diff = _compute_diff(file_path, old_content, new_content)
+    would_change = old_content != new_content
+
+    # === Dry-run: return preview without writing ===
+    if dry_run:
+        return {
+            "dry_run": True,
+            "would_change": would_change,
+            "skill_name": skill_name,
+            "file_path": str(actual_target),
+            "action": action,
+            "diff": diff,
+            "diff_lines": len(diff.split("\n")) - 1 if diff else 0,
+            "old_size_bytes": len(old_content),
+            "new_size_bytes": len(new_content),
+            "existed_before": existed_before,
+            "planned_files": [str(actual_target)],
+            "backup_required": would_change and existed_before,
+            "status": "dry_run_ok",
+        }
+
     # === Create backup metadata ===
     backup_path, backup_meta = _create_backup_metadata(path, skill_name, actual_target, existed_before)
     if not backup_path:
@@ -953,16 +989,6 @@ def run_preauthorized_skill_patch(manifest: Dict[str, Any]) -> Dict[str, Any]:
         actual_target.write_text(new_content, encoding="utf-8")
     except Exception as e:
         return {"error_code": "skill_patch_validation_failed", "error": str(e)}
-
-    # === Redacted diff ===
-    diff = _redact_diff(
-        "\n".join(difflib.unified_diff(
-            old_content.splitlines(keepends=True),
-            new_content.splitlines(keepends=True),
-            fromfile=f"a/{file_path}",
-            tofile=f"b/{file_path}",
-        ))
-    )
 
     smoke_result = smoke_skill_access(skill_name)
 

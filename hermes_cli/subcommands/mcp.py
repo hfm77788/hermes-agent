@@ -36,6 +36,28 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
         action="store_true",
         help="Enable verbose logging on stderr",
     )
+    mcp_serve_p.add_argument(
+        "--transport",
+        choices=["stdio", "sse"],
+        default="stdio",
+        help="Transport mode: stdio (default) or sse (HTTP for ChatGPT)",
+    )
+    mcp_serve_p.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Listen address for SSE transport (default: 127.0.0.1)",
+    )
+    mcp_serve_p.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Listen port for SSE transport (default: 8000)",
+    )
+    mcp_serve_p.add_argument(
+        "--mount-path",
+        default="/",
+        help="Mount path for SSE app (default: /)",
+    )
     add_accept_hooks_flag(mcp_serve_p)
 
     mcp_add_p = mcp_sub.add_parser(
