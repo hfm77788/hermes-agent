@@ -128,8 +128,9 @@ def _is_forbidden_path(path: Path) -> Tuple[bool, str]:
 
     sensitive = [".env", "token", "secret", "cookie", "session"]
     for s in sensitive:
-        if s in path_lower:
-            return True, f"forbidden_path_denied: path contains '{s}'"
+        for part in parts:
+            if part == s:
+                return True, f"forbidden_path_denied: '{s}' in path"
 
     return False, ""
 
@@ -575,6 +576,9 @@ def read_skill_file_chunked(
                     "canonical_uri": canonical_uri}
         if ".." in rp.parts:
             return {"error_code": "forbidden_path_denied: path traversal denied",
+                    "canonical_uri": canonical_uri}
+        if any(part.startswith(".") for part in rp.parts):
+            return {"error_code": "forbidden_path_denied: hidden path segment denied",
                     "canonical_uri": canonical_uri}
         skill_dir = _get_skill_dir(path).resolve()
         target = (skill_dir / rp).resolve()
