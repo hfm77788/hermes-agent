@@ -43,6 +43,21 @@ from typing import Dict, List, Optional
 logger = logging.getLogger("hermes.mcp_serve")
 
 # ---------------------------------------------------------------------------
+# Skill tools import (ChatGPT-Hermes high-trust preauthorization channel)
+# ---------------------------------------------------------------------------
+try:
+    from tools.mcp_skill_tools import (
+        hermes_health_check as _skill_health_check,
+        resolve_skill_uri as _skill_resolve_uri,
+        read_skill_bundle as _skill_read_bundle,
+        read_skill_file_chunked as _skill_read_file_chunked,
+        smoke_skill_access as _skill_smoke_skill_access,
+    )
+    _SKILL_TOOLS_AVAILABLE = True
+except ImportError:
+    _SKILL_TOOLS_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
 # Lazy MCP SDK import
 # ---------------------------------------------------------------------------
 
@@ -874,6 +889,84 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 
         result = bridge.respond_to_approval(id, decision)
         return json.dumps(result, indent=2)
+
+    # -- Skill Read Tools (ChatGPT-Hermes High-Trust Channel) ---------------
+
+    if _SKILL_TOOLS_AVAILABLE:
+
+        @mcp.tool()
+        def hermes_health_check() -> str:
+            """Check Hermes MCP + skills health status.
+
+            Returns mcp_ok, htp_ok, skills_root_exists, skills_root_readable,
+            version, and timestamp. Use this to verify the skill channel is
+            healthy before attempting skill reads.
+            """
+            result = _skill_health_check()
+            return json.dumps(result, indent=2)
+
+        @mcp.tool()
+        def resolve_skill_uri(skill_name: str) -> str:
+            """Resolve a skill name to its canonical URI and filesystem path.
+
+            Args:
+                skill_name: Skill name, e.g. "reference-writing"
+
+            Returns canonical_uri, local_path, category, exists, confidence.
+            When multiple matches exist, returns candidates list without
+            auto-selecting one.
+            """
+            result = _skill_resolve_uri(skill_name)
+            return json.dumps(result, indent=2)
+
+        @mcp.tool()
+        def read_skill_bundle(skill_name: str) -> str:
+            """Read a skill's SKILL.md summary, frontmatter, and manifest.
+
+            Args:
+                skill_name: Skill name or canonical URI like
+                           "reference-writing" or
+                           "skill:productivity/reference-writing"
+
+            Returns SKILL.md line_count, frontmatter, references list,
+            scripts list, and _index.md summary. Full content > 20KB
+            returns a summary with chunk_required=true.
+            """
+            result = _skill_read_bundle(skill_name)
+            return json.dumps(result, indent=2)
+
+        @mcp.tool()
+        def read_skill_file_chunked(
+            canonical_uri: str,
+            start_line: int = 1,
+            end_line: int = 0,
+        ) -> str:
+            """Read a chunk of a skill file by line range.
+
+            Args:
+                canonical_uri: Canonical URI, e.g.
+                              "skill:productivity/reference-writing"
+                start_line: 1-indexed start line (default 1)
+                end_line: 1-indexed end line inclusive. 0 means to end.
+
+            Returns chunk content, line numbers, and chunk_required flag.
+            """
+            end = end_line if end_line > 0 else None
+            result = _skill_read_file_chunked(canonical_uri, start_line, end)
+            return json.dumps(result, indent=2)
+
+        @mcp.tool()
+        def smoke_skill_access(skill_name: str) -> str:
+            """Check accessibility of a skill (PASS/WARN/FAIL).
+
+            Args:
+                skill_name: Skill name, e.g. "reference-writing"
+
+            Checks SKILL.md, references/_index.md, references/ dir,
+            and scripts/ dir. Returns overall status and per-check results.
+            """
+            result = _skill_smoke_skill_access(skill_name)
+            return json.dumps(result, indent=2)
 
     return mcp
 
