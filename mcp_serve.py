@@ -1091,11 +1091,9 @@ def run_mcp_server(
     if transport == "sse":
         _is_loopback = host in ("127.0.0.1", "localhost", "::1")
 
-        # --- Principle 2+3: non-loopback requires auth; explicit auth_token_env
-        #     always loads token regardless of bind host ---
+        # --- Auth check ---
         auth_token = None
         if not _is_loopback and not auth_token_env:
-            # Non-loopback without --auth-token-env → fail-fast
             print(
                 "Error: Non-loopback SSE bind requires --auth-token-env.\n"
                 "Public/internal network SSE endpoints (including --host 0.0.0.0)\n"
@@ -1125,9 +1123,8 @@ def run_mcp_server(
                 )
 
         # --- Build transport security allowlist ---
-        #     Build whenever bind host is non-loopback OR allowed_host is set.
-        ts_config = None
         _need_transport_sec = host not in ("127.0.0.1", "localhost", "::1") or bool(allowed_host)
+        ts_config = None
         if _need_transport_sec:
             ts_hosts = [
                 "127.0.0.1:*", "localhost:*", "[::1]:*",
@@ -1137,8 +1134,6 @@ def run_mcp_server(
                 "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*",
                 "http://127.0.0.1", "http://localhost", "http://[::1]",
             ]
-
-            # Bind address entries (unless 0.0.0.0, which is not a real hostname)
             if host != "0.0.0.0":
                 ts_hosts.append(host)
                 ts_hosts.append(f"{host}:*")
@@ -1146,8 +1141,6 @@ def run_mcp_server(
                 ts_origins.append(f"https://{host}")
                 ts_origins.append(f"http://{host}:*")
                 ts_origins.append(f"https://{host}:*")
-
-            # allowed_host — always added when provided, regardless of bind address
             if allowed_host:
                 ts_hosts.append(allowed_host)
                 ts_hosts.append(f"{allowed_host}:*")
@@ -1163,9 +1156,9 @@ def run_mcp_server(
                     "Usage: --host 0.0.0.0 --allowed-host <your-hostname>",
                     file=sys.stderr,
                 )
-
             ts_config = {"allowed_hosts": ts_hosts, "allowed_origins": ts_origins}
 
+        # --- Build the SSE server (always via Starlette + uvicorn) ---
         server = create_mcp_server(
             event_bridge=bridge,
             host=host,
@@ -1174,30 +1167,30 @@ def run_mcp_server(
             transport_security=ts_config,
         )
 
-        # --- Build auth middleware if token is configured ---
-        starlette_app = None
-        if auth_token:
-            starlette_app = _build_auth_middleware(server, mount_path, auth_token)
+        # Unify Starlette app: auth_token controls whether Bearer check
+        # is active. Routing structure (mount_path) is identical for both.
+        starlette_app = _build_sse_app(server, mount_path, auth_token)
 
         async def _run_sse():
+            import uvicorn
             try:
                 if auth_token:
-                    import uvicorn
-                    app = starlette_app or server.sse_app(mount_path=mount_path)
-                    config = uvicorn.Config(
-                        app,
-                        host=host,
-                        port=port,
-                        log_level="debug" if verbose else "warning",
-                    )
-                    uvicorn_server = uvicorn.Server(config)
-                    await uvicorn_server.serve()
+                    label = f" (Bearer auth via {auth_token_env})"
                 else:
-                    print(
-                        f"Hermes MCP SSE server listening on http://{host}:{port}{mount_path}",
-                        file=sys.stderr,
-                    )
-                    await server.run_sse_async(mount_path=mount_path)
+                    label = " (no auth, localhost only)"
+                print(
+                    f"Hermes MCP SSE server listening on "
+                    f"http://{host}:{port}{mount_path}{label}",
+                    file=sys.stderr,
+                )
+                config = uvicorn.Config(
+                    starlette_app,
+                    host=host,
+                    port=port,
+                    log_level="debug" if verbose else "warning",
+                )
+                uvicorn_server = uvicorn.Server(config)
+                await uvicorn_server.serve()
             finally:
                 bridge.stop()
 
@@ -1221,24 +1214,23 @@ def run_mcp_server(
             bridge.stop()
 
 
-def _build_auth_middleware(
+def _build_sse_app(
     server: "FastMCP",
     mount_path: str,
-    token: str,
+    token: Optional[str] = None,
 ) -> "Starlette":
-    """Build a Starlette app wrapping the FastMCP SSE server with Bearer auth.
+    """Build a Starlette app wrapping the FastMCP SSE server, mounted at mount_path.
 
-    The middleware checks every request to the SSE and message endpoints
-    for a valid Authorization: Bearer *** header. Unauthenticated
-    requests return 401.
+    The auth layer (Bearer token check) is controlled by the ``token`` param:
+      - token is a str → BearerAuthMiddleware enforces it on SSE/message routes.
+      - token is None → auth middleware is a no-op pass-through (local dev).
 
-    FastMCP always registers SSE routes at '/sse' and '/messages/' regardless
-    of mount_path. The SSE child app is mounted at the requested mount_path:
-      mount_path="/"  → Mount("/", app=sse_app)   → routes at /sse, /messages
-      mount_path="/mcp" → Mount("/mcp", app=sse_app) → routes at /mcp/sse, /mcp/messages
+    Routing structure is identical in both cases:
+      mount_path="/"   → Mount("/",   app=sse_app) → /sse, /messages
+      mount_path="/mcp" → Mount("/mcp", app=sse_app) → /mcp/sse, /mcp/messages
 
     The middleware protects both the actual routes (under mount_path) and
-    the raw /sse, /messages paths as a safety net.
+    raw /sse, /messages paths as a safety net.
     """
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
@@ -1249,26 +1241,15 @@ def _build_auth_middleware(
 
     sse_app = server.sse_app(mount_path=mount_path)
 
-    # Normalise mount_path: "/" or ""
+    # Normalise mount_path
     _mp = mount_path.rstrip("/") if mount_path and mount_path != "/" else ""
 
-    # Build protected paths. The actual routes are under mount_path;
-    # we also protect raw paths as a safety net.
-    _protected = set()
+    # Build protected paths
+    _protected = {"/sse", "/messages"}
     if _mp:
-        # Mounted at /mcp → actual paths are /mcp/sse, /mcp/messages
         _protected.add(f"{_mp}/sse")
         _protected.add(f"{_mp}/messages")
-    else:
-        # Mounted at / → actual paths are /sse, /messages
-        _protected.add("/sse")
-        _protected.add("/messages")
 
-    # Safety net: also protect raw /sse and /messages even when not at root
-    _protected.add("/sse")
-    _protected.add("/messages")
-
-    # Message endpoint sub-paths for prefix matching (both raw and prefixed)
     _msg_prefixes = ["/messages"]
     if _mp:
         _msg_prefixes.append(f"{_mp}/messages")
@@ -1279,19 +1260,16 @@ def _build_auth_middleware(
             if path in _protected or any(
                 path.startswith(p + "/") for p in _msg_prefixes
             ):
-                auth_header = request.headers.get("authorization", "")
-                if not auth_header.startswith("Bearer "):
-                    return Response("Unauthorized", status_code=401)
-                provided = auth_header[len("Bearer "):]
-                if provided != token:
-                    return Response("Unauthorized", status_code=401)
+                if token is not None:
+                    auth_header = request.headers.get("authorization", "")
+                    if not auth_header.startswith("Bearer "):
+                        return Response("Unauthorized", status_code=401)
+                    provided = auth_header[len("Bearer "):]
+                    if provided != token:
+                        return Response("Unauthorized", status_code=401)
             return await call_next(request)
 
     return Starlette(
-        routes=[
-            Mount(_mp or "/", app=sse_app),
-        ],
-        middleware=[
-            Middleware(BearerAuthMiddleware),
-        ],
+        routes=[Mount(_mp or "/", app=sse_app)],
+        middleware=[Middleware(BearerAuthMiddleware)],
     )

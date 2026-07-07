@@ -1220,11 +1220,11 @@ class TestSseTransportSecurity:
         assert "https://10.0.0.5:*" in ts.allowed_origins
 
     def test_auth_middleware_builds_with_token(self, monkeypatch):
-        """_build_auth_middleware should return a Starlette app with auth."""
+        """_build_sse_app should return a Starlette app with auth."""
         pytest.importorskip("mcp", reason="MCP SDK not installed")
         import mcp_serve
         server = mcp_serve.create_mcp_server()
-        app = mcp_serve._build_auth_middleware(server, "/", "test-token-123")
+        app = mcp_serve._build_sse_app(server, "/", "test-token-123")
         assert app is not None
 
     def test_run_mcp_server_non_loopback_requires_auth(self, monkeypatch):
@@ -1327,7 +1327,7 @@ class TestSseTransportSecurity:
         import mcp_serve
         monkeypatch.setenv("_TEST_MCP_TOKEN_0000", "test-0000-token")
         monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
-        app = mcp_serve._build_auth_middleware(
+        app = mcp_serve._build_sse_app(
             mcp_serve.create_mcp_server(host="0.0.0.0", port=8000),
             "/", "test-0000-token",
         )
@@ -1348,7 +1348,7 @@ class TestSseTransportSecurity:
         import mcp_serve
         monkeypatch.setenv("_TEST_MCP_TOKEN_1005", "test-1005-token")
         monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
-        app = mcp_serve._build_auth_middleware(
+        app = mcp_serve._build_sse_app(
             mcp_serve.create_mcp_server(host="10.0.0.5", port=8000),
             "/", "test-1005-token",
         )
@@ -1419,13 +1419,13 @@ class TestSseTransportSecurity:
         })
 
         # mount_path="/" → Mount("/") — path appears as ""
-        app_root = mcp_serve._build_auth_middleware(server, "/", "tok")
+        app_root = mcp_serve._build_sse_app(server, "/", "tok")
         root_routes = [r.path for r in app_root.routes]
         assert "" in root_routes or "/" in root_routes, \
             f"Mount('/') expected in {root_routes}"
 
         # mount_path="/mcp" → Mount("/mcp"), NOT Mount("/")
-        app_mcp = mcp_serve._build_auth_middleware(server, "/mcp", "tok")
+        app_mcp = mcp_serve._build_sse_app(server, "/mcp", "tok")
         mcp_routes = [r.path for r in app_mcp.routes]
         assert "/mcp" in mcp_routes, f"Mount('/mcp') expected in {mcp_routes}"
         # Should not have a bare Mount("/") for SSE routes
@@ -1445,7 +1445,7 @@ class TestSseTransportSecurity:
               "allowed_origins": ["http://testserver", "http://testserver:*"]}
         server = mcp_serve.create_mcp_server(transport_security=ts)
         for mp in ["/", "/mcp"]:
-            app = mcp_serve._build_auth_middleware(server, mp, "valid-token")
+            app = mcp_serve._build_sse_app(server, mp, "valid-token")
             client = TestClient(app, raise_server_exceptions=False)
             act_msg = f"{mp.rstrip('/')}/messages" if mp != "/" else "/messages"
 
@@ -1481,7 +1481,7 @@ class TestSseTransportSecurity:
             "allowed_hosts": ["testserver", "testserver:*", "127.0.0.1"],
             "allowed_origins": ["http://testserver", "http://testserver:*"],
         })
-        app = mcp_serve._build_auth_middleware(server, "/mcp", "tok")
+        app = mcp_serve._build_sse_app(server, "/mcp", "tok")
         client = TestClient(app, raise_server_exceptions=False)
 
         # /messages (raw, without mount prefix) when mount_path=/mcp:
