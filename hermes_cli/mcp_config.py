@@ -924,6 +924,7 @@ def mcp_command(args):
             host=getattr(args, "host", "127.0.0.1"),
             port=getattr(args, "port", 8000),
             mount_path=getattr(args, "mount_path", "/"),
+            allowed_host=getattr(args, "allowed_host", None),
         )
         return
 

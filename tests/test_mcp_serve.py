@@ -977,6 +977,108 @@ class TestRunMcpServer:
         assert exc_info.value.code == 1
 
 
+class TestSseTransportSecurity:
+    """Tests for SSE transport security — host/port must be passed at FastMCP
+    construction time so transport_security is correctly initialized."""
+
+    def test_create_mcp_server_default_host_localhost(self):
+        """Default host=127.0.0.1 should auto-init transport_security
+        (FastMCP built-in behaviour)."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        server = mcp_serve.create_mcp_server()
+        assert server.settings.host == "127.0.0.1"
+        assert server.settings.port == 8000
+        # FastMCP auto-enables for localhost
+        assert server.settings.transport_security is not None
+        assert server.settings.transport_security.enable_dns_rebinding_protection is True
+
+    def test_create_mcp_server_custom_host(self):
+        """Custom host should be reflected in settings at construction time."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        server = mcp_serve.create_mcp_server(host="192.168.1.100", port=9000)
+        assert server.settings.host == "192.168.1.100"
+        assert server.settings.port == 9000
+
+    def test_create_mcp_server_transport_security_explicit(self):
+        """Explicit transport_security dict should be converted to
+        TransportSecuritySettings."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        ts_config = {
+            "allowed_hosts": ["example.com:*", "127.0.0.1:*"],
+            "allowed_origins": ["http://example.com:*", "https://example.com:*"],
+        }
+        server = mcp_serve.create_mcp_server(
+            host="0.0.0.0", port=8000, transport_security=ts_config
+        )
+        assert server.settings.host == "0.0.0.0"
+        ts = server.settings.transport_security
+        assert ts is not None
+        assert ts.enable_dns_rebinding_protection is True
+        assert "example.com:*" in ts.allowed_hosts
+
+    def test_run_mcp_server_stdio_not_affected(self, monkeypatch):
+        """Stdio transport should not modify FastMCP host/port settings."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        import asyncio
+
+        async def fake_stdio(self):
+            pass
+
+        monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
+        # Create with stdio — should use defaults
+        bridge = mcp_serve.EventBridge()
+        server = mcp_serve.create_mcp_server(event_bridge=bridge)
+        assert server.settings.host == "127.0.0.1"  # unchanged default
+        assert server.settings.port == 8000
+
+    def test_create_mcp_server_localhost_v4(self):
+        """Creating server with default localhost v4 address should not fail."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        s = mcp_serve.create_mcp_server(host="127.0.0.1")
+        assert s.settings.host == "127.0.0.1"
+        assert s.settings.transport_security is not None
+
+    def test_create_mcp_server_localhost_name(self):
+        """Creating server with 'localhost' should auto-init transport security."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        s = mcp_serve.create_mcp_server(host="localhost")
+        assert s.settings.host == "localhost"
+        assert s.settings.transport_security is not None
+
+    def test_run_mcp_server_with_sse_transport_security_0_0_0_0(self, monkeypatch):
+        """When host=0.0.0.0 with allowed_host, transport_security should
+        include the allowed_host value."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        import asyncio
+
+        monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
+        bridge = mcp_serve.EventBridge()
+        server = mcp_serve.create_mcp_server(
+            event_bridge=bridge,
+            host="0.0.0.0",
+            port=8000,
+            transport_security={
+                "allowed_hosts": ["myserver.example.com:*", "127.0.0.1:*", "localhost:*"],
+                "allowed_origins": [
+                    "http://myserver.example.com:*",
+                    "https://myserver.example.com:*",
+                ],
+            },
+        )
+        assert server.settings.host == "0.0.0.0"
+        ts = server.settings.transport_security
+        assert ts is not None
+        assert ts.enable_dns_rebinding_protection is True
+        assert "myserver.example.com:*" in ts.allowed_hosts
+
+
 class TestCliIntegration:
     def test_parse_serve(self):
         import argparse

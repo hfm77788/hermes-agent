@@ -58,6 +58,11 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
         default="/",
         help="Mount path for SSE app (default: /)",
     )
+    mcp_serve_p.add_argument(
+        "--allowed-host",
+        default=None,
+        help="External hostname/IP for SSE clients (required when --host 0.0.0.0)",
+    )
     add_accept_hooks_flag(mcp_serve_p)
 
     mcp_add_p = mcp_sub.add_parser(

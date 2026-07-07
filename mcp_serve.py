@@ -484,13 +484,46 @@ class EventBridge:
 # MCP Server
 # ---------------------------------------------------------------------------
 
-def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
-    """Create and return the Hermes MCP server with all tools registered."""
+def create_mcp_server(
+    event_bridge: Optional[EventBridge] = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    mount_path: str = "/",
+    transport_security: Optional[dict] = None,
+) -> "FastMCP":
+    """Create and return the Hermes MCP server with all tools registered.
+
+    Args:
+        event_bridge: Optional EventBridge for conversation events.
+        host: Listen address for SSE transport (default: 127.0.0.1).
+              Passed to FastMCP at construction time so transport_security
+              is initialized correctly.
+        port: Listen port for SSE transport (default: 8000).
+        mount_path: Mount path for SSE app (default: "/").
+        transport_security: Optional dict with keys 'allowed_hosts' and
+                           'allowed_origins' lists. When provided, overrides
+                           the default FastMCP transport security for non-
+                           localhost hosts. Set to None to use FastMCP auto-
+                           detection (default for localhost addresses).
+    """
     if not _MCP_SERVER_AVAILABLE:
         raise ImportError(
             "MCP server requires the 'mcp' package. "
             f"Install with: {sys.executable} -m pip install 'mcp'"
         )
+
+    # Build TransportSecuritySettings if explicitly provided
+    ts = None
+    if transport_security is not None:
+        try:
+            from mcp.server.fastmcp.server import TransportSecuritySettings
+            ts = TransportSecuritySettings(
+                enable_dns_rebinding_protection=True,
+                allowed_hosts=transport_security.get("allowed_hosts", []),
+                allowed_origins=transport_security.get("allowed_origins", []),
+            )
+        except ImportError:
+            pass
 
     mcp = FastMCP(
         "hermes",
@@ -499,6 +532,10 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
             "conversations across Telegram, Discord, Slack, WhatsApp, Signal, "
             "Matrix, and other connected platforms."
         ),
+        host=host,
+        port=port,
+        mount_path=mount_path,
+        transport_security=ts,
     )
 
     bridge = event_bridge or EventBridge()
@@ -1013,6 +1050,7 @@ def run_mcp_server(
     host: str = "127.0.0.1",
     port: int = 8000,
     mount_path: str = "/",
+    allowed_host: Optional[str] = None,
 ) -> None:
     """Start the Hermes MCP server.
 
@@ -1021,8 +1059,12 @@ def run_mcp_server(
         transport: Transport mode - "stdio" (default) or "sse".
                    SSE transport allows HTTP clients like ChatGPT to connect.
         host: Listen address for SSE transport (default: 127.0.0.1).
+              Use "0.0.0.0" to bind all interfaces (requires --allowed-host).
         port: Listen port for SSE transport (default: 8000).
         mount_path: Mount path for SSE app (default: "/").
+        allowed_host: External hostname/IP for clients connecting to SSE
+                      endpoint. Required when host is "0.0.0.0" to populate
+                      DNS rebinding protection allowlist.
     """
     if not _MCP_SERVER_AVAILABLE:
         print(
@@ -1040,13 +1082,43 @@ def run_mcp_server(
     bridge = EventBridge()
     bridge.start()
 
-    server = create_mcp_server(event_bridge=bridge)
-
     import asyncio
 
     if transport == "sse":
-        server.settings.host = host
-        server.settings.port = port
+        # Build transport security for non-localhost hosts.
+        # FastMCP auto-enables DNS rebinding protection for localhost
+        # (127.0.0.1, localhost, ::1). For other hosts we build it
+        # explicitly to keep protection on.
+        ts_config = None
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            ts_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+            ts_origins = ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
+            if host == "0.0.0.0":
+                if allowed_host:
+                    ts_hosts.append(f"{allowed_host}:*")
+                    ts_origins.append(f"http://{allowed_host}:*")
+                    ts_origins.append(f"https://{allowed_host}:*")
+                else:
+                    print(
+                        "Warning: --host 0.0.0.0 requires --allowed-host to "
+                        "set DNS rebinding protection. Without it, external "
+                        "clients may be rejected.\n"
+                        "Usage: --host 0.0.0.0 --allowed-host <your-hostname>",
+                        file=sys.stderr,
+                    )
+            else:
+                ts_hosts.append(f"{host}:*")
+                ts_origins.append(f"http://{host}:*")
+                ts_origins.append(f"https://{host}:*")
+            ts_config = {"allowed_hosts": ts_hosts, "allowed_origins": ts_origins}
+
+        server = create_mcp_server(
+            event_bridge=bridge,
+            host=host,
+            port=port,
+            mount_path=mount_path,
+            transport_security=ts_config,
+        )
 
         async def _run_sse():
             try:
@@ -1063,6 +1135,9 @@ def run_mcp_server(
         except KeyboardInterrupt:
             bridge.stop()
     else:
+        # stdio: use default FastMCP settings (no host/port needed)
+        server = create_mcp_server(event_bridge=bridge)
+
         async def _run_stdio():
             try:
                 await server.run_stdio_async()
