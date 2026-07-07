@@ -63,6 +63,11 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
         default=None,
         help="External hostname/IP for SSE clients (required when --host 0.0.0.0)",
     )
+    mcp_serve_p.add_argument(
+        "--auth-token-env",
+        default=None,
+        help="Env var name containing Bearer auth token for non-loopback SSE",
+    )
     add_accept_hooks_flag(mcp_serve_p)
 
     mcp_add_p = mcp_sub.add_parser(

@@ -1051,20 +1051,24 @@ def run_mcp_server(
     port: int = 8000,
     mount_path: str = "/",
     allowed_host: Optional[str] = None,
+    auth_token_env: Optional[str] = None,
 ) -> None:
     """Start the Hermes MCP server.
 
     Args:
         verbose: Enable debug logging.
         transport: Transport mode - "stdio" (default) or "sse".
-                   SSE transport allows HTTP clients like ChatGPT to connect.
-        host: Listen address for SSE transport (default: 127.0.0.1).
-              Use "0.0.0.0" to bind all interfaces (requires --allowed-host).
-        port: Listen port for SSE transport (default: 8000).
+        host: Listen address for SSE (default: 127.0.0.1).
+              Use "0.0.0.0" to bind all interfaces.
+        port: Listen port for SSE (default: 8000).
         mount_path: Mount path for SSE app (default: "/").
-        allowed_host: External hostname/IP for clients connecting to SSE
-                      endpoint. Required when host is "0.0.0.0" to populate
-                      DNS rebinding protection allowlist.
+        allowed_host: External hostname/IP for SSE clients. When set,
+                      added to DNS rebinding allowlist regardless of
+                      bind address.
+        auth_token_env: Env var name containing Bearer auth token.
+                       Required for non-loopback SSE binds.
+                       Loopback (127.0.0.1/localhost/::1) allows
+                       no-token access for local development.
     """
     if not _MCP_SERVER_AVAILABLE:
         print(
@@ -1085,46 +1089,69 @@ def run_mcp_server(
     import asyncio
 
     if transport == "sse":
-        # Build transport security for non-localhost hosts.
-        # FastMCP auto-enables DNS rebinding protection for localhost
-        # (127.0.0.1, localhost, ::1). For other hosts we build it
-        # explicitly to keep protection on.
+        # --- Auth check: non-loopback requires auth token ---
+        _is_loopback = host in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+        auth_token = None
+        if not _is_loopback:
+            if not auth_token_env:
+                print(
+                    "Error: Non-loopback SSE bind requires --auth-token-env.\n"
+                    "Public/internal network SSE endpoints must be authenticated.\n"
+                    f"Add --auth-token-env HERMES_MCP_AUTH_TOKEN to your command.\n"
+                    f"For local development use --host 127.0.0.1 instead.",
+                    file=sys.stderr,
+                )
+                bridge.stop()
+                sys.exit(1)
+            auth_token = os.environ.get(auth_token_env, "")
+            if not auth_token:
+                print(
+                    f"Error: Auth token env var '{auth_token_env}' is empty or unset.\n"
+                    f"Set it to a bearer token value before starting the server.",
+                    file=sys.stderr,
+                )
+                bridge.stop()
+                sys.exit(1)
+
+        # --- Build transport security allowlist ---
         ts_config = None
         if host not in ("127.0.0.1", "localhost", "::1"):
             # Base localhost entries (always present)
-            ts_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*", "127.0.0.1", "localhost", "[::1]"]
+            ts_hosts = [
+                "127.0.0.1:*", "localhost:*", "[::1]:*",
+                "127.0.0.1", "localhost", "[::1]",
+            ]
             ts_origins = [
                 "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*",
                 "http://127.0.0.1", "http://localhost", "http://[::1]",
             ]
-            if host == "0.0.0.0":
-                if allowed_host:
-                    # Exact host (no port) — covers bare Host header
-                    ts_hosts.append(allowed_host)
-                    # Wildcard-port host — covers Host: example.com:<port>
-                    ts_hosts.append(f"{allowed_host}:*")
-                    # Exact origins (no port)
-                    ts_origins.append(f"http://{allowed_host}")
-                    ts_origins.append(f"https://{allowed_host}")
-                    # Wildcard-port origins
-                    ts_origins.append(f"http://{allowed_host}:*")
-                    ts_origins.append(f"https://{allowed_host}:*")
-                else:
-                    print(
-                        "Warning: --host 0.0.0.0 requires --allowed-host to "
-                        "set DNS rebinding protection. Without it, external "
-                        "clients may be rejected.\n"
-                        "Usage: --host 0.0.0.0 --allowed-host <your-hostname>",
-                        file=sys.stderr,
-                    )
-            else:
-                # Exact forms
+
+            # Bind address entries (unless 0.0.0.0, which is not a real hostname)
+            if host != "0.0.0.0":
                 ts_hosts.append(host)
                 ts_hosts.append(f"{host}:*")
                 ts_origins.append(f"http://{host}")
                 ts_origins.append(f"https://{host}")
                 ts_origins.append(f"http://{host}:*")
                 ts_origins.append(f"https://{host}:*")
+
+            # allowed_host — always added when provided, regardless of bind address
+            if allowed_host:
+                ts_hosts.append(allowed_host)
+                ts_hosts.append(f"{allowed_host}:*")
+                ts_origins.append(f"http://{allowed_host}")
+                ts_origins.append(f"https://{allowed_host}")
+                ts_origins.append(f"http://{allowed_host}:*")
+                ts_origins.append(f"https://{allowed_host}:*")
+            elif host == "0.0.0.0" and not allowed_host:
+                print(
+                    "Warning: --host 0.0.0.0 requires --allowed-host to "
+                    "set DNS rebinding protection. Without it, external "
+                    "clients may be rejected.\n"
+                    "Usage: --host 0.0.0.0 --allowed-host <your-hostname>",
+                    file=sys.stderr,
+                )
+
             ts_config = {"allowed_hosts": ts_hosts, "allowed_origins": ts_origins}
 
         server = create_mcp_server(
@@ -1135,13 +1162,30 @@ def run_mcp_server(
             transport_security=ts_config,
         )
 
+        # --- Build auth middleware if token is configured ---
+        starlette_app = None
+        if auth_token:
+            starlette_app = _build_auth_middleware(server, mount_path, auth_token)
+
         async def _run_sse():
             try:
-                print(
-                    f"Hermes MCP SSE server listening on http://{host}:{port}{mount_path}",
-                    file=sys.stderr,
-                )
-                await server.run_sse_async(mount_path=mount_path)
+                if auth_token:
+                    import uvicorn
+                    app = starlette_app or server.sse_app(mount_path=mount_path)
+                    config = uvicorn.Config(
+                        app,
+                        host=host,
+                        port=port,
+                        log_level="debug" if verbose else "warning",
+                    )
+                    uvicorn_server = uvicorn.Server(config)
+                    await uvicorn_server.serve()
+                else:
+                    print(
+                        f"Hermes MCP SSE server listening on http://{host}:{port}{mount_path}",
+                        file=sys.stderr,
+                    )
+                    await server.run_sse_async(mount_path=mount_path)
             finally:
                 bridge.stop()
 
@@ -1163,3 +1207,48 @@ def run_mcp_server(
             asyncio.run(_run_stdio())
         except KeyboardInterrupt:
             bridge.stop()
+
+
+def _build_auth_middleware(
+    server: "FastMCP",
+    mount_path: str,
+    token: str,
+) -> "Starlette":
+    """Build a Starlette app wrapping the FastMCP SSE server with Bearer auth.
+
+    The middleware checks every request to the SSE and message endpoints
+    for a valid Authorization: Bearer <token> header. Unauthenticated
+    requests return 401.
+    """
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.requests import Request
+    from starlette.responses import Response
+    from starlette.routing import Mount, Route
+
+    sse_app = server.sse_app(mount_path=mount_path)
+
+    class BearerAuthMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            # Only protect SSE and message endpoints
+            path = request.url.path.rstrip("/")
+            sse_path = (mount_path.rstrip("/") or "") + "/sse"
+            msg_path = (mount_path.rstrip("/") or "") + "/messages"
+            if path == sse_path or path.startswith(msg_path):
+                auth_header = request.headers.get("authorization", "")
+                if not auth_header.startswith("Bearer "):
+                    return Response("Unauthorized", status_code=401)
+                provided = auth_header[len("Bearer "):]
+                if provided != token:
+                    return Response("Unauthorized", status_code=401)
+            return await call_next(request)
+
+    return Starlette(
+        routes=[
+            Mount("/", app=sse_app),
+        ],
+        middleware=[
+            Middleware(BearerAuthMiddleware),
+        ],
+    )

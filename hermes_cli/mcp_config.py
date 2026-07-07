@@ -925,6 +925,7 @@ def mcp_command(args):
             port=getattr(args, "port", 8000),
             mount_path=getattr(args, "mount_path", "/"),
             allowed_host=getattr(args, "allowed_host", None),
+            auth_token_env=getattr(args, "auth_token_env", None),
         )
         return
 
