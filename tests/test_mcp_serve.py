@@ -935,6 +935,14 @@ class TestToolRegistration:
             "messages_send", "channels_list",
             "permissions_list_open", "permissions_respond",
         }
+        import mcp_serve as _ms
+        if getattr(_ms, "_SKILL_TOOLS_AVAILABLE", False):
+            expected |= {
+                "hermes_health_check", "resolve_skill_uri",
+                "read_skill_bundle", "read_skill_file_chunked",
+                "smoke_skill_access", "get_preauthorization_profile",
+                "run_preauthorized_skill_patch", "rollback_skill_patch",
+            }
         assert expected == tool_names, f"Missing: {expected - tool_names}, Extra: {tool_names - expected}"
 
     def test_tools_have_descriptions(self, mcp_server_e2e, _event_loop):
@@ -1213,7 +1221,10 @@ class TestCliIntegration:
         args = argparse.Namespace(mcp_action="serve", verbose=True)
         from hermes_cli.mcp_config import mcp_command
         mcp_command(args)
-        mock_run.assert_called_once_with(verbose=True)
+        mock_run.assert_called_once_with(
+            verbose=True, transport="stdio", host="127.0.0.1",
+            port=8000, mount_path="/", allowed_host=None,
+        )
 
 
 # ---------------------------------------------------------------------------
