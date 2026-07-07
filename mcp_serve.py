@@ -1090,13 +1090,14 @@ def run_mcp_server(
 
     if transport == "sse":
         # --- Auth check: non-loopback requires auth token ---
-        _is_loopback = host in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+        _is_loopback = host in ("127.0.0.1", "localhost", "::1")
         auth_token = None
         if not _is_loopback:
             if not auth_token_env:
                 print(
                     "Error: Non-loopback SSE bind requires --auth-token-env.\n"
-                    "Public/internal network SSE endpoints must be authenticated.\n"
+                    "Public/internal network SSE endpoints (including --host 0.0.0.0)\n"
+                    "must be authenticated.\n"
                     f"Add --auth-token-env HERMES_MCP_AUTH_TOKEN to your command.\n"
                     f"For local development use --host 127.0.0.1 instead.",
                     file=sys.stderr,

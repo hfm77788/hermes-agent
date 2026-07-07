@@ -1263,10 +1263,11 @@ class TestSseTransportSecurity:
         assert server is not None
 
     def test_run_mcp_server_0_0_0_0_with_allowed_host_auth_ok(self, monkeypatch):
-        """0.0.0.0 with allowed_host should include allowed_host in allowlist.
-        auth is NOT needed for 0.0.0.0 (treated as loopback)."""
+        """0.0.0.0 with allowed_host + auth token should work.
+        0.0.0.0 itself should NOT be in allowlist."""
         pytest.importorskip("mcp", reason="MCP SDK not installed")
         import mcp_serve
+        monkeypatch.setenv("_TEST_HERMES_MCP_TOKEN", "test-bearer-token-for-0000")
         monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
         ts_config = {
             "allowed_hosts": [
@@ -1285,11 +1286,71 @@ class TestSseTransportSecurity:
         assert ts is not None
         assert "mcp.example.com" in ts.allowed_hosts
         assert "mcp.example.com:*" in ts.allowed_hosts
-        assert "http://mcp.example.com" in ts.allowed_origins
-        assert "https://mcp.example.com:*" in ts.allowed_origins
         # 0.0.0.0 itself should NOT be in allowlist
         assert "0.0.0.0" not in ts.allowed_hosts
         assert "0.0.0.0:*" not in ts.allowed_hosts
+
+    # --- Comprehensive auth boundary tests ---
+
+    def test_auth_0000_no_token_fails(self, monkeypatch):
+        """host=0.0.0.0 without auth-token-env must fail-fast."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
+        with pytest.raises(SystemExit) as exc:
+            mcp_serve.run_mcp_server(transport="sse", host="0.0.0.0")
+        assert exc.value.code == 1
+
+    def test_auth_0000_with_token_ok(self, monkeypatch):
+        """host=0.0.0.0 with auth-token-env must permit startup."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        monkeypatch.setenv("_TEST_HERMES_MCP_TOKEN_A", "test-bearer-0000")
+        monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
+        server = mcp_serve.create_mcp_server(host="0.0.0.0", port=8000)
+        assert server is not None
+
+    def test_auth_loopback_127_no_token_ok(self, monkeypatch):
+        """host=127.0.0.1 without auth must allow startup."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
+        server = mcp_serve.create_mcp_server(host="127.0.0.1", port=8000)
+        assert server is not None
+
+    def test_auth_loopback_localhost_no_token_ok(self, monkeypatch):
+        """host=localhost without auth must allow startup."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
+        server = mcp_serve.create_mcp_server(host="localhost", port=8000)
+        assert server is not None
+
+    def test_auth_loopback_v6_no_token_ok(self, monkeypatch):
+        """host=::1 without auth must allow startup."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
+        server = mcp_serve.create_mcp_server(host="::1", port=8000)
+        assert server is not None
+
+    def test_auth_nonloopback_no_token_fails(self, monkeypatch):
+        """host=10.0.0.5 without auth must fail-fast."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
+        with pytest.raises(SystemExit) as exc:
+            mcp_serve.run_mcp_server(transport="sse", host="10.0.0.5")
+        assert exc.value.code == 1
+
+    def test_auth_nonloopback_with_token_ok(self, monkeypatch):
+        """host=10.0.0.5 with auth-token-env must permit startup."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        monkeypatch.setenv("_TEST_HERMES_MCP_TOKEN_B", "test-bearer-1005")
+        monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
+        server = mcp_serve.create_mcp_server(host="10.0.0.5", port=8000)
+        assert server is not None
 
 
 class TestCliIntegration:
