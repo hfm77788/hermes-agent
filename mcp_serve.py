@@ -940,6 +940,7 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
             canonical_uri: str,
             start_line: int = 1,
             end_line: int = 0,
+            relative_path: Optional[str] = None,
         ) -> str:
             """Read a chunk of a skill file by line range.
 
@@ -948,11 +949,15 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
                               "skill:productivity/reference-writing"
                 start_line: 1-indexed start line (default 1)
                 end_line: 1-indexed end line inclusive. 0 means to end.
+                relative_path: Optional relative path within skill_dir
+                              for non-SKILL.md files, e.g.
+                              "references/_index.md" or
+                              "references/styles/guide.md".
 
             Returns chunk content, line numbers, and chunk_required flag.
             """
             end = end_line if end_line > 0 else None
-            result = _skill_read_file_chunked(canonical_uri, start_line, end)
+            result = _skill_read_file_chunked(canonical_uri, start_line, end, relative_path)
             return json.dumps(result, indent=2)
 
         @mcp.tool()

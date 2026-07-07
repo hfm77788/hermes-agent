@@ -307,13 +307,26 @@ def _safe_read_index(skill_dir: Path, skills_root: Path) -> Tuple[Optional[str],
         return None, None
 
 
-def _safe_list_dir(dir_path: Path, skills_root: Path) -> List[str]:
+def _safe_list_dir(dir_path: Path, skills_root: Path) -> Tuple[List[str], Optional[str]]:
     """List files in a directory, validating symlinks.
 
-    Only returns files that are within the skills root.
+    Validates the directory itself first, then each child.
+    Returns (files, error_code) -- if error_code is set, files is empty.
     """
     if not dir_path.exists():
-        return []
+        return [], None
+
+    # Validate the directory itself (if it's a symlink)
+    allowed, reason = _validate_symlink_target(dir_path, skills_root)
+    if not allowed:
+        return [], reason
+
+    resolved_dir = dir_path.resolve()
+    try:
+        resolved_dir.relative_to(skills_root.resolve())
+    except ValueError:
+        return [], "forbidden_path_denied: references/scripts dir resolves outside skills root"
+
     result = []
     for f in dir_path.iterdir():
         if not f.is_file() or f.name.startswith("."):
@@ -322,8 +335,13 @@ def _safe_list_dir(dir_path: Path, skills_root: Path) -> List[str]:
             allowed, _ = _validate_symlink_target(f, skills_root)
             if not allowed:
                 continue
+        # Also verify resolved child is within skills_root
+        try:
+            f.resolve().relative_to(skills_root.resolve())
+        except ValueError:
+            continue
         result.append(f.name)
-    return sorted(result)
+    return sorted(result), None
 
 
 # ---------------------------------------------------------------------------
@@ -480,7 +498,12 @@ def read_skill_bundle(skill_name: str) -> Dict[str, Any]:
     refs_dir = skill_dir / "references"
     if refs_dir.exists():
         if skills_root:
-            result["references"] = _safe_list_dir(refs_dir, skills_root)
+            refs, refs_err = _safe_list_dir(refs_dir, skills_root)
+            if refs_err:
+                result["references_error"] = refs_err
+                result["references"] = []
+            else:
+                result["references"] = refs
         else:
             result["references"] = sorted([
                 f.name for f in refs_dir.iterdir()
@@ -491,7 +514,12 @@ def read_skill_bundle(skill_name: str) -> Dict[str, Any]:
     scripts_dir = skill_dir / "scripts"
     if scripts_dir.exists():
         if skills_root:
-            result["scripts"] = _safe_list_dir(scripts_dir, skills_root)
+            scripts, scripts_err = _safe_list_dir(scripts_dir, skills_root)
+            if scripts_err:
+                result["scripts_error"] = scripts_err
+                result["scripts"] = []
+            else:
+                result["scripts"] = scripts
         else:
             result["scripts"] = sorted([
                 f.name for f in scripts_dir.iterdir()
@@ -513,6 +541,7 @@ def read_skill_file_chunked(
     canonical_uri: str,
     start_line: int = 1,
     end_line: Optional[int] = None,
+    relative_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Read a chunk of a skill file by line range.
 
@@ -520,11 +549,12 @@ def read_skill_file_chunked(
         canonical_uri: Canonical URI, e.g. "skill:productivity/reference-writing"
         start_line: 1-indexed start line
         end_line: 1-indexed end line (inclusive). If None, reads to end.
+        relative_path: Optional relative path within skill_dir for non-SKILL.md
+                      files, e.g. "references/_index.md" or "references/styles/a.md".
+                      Must be relative, no '..', resolve within skill_dir.
 
     Returns:
         chunk content, line numbers, and truncation signals.
-        If the requested range exceeds MAX_OUTPUT_CHARS, returns truncated
-        with chunk_required=true, truncated=true, and next_start_line.
     """
     if canonical_uri.startswith("skill:"):
         skill_name = canonical_uri.split(":", 1)[1]
@@ -537,12 +567,49 @@ def read_skill_file_chunked(
         result["canonical_uri"] = canonical_uri
         return result
 
-    is_forbidden, reason = _is_forbidden_path(path)
+    # Determine the target file
+    if relative_path:
+        rp = Path(relative_path)
+        if rp.is_absolute():
+            return {"error_code": "forbidden_path_denied: relative_path must not be absolute",
+                    "canonical_uri": canonical_uri}
+        if ".." in rp.parts:
+            return {"error_code": "forbidden_path_denied: path traversal denied",
+                    "canonical_uri": canonical_uri}
+        skill_dir = _get_skill_dir(path).resolve()
+        target = (skill_dir / rp).resolve()
+        try:
+            target.relative_to(skill_dir)
+        except ValueError:
+            return {"error_code": "forbidden_path_denied: relative_path outside skill_dir",
+                    "canonical_uri": canonical_uri}
+        # Also verify within skills_root
+        skills_root = _get_skills_root()
+        if skills_root:
+            try:
+                target.relative_to(skills_root.resolve())
+            except ValueError:
+                return {"error_code": "forbidden_path_denied: target outside skills_root",
+                        "canonical_uri": canonical_uri}
+            # Symlink validation
+            if target.is_symlink():
+                allowed, reason = _validate_symlink_target(target, skills_root)
+                if not allowed:
+                    return {"error_code": reason, "canonical_uri": canonical_uri}
+        if not target.exists():
+            return {"error_code": "skill_uri_not_found",
+                    "error": f"File not found: {relative_path}",
+                    "canonical_uri": canonical_uri}
+        target_path = target
+    else:
+        target_path = path
+
+    is_forbidden, reason = _is_forbidden_path(target_path)
     if is_forbidden:
         return {"error_code": reason, "canonical_uri": canonical_uri}
 
     try:
-        content = path.read_text(encoding="utf-8")
+        content = target_path.read_text(encoding="utf-8")
     except Exception as e:
         return {
             "error_code": "skill_read_stream_interrupted",
@@ -575,13 +642,13 @@ def read_skill_file_chunked(
     next_start_line = None
     if chunk_size > MAX_OUTPUT_CHARS:
         truncated = True
-        # Keep first 100 lines of the requested range
         chunk = chunk[:100]
         chunk_size = len("\n".join(chunk))
         next_start_line = start_line + 100
 
     return {
         "canonical_uri": canonical_uri,
+        "relative_path": relative_path,
         "start_line": start_line,
         "end_line": end_line if not truncated else start_line + 99,
         "total_lines": total_lines,

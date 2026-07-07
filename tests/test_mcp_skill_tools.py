@@ -235,3 +235,105 @@ class TestHermesHomeResolver:
         home = _get_hermes_home()
         if home and skills_root:
             assert str(skills_root).startswith(str(home))
+
+
+class TestReadChunkedReferencedFiles:
+    """Chunked read of non-SKILL.md files within a skill."""
+
+    def test_read_references_index(self):
+        skills_root = _get_skills_root()
+        if skills_root:
+            test_dir = skills_root / "chunked-ref-test"
+            test_dir.mkdir(parents=True, exist_ok=True)
+            (test_dir / "SKILL.md").write_text("---\nname: crt\n---\n\n# Test\n")
+            refs = test_dir / "references"
+            refs.mkdir(exist_ok=True)
+            (refs / "_index.md").write_text("# Index\n\nSome reference content.\n")
+            result = read_skill_file_chunked(
+                "skill:chunked-ref-test", start_line=1, end_line=3,
+                relative_path="references/_index.md"
+            )
+            assert result.get("start_line") == 1
+            assert "# Index" in result.get("chunk", "")
+
+    def test_read_nested_references(self):
+        skills_root = _get_skills_root()
+        if skills_root:
+            test_dir = skills_root / "chunked-nested-test"
+            test_dir.mkdir(parents=True, exist_ok=True)
+            (test_dir / "SKILL.md").write_text("---\nname: cnt\n---\n\n# Test\n")
+            nested = test_dir / "references" / "styles"
+            nested.mkdir(parents=True, exist_ok=True)
+            (nested / "guide.md").write_text("# Style Guide\n\nUse consistent formatting.\n")
+            result = read_skill_file_chunked(
+                "skill:chunked-nested-test", start_line=1, end_line=2,
+                relative_path="references/styles/guide.md"
+            )
+            assert "# Style Guide" in result.get("chunk", "")
+
+    def test_path_traversal_denied(self):
+        skills_root = _get_skills_root()
+        if skills_root:
+            test_dir = skills_root / "chunked-ref-test"
+            test_dir.mkdir(parents=True, exist_ok=True)
+            (test_dir / "SKILL.md").write_text("---\nname: crt\n---\n\n# Test\n")
+            result = read_skill_file_chunked(
+                "skill:chunked-ref-test", relative_path="../etc/passwd"
+            )
+            assert result.get("error_code", "").startswith("forbidden_path_denied")
+
+    def test_symlink_outside_denied(self):
+        skills_root = _get_skills_root()
+        if skills_root:
+            test_dir = skills_root / "chunked-sym-test"
+            test_dir.mkdir(parents=True, exist_ok=True)
+            (test_dir / "SKILL.md").write_text("---\nname: cst\n---\n\n# Test\n")
+            refs = test_dir / "references"
+            refs.mkdir(exist_ok=True)
+            symlink = refs / "outside.md"
+            try:
+                os.symlink("/etc/passwd", str(symlink))
+            except OSError:
+                return
+            result = read_skill_file_chunked(
+                "skill:chunked-sym-test", relative_path="references/outside.md"
+            )
+            assert result.get("error_code", "").startswith("forbidden_path_denied")
+            symlink.unlink()
+
+
+class TestSymlinkDirValidation:
+    """Validate that symlinked reference/script dirs are caught."""
+
+    def test_symlink_references_dir_outside_denied(self):
+        skills_root = _get_skills_root()
+        if skills_root:
+            test_dir = skills_root / "symdir-test"
+            test_dir.mkdir(parents=True, exist_ok=True)
+            (test_dir / "SKILL.md").write_text("---\nname: symdir\n---\n\n# Test\n")
+            refs = test_dir / "references"
+            if refs.exists():
+                refs.rmdir()
+            try:
+                os.symlink("/etc", str(refs))
+            except OSError:
+                return
+            result = read_skill_bundle("symdir-test")
+            assert "references_error" in result
+            # Cleanup
+            refs.unlink()
+
+    def test_valid_references_still_listed(self):
+        skills_root = _get_skills_root()
+        if skills_root:
+            test_dir = skills_root / "valid-ref-test"
+            test_dir.mkdir(parents=True, exist_ok=True)
+            (test_dir / "SKILL.md").write_text("---\nname: valid-ref\n---\n\n# Test\n")
+            refs = test_dir / "references"
+            refs.mkdir(exist_ok=True)
+            (refs / "_index.md").write_text("# Index\n")
+            (refs / "guide.md").write_text("# Guide\n")
+            result = read_skill_bundle("valid-ref-test")
+            assert "references" in result
+            assert "_index.md" in result.get("references", [])
+            assert "guide.md" in result.get("references", [])
