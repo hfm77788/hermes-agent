@@ -382,7 +382,7 @@ def hermes_health_check() -> Dict[str, Any]:
                     if f == "SKILL.md":
                         try:
                             test_path = Path(root) / f
-                            with open(test_path, "r") as fh:
+                            with open(test_path, "r", encoding="utf-8") as fh:
                                 fh.read(100)
                             result["skills_root_readable"] = True
                         except Exception:
