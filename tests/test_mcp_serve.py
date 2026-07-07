@@ -1409,6 +1409,30 @@ class TestSseTransportSecurity:
 
     # === C: mount_path and auth route protection ===
 
+    def test_c_mount_path_routes_correctly(self, monkeypatch):
+        """Mount SSE app at correct prefix based on mount_path."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        server = mcp_serve.create_mcp_server(transport_security={
+            "allowed_hosts": ["testserver", "testserver:*", "127.0.0.1"],
+            "allowed_origins": ["http://testserver", "http://testserver:*"],
+        })
+
+        # mount_path="/" → Mount("/") — path appears as ""
+        app_root = mcp_serve._build_auth_middleware(server, "/", "tok")
+        root_routes = [r.path for r in app_root.routes]
+        assert "" in root_routes or "/" in root_routes, \
+            f"Mount('/') expected in {root_routes}"
+
+        # mount_path="/mcp" → Mount("/mcp"), NOT Mount("/")
+        app_mcp = mcp_serve._build_auth_middleware(server, "/mcp", "tok")
+        mcp_routes = [r.path for r in app_mcp.routes]
+        assert "/mcp" in mcp_routes, f"Mount('/mcp') expected in {mcp_routes}"
+        # Should not have a bare Mount("/") for SSE routes
+        # (a Mount("/") would expose /sse and /messages at wrong prefix)
+        root_mount = [r for r in mcp_routes if r in ("", "/")]
+        assert len(root_mount) == 0, f"Unexpected Mount('/') in {mcp_routes}"
+
     def test_c_mount_path_auth_middleware_protects_sse_and_messages(self, monkeypatch):
         """C1-C7: middleware must protect /sse and /messages regardless of mount_path.
 
@@ -1417,35 +1441,39 @@ class TestSseTransportSecurity:
         pytest.importorskip("mcp", reason="MCP SDK not installed")
         from starlette.testclient import TestClient
         import mcp_serve
-        server = mcp_serve.create_mcp_server(transport_security={
-            "allowed_hosts": ["testserver", "testserver:*", "127.0.0.1"],
-            "allowed_origins": ["http://testserver", "http://testserver:*"],
-        })
+        ts = {"allowed_hosts": ["testserver", "testserver:*", "127.0.0.1"],
+              "allowed_origins": ["http://testserver", "http://testserver:*"]}
+        server = mcp_serve.create_mcp_server(transport_security=ts)
         for mp in ["/", "/mcp"]:
             app = mcp_serve._build_auth_middleware(server, mp, "valid-token")
             client = TestClient(app, raise_server_exceptions=False)
-            msg_path = f"{mp.rstrip('/')}/messages"
-            raw_msg = "/messages"
+            act_msg = f"{mp.rstrip('/')}/messages" if mp != "/" else "/messages"
 
-            for path in [msg_path, raw_msg]:
+            # Actual message route (under mount_path)
+            for path in [act_msg]:
                 # Wrong token → 401
-                r = client.post(
-                    path + "?session_id=x",
-                    headers={"Authorization": "Bearer wrong-token"},
-                )
+                r = client.post(path + "?session_id=x",
+                                headers={"Authorization": "Bearer wrong-token"})
                 assert r.status_code == 401, f"wrong token at {path}: {r.status_code}"
                 # No token → 401
                 r2 = client.post(path + "?session_id=x")
                 assert r2.status_code == 401, f"no token at {path}: {r2.status_code}"
-                # Valid token → passes through (not 401)
-                r3 = client.post(
-                    path + "?session_id=x",
-                    headers={"Authorization": "Bearer valid-token"},
-                )
+                # Valid token → not 401
+                r3 = client.post(path + "?session_id=x",
+                                 headers={"Authorization": "Bearer valid-token"})
                 assert r3.status_code != 401, f"valid token at {path} got 401"
 
+            # When mount_path is root (/), raw /messages is the actual route
+            # When mount_path is /mcp, raw /messages should NOT be the actual SSE route
+            # (but middleware still protects it as safety net — 401 without token)
+            raw_msg = "/messages"
+            r = client.post(raw_msg + "?session_id=x")
+            assert r.status_code in (401, 404), \
+                f"raw /messages at mount={mp} expected 401/404 got {r.status_code}"
+
     def test_c_mount_path_root_sse_unreachable(self, monkeypatch):
-        """Raw /messages without mount prefix should be protected when mount_path=/mcp."""
+        """Raw /messages without mount prefix should be protected when
+        mount_path=/mcp and should not be the actual SSE route."""
         pytest.importorskip("mcp", reason="MCP SDK not installed")
         from starlette.testclient import TestClient
         import mcp_serve
@@ -1455,9 +1483,24 @@ class TestSseTransportSecurity:
         })
         app = mcp_serve._build_auth_middleware(server, "/mcp", "tok")
         client = TestClient(app, raise_server_exceptions=False)
-        # /messages without mount prefix should be protected
+
+        # /messages (raw, without mount prefix) when mount_path=/mcp:
+        # - Should NOT be the actual SSE route
+        # - If reachable (unlikely), must be 401 without token
         resp = client.post("/messages?session_id=x")
-        assert resp.status_code in (401, 404), f"/messages should be 401 or 404, got {resp.status_code}"
+        assert resp.status_code in (401, 404), \
+            f"/messages should be 401 or 404, got {resp.status_code}"
+
+        # /mcp/messages (actual route) without token → 401
+        resp = client.post("/mcp/messages?session_id=x")
+        assert resp.status_code == 401, \
+            f"/mcp/messages should be 401 got {resp.status_code}"
+
+        # /mcp/messages with correct token → not 401
+        resp = client.post("/mcp/messages?session_id=x",
+                           headers={"Authorization": "Bearer tok"})
+        assert resp.status_code != 401, \
+            f"/mcp/messages with valid token got 401"
 
     # === D: skill patch endgame still works ===
 

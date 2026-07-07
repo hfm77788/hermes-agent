@@ -1233,8 +1233,12 @@ def _build_auth_middleware(
     requests return 401.
 
     FastMCP always registers SSE routes at '/sse' and '/messages/' regardless
-    of mount_path. The middleware protects both the raw routes and the
-    mount_path-prefixed variants as a safety net.
+    of mount_path. The SSE child app is mounted at the requested mount_path:
+      mount_path="/"  → Mount("/", app=sse_app)   → routes at /sse, /messages
+      mount_path="/mcp" → Mount("/mcp", app=sse_app) → routes at /mcp/sse, /mcp/messages
+
+    The middleware protects both the actual routes (under mount_path) and
+    the raw /sse, /messages paths as a safety net.
     """
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
@@ -1245,23 +1249,35 @@ def _build_auth_middleware(
 
     sse_app = server.sse_app(mount_path=mount_path)
 
-    # Build the set of protected paths. FastMCP always exposes:
-    #   GET  /sse              (SSE endpoint)
-    #   POST /messages/?id=... (message endpoint)
-    # We protect both raw forms and mount_path-prefixed forms.
-    _mp = mount_path.rstrip("/") if mount_path else ""
-    _protected = {
-        "/sse",
-        "/messages",
-        f"{_mp}/sse",
-        f"{_mp}/messages",
-    }
+    # Normalise mount_path: "/" or ""
+    _mp = mount_path.rstrip("/") if mount_path and mount_path != "/" else ""
+
+    # Build protected paths. The actual routes are under mount_path;
+    # we also protect raw paths as a safety net.
+    _protected = set()
+    if _mp:
+        # Mounted at /mcp → actual paths are /mcp/sse, /mcp/messages
+        _protected.add(f"{_mp}/sse")
+        _protected.add(f"{_mp}/messages")
+    else:
+        # Mounted at / → actual paths are /sse, /messages
+        _protected.add("/sse")
+        _protected.add("/messages")
+
+    # Safety net: also protect raw /sse and /messages even when not at root
+    _protected.add("/sse")
+    _protected.add("/messages")
+
+    # Message endpoint sub-paths for prefix matching (both raw and prefixed)
+    _msg_prefixes = ["/messages"]
+    if _mp:
+        _msg_prefixes.append(f"{_mp}/messages")
 
     class BearerAuthMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next):
             path = request.url.path.rstrip("/")
             if path in _protected or any(
-                path.startswith(p + "/") for p in ("/messages", f"{_mp}/messages")
+                path.startswith(p + "/") for p in _msg_prefixes
             ):
                 auth_header = request.headers.get("authorization", "")
                 if not auth_header.startswith("Bearer "):
@@ -1273,7 +1289,7 @@ def _build_auth_middleware(
 
     return Starlette(
         routes=[
-            Mount("/", app=sse_app),
+            Mount(_mp or "/", app=sse_app),
         ],
         middleware=[
             Middleware(BearerAuthMiddleware),
