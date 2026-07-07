@@ -1089,21 +1089,25 @@ def run_mcp_server(
     import asyncio
 
     if transport == "sse":
-        # --- Auth check: non-loopback requires auth token ---
         _is_loopback = host in ("127.0.0.1", "localhost", "::1")
+
+        # --- Principle 2+3: non-loopback requires auth; explicit auth_token_env
+        #     always loads token regardless of bind host ---
         auth_token = None
-        if not _is_loopback:
-            if not auth_token_env:
-                print(
-                    "Error: Non-loopback SSE bind requires --auth-token-env.\n"
-                    "Public/internal network SSE endpoints (including --host 0.0.0.0)\n"
-                    "must be authenticated.\n"
-                    f"Add --auth-token-env HERMES_MCP_AUTH_TOKEN to your command.\n"
-                    f"For local development use --host 127.0.0.1 instead.",
-                    file=sys.stderr,
-                )
-                bridge.stop()
-                sys.exit(1)
+        if not _is_loopback and not auth_token_env:
+            # Non-loopback without --auth-token-env → fail-fast
+            print(
+                "Error: Non-loopback SSE bind requires --auth-token-env.\n"
+                "Public/internal network SSE endpoints (including --host 0.0.0.0)\n"
+                "must be authenticated.\n"
+                f"Add --auth-token-env HERMES_MCP_AUTH_TOKEN to your command.\n"
+                f"For local development use --host 127.0.0.1 instead.",
+                file=sys.stderr,
+            )
+            bridge.stop()
+            sys.exit(1)
+
+        if auth_token_env:
             auth_token = os.environ.get(auth_token_env, "")
             if not auth_token:
                 print(
@@ -1113,11 +1117,18 @@ def run_mcp_server(
                 )
                 bridge.stop()
                 sys.exit(1)
+            if _is_loopback:
+                print(
+                    f"Hermes MCP SSE: loopback bind with auth_token_env="
+                    f"'{auth_token_env}', Bearer auth enabled.",
+                    file=sys.stderr,
+                )
 
         # --- Build transport security allowlist ---
+        #     Build whenever bind host is non-loopback OR allowed_host is set.
         ts_config = None
-        if host not in ("127.0.0.1", "localhost", "::1"):
-            # Base localhost entries (always present)
+        _need_transport_sec = host not in ("127.0.0.1", "localhost", "::1") or bool(allowed_host)
+        if _need_transport_sec:
             ts_hosts = [
                 "127.0.0.1:*", "localhost:*", "[::1]:*",
                 "127.0.0.1", "localhost", "[::1]",
@@ -1218,8 +1229,12 @@ def _build_auth_middleware(
     """Build a Starlette app wrapping the FastMCP SSE server with Bearer auth.
 
     The middleware checks every request to the SSE and message endpoints
-    for a valid Authorization: Bearer <token> header. Unauthenticated
+    for a valid Authorization: Bearer *** header. Unauthenticated
     requests return 401.
+
+    FastMCP always registers SSE routes at '/sse' and '/messages/' regardless
+    of mount_path. The middleware protects both the raw routes and the
+    mount_path-prefixed variants as a safety net.
     """
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
@@ -1230,13 +1245,24 @@ def _build_auth_middleware(
 
     sse_app = server.sse_app(mount_path=mount_path)
 
+    # Build the set of protected paths. FastMCP always exposes:
+    #   GET  /sse              (SSE endpoint)
+    #   POST /messages/?id=... (message endpoint)
+    # We protect both raw forms and mount_path-prefixed forms.
+    _mp = mount_path.rstrip("/") if mount_path else ""
+    _protected = {
+        "/sse",
+        "/messages",
+        f"{_mp}/sse",
+        f"{_mp}/messages",
+    }
+
     class BearerAuthMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next):
-            # Only protect SSE and message endpoints
             path = request.url.path.rstrip("/")
-            sse_path = (mount_path.rstrip("/") or "") + "/sse"
-            msg_path = (mount_path.rstrip("/") or "") + "/messages"
-            if path == sse_path or path.startswith(msg_path):
+            if path in _protected or any(
+                path.startswith(p + "/") for p in ("/messages", f"{_mp}/messages")
+            ):
                 auth_header = request.headers.get("authorization", "")
                 if not auth_header.startswith("Bearer "):
                     return Response("Unauthorized", status_code=401)

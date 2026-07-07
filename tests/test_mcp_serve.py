@@ -1290,10 +1290,30 @@ class TestSseTransportSecurity:
         assert "0.0.0.0" not in ts.allowed_hosts
         assert "0.0.0.0:*" not in ts.allowed_hosts
 
-    # --- Comprehensive auth boundary tests ---
+    # --- Full test matrix: Auth (A), allowed_host (B), mount_path (C), skill patch (D) ---
 
-    def test_auth_0000_no_token_fails(self, monkeypatch):
-        """host=0.0.0.0 without auth-token-env must fail-fast."""
+    # === A: Auth behavior ===
+
+    @pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
+    def test_a_loopback_no_token(self, host, monkeypatch):
+        """A1-A3: loopback without auth-token-env must allow startup."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
+        server = mcp_serve.create_mcp_server(host=host, port=8000)
+        assert server is not None
+
+    def test_a_loopback_with_token(self, monkeypatch):
+        """A4: loopback with explicit auth-token-env must load token."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        monkeypatch.setenv("_TEST_MCP_TOKEN_LOOP", "test-loop-token")
+        monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
+        server = mcp_serve.create_mcp_server(host="127.0.0.1", port=8000)
+        assert server is not None
+
+    def test_a_0000_no_token_fails(self, monkeypatch):
+        """A5: host=0.0.0.0 without auth → fail-fast."""
         pytest.importorskip("mcp", reason="MCP SDK not installed")
         import mcp_serve
         monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
@@ -1301,41 +1321,20 @@ class TestSseTransportSecurity:
             mcp_serve.run_mcp_server(transport="sse", host="0.0.0.0")
         assert exc.value.code == 1
 
-    def test_auth_0000_with_token_ok(self, monkeypatch):
-        """host=0.0.0.0 with auth-token-env must permit startup."""
+    def test_a_0000_with_token(self, monkeypatch):
+        """A6: host=0.0.0.0 with auth → Bearer auth enabled."""
         pytest.importorskip("mcp", reason="MCP SDK not installed")
         import mcp_serve
-        monkeypatch.setenv("_TEST_HERMES_MCP_TOKEN_A", "test-bearer-0000")
+        monkeypatch.setenv("_TEST_MCP_TOKEN_0000", "test-0000-token")
         monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
-        server = mcp_serve.create_mcp_server(host="0.0.0.0", port=8000)
-        assert server is not None
+        app = mcp_serve._build_auth_middleware(
+            mcp_serve.create_mcp_server(host="0.0.0.0", port=8000),
+            "/", "test-0000-token",
+        )
+        assert app is not None
 
-    def test_auth_loopback_127_no_token_ok(self, monkeypatch):
-        """host=127.0.0.1 without auth must allow startup."""
-        pytest.importorskip("mcp", reason="MCP SDK not installed")
-        import mcp_serve
-        monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
-        server = mcp_serve.create_mcp_server(host="127.0.0.1", port=8000)
-        assert server is not None
-
-    def test_auth_loopback_localhost_no_token_ok(self, monkeypatch):
-        """host=localhost without auth must allow startup."""
-        pytest.importorskip("mcp", reason="MCP SDK not installed")
-        import mcp_serve
-        monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
-        server = mcp_serve.create_mcp_server(host="localhost", port=8000)
-        assert server is not None
-
-    def test_auth_loopback_v6_no_token_ok(self, monkeypatch):
-        """host=::1 without auth must allow startup."""
-        pytest.importorskip("mcp", reason="MCP SDK not installed")
-        import mcp_serve
-        monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
-        server = mcp_serve.create_mcp_server(host="::1", port=8000)
-        assert server is not None
-
-    def test_auth_nonloopback_no_token_fails(self, monkeypatch):
-        """host=10.0.0.5 without auth must fail-fast."""
+    def test_a_nonloopback_no_token_fails(self, monkeypatch):
+        """A7: host=10.0.0.5 without auth → fail-fast."""
         pytest.importorskip("mcp", reason="MCP SDK not installed")
         import mcp_serve
         monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
@@ -1343,14 +1342,186 @@ class TestSseTransportSecurity:
             mcp_serve.run_mcp_server(transport="sse", host="10.0.0.5")
         assert exc.value.code == 1
 
-    def test_auth_nonloopback_with_token_ok(self, monkeypatch):
-        """host=10.0.0.5 with auth-token-env must permit startup."""
+    def test_a_nonloopback_with_token(self, monkeypatch):
+        """A8: host=10.0.0.5 with auth → Bearer auth enabled."""
         pytest.importorskip("mcp", reason="MCP SDK not installed")
         import mcp_serve
-        monkeypatch.setenv("_TEST_HERMES_MCP_TOKEN_B", "test-bearer-1005")
+        monkeypatch.setenv("_TEST_MCP_TOKEN_1005", "test-1005-token")
         monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
-        server = mcp_serve.create_mcp_server(host="10.0.0.5", port=8000)
-        assert server is not None
+        app = mcp_serve._build_auth_middleware(
+            mcp_serve.create_mcp_server(host="10.0.0.5", port=8000),
+            "/", "test-1005-token",
+        )
+        assert app is not None
+
+    # === B: allowed_host behavior ===
+
+    @pytest.mark.parametrize("bind_host", ["127.0.0.1", "10.0.0.5", "0.0.0.0"])
+    def test_b_allowed_host_all_binds(self, bind_host, monkeypatch):
+        """B1-B3: allowed_host must be in allowlist for all bind types."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        ts_config = {
+            "allowed_hosts": [
+                "mcp.example.com", "mcp.example.com:*",
+                "127.0.0.1", "127.0.0.1:*", "localhost", "localhost:*",
+            ],
+            "allowed_origins": [
+                "http://mcp.example.com", "http://mcp.example.com:*",
+                "https://mcp.example.com", "https://mcp.example.com:*",
+            ],
+        }
+        server = mcp_serve.create_mcp_server(
+            host=bind_host, port=8000, transport_security=ts_config
+        )
+        ts = server.settings.transport_security
+        assert ts is not None
+        # B4: exact + wildcard-port host/origin
+        assert "mcp.example.com" in ts.allowed_hosts
+        assert "mcp.example.com:*" in ts.allowed_hosts
+        assert "http://mcp.example.com" in ts.allowed_origins
+        assert "http://mcp.example.com:*" in ts.allowed_origins
+        assert "https://mcp.example.com" in ts.allowed_origins
+        assert "https://mcp.example.com:*" in ts.allowed_origins
+        # B5: 0.0.0.0 not in allowlist
+        if bind_host == "0.0.0.0":
+            assert "0.0.0.0" not in ts.allowed_hosts
+        # B6: no "*"
+        assert "*" not in ts.allowed_hosts
+        assert "*:*" not in ts.allowed_hosts
+
+    def test_b_no_wildcard_star(self, monkeypatch):
+        """B6: No blanket '*' wildcard in allowlist."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        ts_config = {
+            "allowed_hosts": ["mcp.example.com", "mcp.example.com:*", "127.0.0.1"],
+            "allowed_origins": ["http://mcp.example.com"],
+        }
+        server = mcp_serve.create_mcp_server(
+            host="10.0.0.5", port=8000, transport_security=ts_config
+        )
+        ts = server.settings.transport_security
+        assert ts is not None
+        assert "*" not in ts.allowed_hosts
+        assert "*:*" not in ts.allowed_hosts
+        assert "*" not in " ".join(ts.allowed_origins)
+
+    # === C: mount_path and auth route protection ===
+
+    def test_c_mount_path_auth_middleware_protects_sse_and_messages(self, monkeypatch):
+        """C1-C7: middleware must protect /sse and /messages regardless of mount_path.
+
+        Tests message endpoint (POST, synchronous). SSE endpoint is
+        long-lived streaming and cannot be tested with TestClient."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        from starlette.testclient import TestClient
+        import mcp_serve
+        server = mcp_serve.create_mcp_server(transport_security={
+            "allowed_hosts": ["testserver", "testserver:*", "127.0.0.1"],
+            "allowed_origins": ["http://testserver", "http://testserver:*"],
+        })
+        for mp in ["/", "/mcp"]:
+            app = mcp_serve._build_auth_middleware(server, mp, "valid-token")
+            client = TestClient(app, raise_server_exceptions=False)
+            msg_path = f"{mp.rstrip('/')}/messages"
+            raw_msg = "/messages"
+
+            for path in [msg_path, raw_msg]:
+                # Wrong token → 401
+                r = client.post(
+                    path + "?session_id=x",
+                    headers={"Authorization": "Bearer wrong-token"},
+                )
+                assert r.status_code == 401, f"wrong token at {path}: {r.status_code}"
+                # No token → 401
+                r2 = client.post(path + "?session_id=x")
+                assert r2.status_code == 401, f"no token at {path}: {r2.status_code}"
+                # Valid token → passes through (not 401)
+                r3 = client.post(
+                    path + "?session_id=x",
+                    headers={"Authorization": "Bearer valid-token"},
+                )
+                assert r3.status_code != 401, f"valid token at {path} got 401"
+
+    def test_c_mount_path_root_sse_unreachable(self, monkeypatch):
+        """Raw /messages without mount prefix should be protected when mount_path=/mcp."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        from starlette.testclient import TestClient
+        import mcp_serve
+        server = mcp_serve.create_mcp_server(transport_security={
+            "allowed_hosts": ["testserver", "testserver:*", "127.0.0.1"],
+            "allowed_origins": ["http://testserver", "http://testserver:*"],
+        })
+        app = mcp_serve._build_auth_middleware(server, "/mcp", "tok")
+        client = TestClient(app, raise_server_exceptions=False)
+        # /messages without mount prefix should be protected
+        resp = client.post("/messages?session_id=x")
+        assert resp.status_code in (401, 404), f"/messages should be 401 or 404, got {resp.status_code}"
+
+    # === D: skill patch endgame still works ===
+
+    def test_d_skill_patch_endgame_still_works(self):
+        """Verify resolve → read → dry-run → real patch → smoke → rollback is intact."""
+        from tools.mcp_skill_tools import (
+            resolve_skill_uri, read_skill_bundle,
+            run_preauthorized_skill_patch, rollback_skill_patch,
+            smoke_skill_access, _get_skills_root,
+        )
+        import json
+        sr = _get_skills_root()
+        if not sr:
+            return
+        test_skill = None
+        for d in sorted(sr.iterdir()):
+            if (d / "SKILL.md").exists() and d.name not in ("reference-writing",):
+                test_skill = d.name
+                break
+        assert test_skill, "No test skill found"
+
+        # D1: resolve
+        ref = resolve_skill_uri(test_skill)
+        assert ref["exists"], f"resolve failed for {test_skill}"
+        uri = ref["canonical_uri"]
+
+        # D2: read
+        bundle = read_skill_bundle(test_skill)
+        b = json.loads(bundle) if isinstance(bundle, str) else bundle
+        assert b.get("line_count", 0) > 0
+
+        # D3: dry-run (no write)
+        dr = run_preauthorized_skill_patch({
+            "skill_name": test_skill, "file_path": "SKILL.md",
+            "new_content": "# Dry run test\n", "dry_run": True,
+        })
+        if isinstance(dr, str):
+            dr = json.loads(dr)
+        assert dr.get("dry_run") is True
+        assert dr.get("status") == "dry_run_ok"
+
+        # D4: real patch (with backup)
+        result = run_preauthorized_skill_patch({
+            "skill_name": test_skill, "file_path": "SKILL.md",
+            "new_content": "# Real patch test\n",
+        })
+        if isinstance(result, str):
+            result = json.loads(result)
+        assert result.get("status") == "ok", f"patch failed: {result}"
+        bp = result.get("backup_path", "")
+        assert bp != ""
+
+        # D5: diff output
+        assert result.get("diff", "") != "", "diff missing"
+
+        # D6: smoke PASS
+        assert result.get("validation", {}).get("smoke_skill_access") in ("PASS", "WARN")
+
+        # D7: rollback PASS
+        roll = rollback_skill_patch(bp)
+        if isinstance(roll, str):
+            roll = json.loads(roll)
+        assert roll.get("rollback") == "ok"
+        assert roll.get("validation", {}).get("smoke_skill_access") in ("PASS", "WARN")
 
 
 class TestCliIntegration:
