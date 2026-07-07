@@ -1091,11 +1091,22 @@ def run_mcp_server(
         # explicitly to keep protection on.
         ts_config = None
         if host not in ("127.0.0.1", "localhost", "::1"):
-            ts_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
-            ts_origins = ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
+            # Base localhost entries (always present)
+            ts_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*", "127.0.0.1", "localhost", "[::1]"]
+            ts_origins = [
+                "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*",
+                "http://127.0.0.1", "http://localhost", "http://[::1]",
+            ]
             if host == "0.0.0.0":
                 if allowed_host:
+                    # Exact host (no port) — covers bare Host header
+                    ts_hosts.append(allowed_host)
+                    # Wildcard-port host — covers Host: example.com:<port>
                     ts_hosts.append(f"{allowed_host}:*")
+                    # Exact origins (no port)
+                    ts_origins.append(f"http://{allowed_host}")
+                    ts_origins.append(f"https://{allowed_host}")
+                    # Wildcard-port origins
                     ts_origins.append(f"http://{allowed_host}:*")
                     ts_origins.append(f"https://{allowed_host}:*")
                 else:
@@ -1107,7 +1118,11 @@ def run_mcp_server(
                         file=sys.stderr,
                     )
             else:
+                # Exact forms
+                ts_hosts.append(host)
                 ts_hosts.append(f"{host}:*")
+                ts_origins.append(f"http://{host}")
+                ts_origins.append(f"https://{host}")
                 ts_origins.append(f"http://{host}:*")
                 ts_origins.append(f"https://{host}:*")
             ts_config = {"allowed_hosts": ts_hosts, "allowed_origins": ts_origins}

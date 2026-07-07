@@ -1078,6 +1078,105 @@ class TestSseTransportSecurity:
         assert ts.enable_dns_rebinding_protection is True
         assert "myserver.example.com:*" in ts.allowed_hosts
 
+    def test_transport_security_exact_host_via_create(self):
+        """allowed_host should include exact host form (no port) and
+        wildcard-port form for both host and origins."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        ts_config = {
+            "allowed_hosts": ["example.com", "example.com:*", "127.0.0.1", "127.0.0.1:*"],
+            "allowed_origins": [
+                "http://example.com", "https://example.com",
+                "http://example.com:*", "https://example.com:*",
+            ],
+        }
+        server = mcp_serve.create_mcp_server(
+            host="0.0.0.0", port=8000, transport_security=ts_config
+        )
+        ts = server.settings.transport_security
+        assert ts is not None
+        # Exact host (no port)
+        assert "example.com" in ts.allowed_hosts, \
+            "Missing exact host 'example.com' — needed for bare Host header"
+        # Wildcard-port host
+        assert "example.com:*" in ts.allowed_hosts, \
+            "Missing wildcard-port host 'example.com:*'"
+        # Exact origins (no port)
+        assert "http://example.com" in ts.allowed_origins, \
+            "Missing exact http origin"
+        assert "https://example.com" in ts.allowed_origins, \
+            "Missing exact https origin"
+        # Wildcard-port origins
+        assert "http://example.com:*" in ts.allowed_origins, \
+            "Missing wildcard-port http origin"
+        assert "https://example.com:*" in ts.allowed_origins, \
+            "Missing wildcard-port https origin"
+
+    def test_transport_security_exact_localhost(self):
+        """Localhost entries should include both exact and wildcard-port forms."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        ts_config = {
+            "allowed_hosts": [
+                "example.com", "example.com:*",
+                "127.0.0.1", "127.0.0.1:*", "localhost", "localhost:*",
+            ],
+            "allowed_origins": [
+                "http://example.com", "http://example.com:*",
+                "https://example.com", "https://example.com:*",
+                "http://127.0.0.1", "http://127.0.0.1:*",
+                "http://localhost", "http://localhost:*",
+            ],
+        }
+        server = mcp_serve.create_mcp_server(
+            host="0.0.0.0", port=8000, transport_security=ts_config
+        )
+        ts = server.settings.transport_security
+        assert ts is not None
+        assert "127.0.0.1" in ts.allowed_hosts
+        assert "127.0.0.1:*" in ts.allowed_hosts
+        assert "localhost" in ts.allowed_hosts
+        assert "localhost:*" in ts.allowed_hosts
+
+    def test_transport_security_0_0_0_0_no_allowed_host(self):
+        """host=0.0.0.0 without allowed_host should NOT add external hosts."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        # Only localhost entries, no external host
+        ts_config = {
+            "allowed_hosts": ["127.0.0.1:*", "localhost:*", "[::1]:*"],
+            "allowed_origins": [
+                "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*",
+            ],
+        }
+        server = mcp_serve.create_mcp_server(
+            host="0.0.0.0", port=8000, transport_security=ts_config
+        )
+        ts = server.settings.transport_security
+        assert ts is not None
+        # Should NOT contain any external host
+        external = [h for h in ts.allowed_hosts
+                     if h not in ("127.0.0.1", "localhost", "[::1]",
+                                  "127.0.0.1:*", "localhost:*", "[::1]:*")]
+        assert len(external) == 0, \
+            f"host=0.0.0.0 without allowed_host should not add external hosts, got: {external}"
+
+    def test_transport_security_stdlib_default(self):
+        """Stdio transport should not add any transport_security entries."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        # Default localhost — FastMCP auto-initializes transport_security
+        server = mcp_serve.create_mcp_server()
+        assert server.settings.host == "127.0.0.1"
+        # FastMCP auto-initializes for localhost (no external hosts)
+        ts = server.settings.transport_security
+        if ts:
+            external = [h for h in ts.allowed_hosts
+                         if h not in ("127.0.0.1", "localhost", "[::1]",
+                                      "127.0.0.1:*", "localhost:*", "[::1]:*")]
+            assert len(external) == 0, \
+                f"Default stdio should not have external hosts, got: {external}"
+
 
 class TestCliIntegration:
     def test_parse_serve(self):
