@@ -1,16 +1,19 @@
 """
-Hermes MCP Skill Tools — read-only skill access for ChatGPT.
+Hermes MCP Skill Tools -- read-only skill access for ChatGPT.
 
-Provides:
-  hermes_health_check    — MCP/Skills health status
-  resolve_skill_uri      — resolve skill name → canonical URI
-  read_skill_bundle      — read SKILL.md summary + manifest
-  read_skill_file_chunked — chunked file reading
-  smoke_skill_access     — accessibility check (PASS/WARN/FAIL)
+Phase 1 (read-only):
+  hermes_health_check    -- MCP/Skills health status
+  resolve_skill_uri      -- resolve skill name to canonical URI
+  read_skill_bundle      -- read SKILL.md summary + manifest
+  read_skill_file_chunked -- chunked file reading
+  smoke_skill_access     -- accessibility check (PASS/WARN/FAIL)
 
 Security:
-  - Forbidden paths: secrets, token, cookie, session, .env, ~/.ssh, ~/.config/gh
-  - Single response > 20KB returns summary + chunk hint
+  - skill_name must not be absolute or contain ..
+  - All resolved paths verified relative_to(skills_root)
+  - Forbidden paths checked on resolved target
+  - Symlinks validated before read
+  - Truncation signal preserved
   - Structured errors with error codes
   - Read-only: no writes, no mutations
 """
@@ -22,6 +25,46 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Hermes home resolver -- use the canonical resolver
+# ---------------------------------------------------------------------------
+
+try:
+    from hermes_constants import get_hermes_home as _canonical_get_hermes_home
+except ImportError:
+    _canonical_get_hermes_home = None
+
+
+def _get_hermes_home() -> Optional[Path]:
+    """Resolve Hermes home directory using the canonical resolver."""
+    if _canonical_get_hermes_home:
+        try:
+            return _canonical_get_hermes_home()
+        except Exception:
+            pass
+    # Fallback
+    for path_str in [
+        os.environ.get("HERMES_HOME"),
+        os.path.expanduser("~/.hermes"),
+    ]:
+        if path_str:
+            p = Path(path_str)
+            if p.exists():
+                return p
+    return None
+
+
+def _get_skills_root() -> Optional[Path]:
+    """Resolve skills root directory."""
+    home = _get_hermes_home()
+    if not home:
+        return None
+    skills = home / "skills"
+    if skills.exists() and skills.is_dir():
+        return skills
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -63,50 +106,26 @@ ERROR_CODES = {
 }
 
 
-def _get_hermes_home() -> Optional[Path]:
-    """Resolve Hermes home directory."""
-    for path_str in [
-        os.environ.get("HERMES_HOME"),
-        os.path.expanduser("~/.hermes"),
-    ]:
-        if path_str:
-            p = Path(path_str)
-            if p.exists():
-                return p
-    return None
-
-
-def _get_skills_root() -> Optional[Path]:
-    """Resolve skills root directory."""
-    home = _get_hermes_home()
-    if not home:
-        return None
-    skills = home / "skills"
-    if skills.exists():
-        return skills
-    return None
-
-
 def _is_forbidden_path(path: Path) -> Tuple[bool, str]:
-    """Check if a path matches any forbidden pattern.
+    """Check if a resolved path matches any forbidden pattern.
+
+    Args:
+        path: Already-resolved Path (caller must resolve first).
 
     Returns (is_forbidden, reason).
     """
     path_str = str(path)
     path_lower = path_str.lower()
 
-    # Check forbidden path name segments
     parts = path.parts
     for part in parts:
         if part in FORBIDDEN_PATH_NAMES:
             return True, f"forbidden_path_denied: '{part}' in path"
 
-    # Check forbidden patterns
     for pattern in FORBIDDEN_PATTERNS:
         if path.match(pattern):
             return True, f"forbidden_path_denied: matches '{pattern}'"
 
-    # Check sensitive substrings
     sensitive = [".env", "token", "secret", "cookie", "session"]
     for s in sensitive:
         if s in path_lower:
@@ -115,11 +134,38 @@ def _is_forbidden_path(path: Path) -> Tuple[bool, str]:
     return False, ""
 
 
+def _validate_symlink_target(link_path: Path, allowed_root: Path) -> Tuple[bool, str]:
+    """Validate that a symlink target is within an allowed root.
+
+    Returns (allowed, reason).
+    """
+    if not link_path.is_symlink():
+        return True, ""
+    resolved_target = link_path.resolve()
+    try:
+        resolved_target.relative_to(allowed_root.resolve())
+    except ValueError:
+        return False, (
+            f"forbidden_path_denied: symlink {link_path} "
+            f"points outside allowed root {allowed_root}"
+        )
+    # Also check the resolved target for forbidden patterns
+    is_forbidden, reason = _is_forbidden_path(resolved_target)
+    if is_forbidden:
+        return False, reason
+    return True, ""
+
+
 def _resolve_skill_path(skill_name: str) -> Tuple[Optional[Path], Dict[str, Any]]:
     """Resolve a skill name to its filesystem path.
 
-    Returns (path, metadata) where metadata includes:
-      canonical_uri, category, exists, confidence, candidates (if multiple)
+    Security:
+      - skill_name must not be absolute
+      - skill_name must not contain '..'
+      - All resolved paths must be relative_to(skills_root.resolve())
+      - Forbidden path check on resolved target
+
+    Returns (path, metadata).
     """
     skills_root = _get_skills_root()
     meta: Dict[str, Any] = {
@@ -136,34 +182,53 @@ def _resolve_skill_path(skill_name: str) -> Tuple[Optional[Path], Dict[str, Any]
         meta["error_code"] = "hermes_namespace_unavailable"
         return None, meta
 
+    # === Security: deny absolute paths and traversal ===
+    if os.path.isabs(skill_name):
+        meta["error_code"] = "forbidden_path_denied: skill_name must not be absolute"
+        return None, meta
+    if ".." in Path(skill_name).parts:
+        meta["error_code"] = "forbidden_path_denied: path traversal denied"
+        return None, meta
+
+    skills_root_resolved = skills_root.resolve()
+
     # Direct match: skills_root/<skill_name>/SKILL.md
     direct = skills_root / skill_name / "SKILL.md"
-    if direct.exists():
-        is_forbidden, reason = _is_forbidden_path(direct)
+    direct_resolved = direct.resolve()
+    try:
+        direct_resolved.relative_to(skills_root_resolved)
+    except ValueError:
+        meta["error_code"] = "forbidden_path_denied: resolved path outside skills root"
+        return None, meta
+
+    if direct_resolved.exists() and direct_resolved.is_file():
+        is_forbidden, reason = _is_forbidden_path(direct_resolved)
         if is_forbidden:
             meta["error_code"] = reason
             return None, meta
         meta["canonical_uri"] = f"skill:{skill_name}"
-        meta["local_path"] = str(direct)
+        meta["local_path"] = str(direct_resolved)
         meta["exists"] = True
         meta["confidence"] = "exact"
-        return direct, meta
+        return direct_resolved, meta
 
     # Recursive search in subdirectories
     candidates = []
     for root, dirs, files in os.walk(str(skills_root)):
-        # Skip hidden dirs
         dirs[:] = [d for d in dirs if not d.startswith(".")]
         for f in files:
             if f == "SKILL.md":
-                # Check if parent dir name matches
                 parent = Path(root).name
                 if parent == skill_name or skill_name in parent:
-                    full_path = Path(root) / f
+                    full_path = (Path(root) / f).resolve()
+                    try:
+                        full_path.relative_to(skills_root_resolved)
+                    except ValueError:
+                        continue
                     is_forbidden, reason = _is_forbidden_path(full_path)
                     if is_forbidden:
                         continue
-                    rel = full_path.relative_to(skills_root)
+                    rel = full_path.relative_to(skills_root_resolved)
                     category = rel.parts[0] if len(rel.parts) > 2 else None
                     candidates.append({
                         "canonical_uri": f"skill:{rel.parent}",
@@ -186,7 +251,6 @@ def _resolve_skill_path(skill_name: str) -> Tuple[Optional[Path], Dict[str, Any]
             meta["confidence"] = "multiple_matches"
             return None, meta
 
-    # Not found
     meta["error_code"] = "skill_uri_not_found"
     return None, meta
 
@@ -198,7 +262,6 @@ def _read_frontmatter(content: str) -> Dict[str, Any]:
     try:
         end = content.index("---", 3)
         frontmatter_str = content[3:end].strip()
-        # Simple key: value parsing (avoid yaml import dependency)
         result = {}
         for line in frontmatter_str.split("\n"):
             line = line.strip()
@@ -215,6 +278,54 @@ def _get_skill_dir(skill_path: Path) -> Path:
     return skill_path.parent
 
 
+def _safe_read_index(skill_dir: Path, skills_root: Path) -> Tuple[Optional[str], Optional[str]]:
+    """Safely read references/_index.md with symlink validation.
+
+    Returns (content, error_code) -- one will be None.
+    """
+    refs_dir = skill_dir / "references"
+    index_path = refs_dir / "_index.md"
+    if not index_path.exists():
+        return None, None
+
+    # Validate symlink
+    allowed, reason = _validate_symlink_target(index_path, skills_root)
+    if not allowed:
+        return None, reason
+
+    try:
+        # Resolve first, then read
+        resolved = index_path.resolve()
+        # Re-verify resolved path is within skills_root
+        try:
+            resolved.relative_to(skills_root.resolve())
+        except ValueError:
+            return None, "forbidden_path_denied: _index.md resolves outside skills root"
+        content = resolved.read_text(encoding="utf-8")
+        return content[:1000], None
+    except Exception:
+        return None, None
+
+
+def _safe_list_dir(dir_path: Path, skills_root: Path) -> List[str]:
+    """List files in a directory, validating symlinks.
+
+    Only returns files that are within the skills root.
+    """
+    if not dir_path.exists():
+        return []
+    result = []
+    for f in dir_path.iterdir():
+        if not f.is_file() or f.name.startswith("."):
+            continue
+        if f.is_symlink():
+            allowed, _ = _validate_symlink_target(f, skills_root)
+            if not allowed:
+                continue
+        result.append(f.name)
+    return sorted(result)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -222,31 +333,47 @@ def _get_skill_dir(skill_path: Path) -> Path:
 def hermes_health_check() -> Dict[str, Any]:
     """Check Hermes MCP health status.
 
-    Returns: mcp_ok, htp_ok, skills_root_exists, skills_root_readable,
-             version, timestamp.
+    Does NOT assume a specific skill exists. Uses generic filesystem checks:
+      - skills_root exists / is_dir / readable (os.access)
+      - iterates to find any SKILL.md for readability test
     """
     result = {
         "mcp_ok": True,
         "htp_ok": True,
         "skills_root_exists": False,
         "skills_root_readable": False,
-        "version": "0.1.0",
+        "version": "0.1.1",
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
     skills_root = _get_skills_root()
-    if skills_root:
-        result["skills_root_exists"] = True
-        result["skills_root"] = str(skills_root)
-        # Check readability
-        try:
-            test_file = skills_root / "apple" / "SKILL.md"
-            if test_file.exists():
-                with open(test_file, "r") as f:
-                    f.read(100)
-                result["skills_root_readable"] = True
-        except Exception:
-            pass
+    if not skills_root:
+        return result
+
+    result["skills_root_exists"] = True
+    result["skills_root"] = str(skills_root)
+
+    # Generic readability: check exists + is_dir + os.access
+    if skills_root.exists() and skills_root.is_dir():
+        if os.access(str(skills_root), os.R_OK):
+            # Try to find any SKILL.md for a deeper readability test
+            for root, dirs, files in os.walk(str(skills_root)):
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+                for f in files:
+                    if f == "SKILL.md":
+                        try:
+                            test_path = Path(root) / f
+                            with open(test_path, "r") as fh:
+                                fh.read(100)
+                            result["skills_root_readable"] = True
+                        except Exception:
+                            pass
+                        break
+                if result["skills_root_readable"]:
+                    break
+            # If no SKILL.md found, check root dir readability
+            if not result["skills_root_readable"]:
+                result["skills_root_readable"] = os.access(str(skills_root), os.R_OK)
 
     return result
 
@@ -268,6 +395,9 @@ def resolve_skill_uri(skill_name: str) -> Dict[str, Any]:
 def read_skill_bundle(skill_name: str) -> Dict[str, Any]:
     """Read a skill's SKILL.md summary, manifest, and references list.
 
+    For instructional tools: if the SKILL.md is too large, returns
+    explicit signals to prevent the client from operating on partial content.
+
     Args:
         skill_name: Skill name or canonical URI (e.g. "reference-writing"
                     or "skill:productivity/reference-writing")
@@ -275,9 +405,9 @@ def read_skill_bundle(skill_name: str) -> Dict[str, Any]:
     Returns:
         SKILL.md summary, line_count, frontmatter, references list,
         scripts list, _index.md summary (if exists).
-        Does NOT return full content > 20KB.
+        For large files: full_content_available=false, chunk_required=true,
+        complete_instruction_loaded=false, required_next_chunks.
     """
-    # Strip "skill:" prefix if present
     if skill_name.startswith("skill:"):
         skill_name = skill_name.split(":", 1)[1]
 
@@ -299,12 +429,23 @@ def read_skill_bundle(skill_name: str) -> Dict[str, Any]:
     lines = content.split("\n")
     line_count = len(lines)
     frontmatter = _read_frontmatter(content)
-
-    # Truncate if too large
     content_size = len(content)
+
+    skills_root = _get_skills_root()
+    skill_dir = _get_skill_dir(path)
+
     if content_size > MAX_OUTPUT_CHARS:
-        # Return summary only
-        summary_lines = lines[:100]
+        # Large file: return explicit partial-content signals
+        summary_lines_count = 100
+        summary_lines = lines[:summary_lines_count]
+        # Calculate suggested ranges for chunked reading
+        chunk_size = 500  # lines per suggested chunk
+        suggested_ranges = []
+        for i in range(summary_lines_count + 1, line_count + 1, chunk_size):
+            suggested_ranges.append({
+                "start_line": i,
+                "end_line": min(i + chunk_size - 1, line_count),
+            })
         result = {
             "skill_name": skill_name,
             "canonical_uri": meta.get("canonical_uri"),
@@ -312,9 +453,16 @@ def read_skill_bundle(skill_name: str) -> Dict[str, Any]:
             "content_size_bytes": content_size,
             "frontmatter": frontmatter,
             "summary": "\n".join(summary_lines),
+            "summary_lines": summary_lines_count,
+            "full_content_available": False,
             "chunk_required": True,
-            "chunk_hint": f"File is {content_size} bytes. Use "
-                          f"read_skill_file_chunked to read sections.",
+            "complete_instruction_loaded": False,
+            "required_next_chunks": len(suggested_ranges),
+            "suggested_ranges": suggested_ranges[:5],
+            "chunk_hint": (
+                f"File is {content_size} bytes ({line_count} lines). "
+                f"Use read_skill_file_chunked to read remaining sections."
+            ),
         }
     else:
         result = {
@@ -324,32 +472,39 @@ def read_skill_bundle(skill_name: str) -> Dict[str, Any]:
             "content_size_bytes": content_size,
             "frontmatter": frontmatter,
             "content": content,
+            "full_content_available": True,
+            "complete_instruction_loaded": True,
         }
 
-    # List references
-    skill_dir = _get_skill_dir(path)
+    # List references (with symlink validation)
     refs_dir = skill_dir / "references"
     if refs_dir.exists():
-        result["references"] = sorted([
-            f.name for f in refs_dir.iterdir()
-            if f.is_file() and not f.name.startswith(".")
-        ])
+        if skills_root:
+            result["references"] = _safe_list_dir(refs_dir, skills_root)
+        else:
+            result["references"] = sorted([
+                f.name for f in refs_dir.iterdir()
+                if f.is_file() and not f.name.startswith(".")
+            ])
 
-    # List scripts
+    # List scripts (with symlink validation)
     scripts_dir = skill_dir / "scripts"
     if scripts_dir.exists():
-        result["scripts"] = sorted([
-            f.name for f in scripts_dir.iterdir()
-            if f.is_file() and not f.name.startswith(".")
-        ])
+        if skills_root:
+            result["scripts"] = _safe_list_dir(scripts_dir, skills_root)
+        else:
+            result["scripts"] = sorted([
+                f.name for f in scripts_dir.iterdir()
+                if f.is_file() and not f.name.startswith(".")
+            ])
 
-    # _index.md summary
-    if refs_dir and (refs_dir / "_index.md").exists():
-        try:
-            idx_content = (refs_dir / "_index.md").read_text(encoding="utf-8")
-            result["_index_summary"] = idx_content[:1000]
-        except Exception:
-            pass
+    # _index.md summary (with symlink validation)
+    if skills_root and refs_dir.exists():
+        idx_content, idx_error = _safe_read_index(skill_dir, skills_root)
+        if idx_error:
+            result["_index_error"] = idx_error
+        elif idx_content:
+            result["_index_summary"] = idx_content
 
     return result
 
@@ -367,7 +522,9 @@ def read_skill_file_chunked(
         end_line: 1-indexed end line (inclusive). If None, reads to end.
 
     Returns:
-        lines, line_count, chunk_required flag.
+        chunk content, line numbers, and truncation signals.
+        If the requested range exceeds MAX_OUTPUT_CHARS, returns truncated
+        with chunk_required=true, truncated=true, and next_start_line.
     """
     if canonical_uri.startswith("skill:"):
         skill_name = canonical_uri.split(":", 1)[1]
@@ -380,7 +537,6 @@ def read_skill_file_chunked(
         result["canonical_uri"] = canonical_uri
         return result
 
-    # Forbidden check
     is_forbidden, reason = _is_forbidden_path(path)
     if is_forbidden:
         return {"error_code": reason, "canonical_uri": canonical_uri}
@@ -401,7 +557,6 @@ def read_skill_file_chunked(
         end_line = total_lines
     if end_line > total_lines:
         end_line = total_lines
-
     if start_line < 1:
         start_line = 1
     if start_line > total_lines:
@@ -412,22 +567,31 @@ def read_skill_file_chunked(
             "total_lines": total_lines,
         }
 
+    requested_lines = end_line - start_line + 1
     chunk = lines[start_line - 1:end_line]
     chunk_size = len("\n".join(chunk))
 
+    truncated = False
+    next_start_line = None
     if chunk_size > MAX_OUTPUT_CHARS:
-        # Truncate
+        truncated = True
+        # Keep first 100 lines of the requested range
         chunk = chunk[:100]
         chunk_size = len("\n".join(chunk))
+        next_start_line = start_line + 100
 
     return {
         "canonical_uri": canonical_uri,
         "start_line": start_line,
-        "end_line": end_line,
+        "end_line": end_line if not truncated else start_line + 99,
         "total_lines": total_lines,
+        "requested_lines": requested_lines,
+        "returned_lines": len(chunk),
         "chunk": "\n".join(chunk),
         "chunk_size_bytes": chunk_size,
-        "chunk_required": chunk_size > MAX_OUTPUT_CHARS,
+        "truncated": truncated,
+        "chunk_required": truncated,
+        "next_start_line": next_start_line,
     }
 
 
@@ -457,35 +621,36 @@ def smoke_skill_access(skill_name: str) -> Dict[str, Any]:
     checks["resolved"] = "PASS"
     checks["local_path"] = str(path)
 
-    # Check SKILL.md
     if path.exists():
         checks["skill_md"] = "PASS"
     else:
         checks["skill_md"] = "FAIL"
 
     skill_dir = _get_skill_dir(path)
+    skills_root = _get_skills_root()
 
-    # Check references dir
     refs_dir = skill_dir / "references"
     if refs_dir.exists():
         checks["references_dir"] = "PASS"
-        # Check _index.md
-        if (refs_dir / "_index.md").exists():
-            checks["references_index"] = "PASS"
+        index_path = refs_dir / "_index.md"
+        if index_path.exists():
+            if skills_root:
+                allowed, _ = _validate_symlink_target(index_path, skills_root)
+                checks["references_index"] = "PASS" if allowed else "FAIL"
+            else:
+                checks["references_index"] = "PASS"
         else:
             checks["references_index"] = "WARN"
     else:
         checks["references_dir"] = "WARN"
         checks["references_index"] = "WARN"
 
-    # Check scripts dir
     scripts_dir = skill_dir / "scripts"
     if scripts_dir.exists():
         checks["scripts_dir"] = "PASS"
     else:
         checks["scripts_dir"] = "WARN"
 
-    # Overall status
     if "FAIL" in checks.values():
         overall = "FAIL"
     elif "WARN" in checks.values():
