@@ -735,3 +735,357 @@ def smoke_skill_access(skill_name: str) -> Dict[str, Any]:
         "checks": checks,
         "overall": overall,
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Preauthorized Write API
+# ---------------------------------------------------------------------------
+
+import datetime
+import difflib
+import re
+import shutil
+import uuid
+
+ALLOWED_PATHS = [
+    "/home/ubuntu/.hermes/skills",
+    "/tmp/hermes-artifacts",
+    "/tmp/hermes-skill-backups",
+]
+
+ALLOWED_SCOPES = ["P0_READ", "P1_ARTIFACT", "P2_SKILL_PATCH", "P3_PR_CREATE"]
+FORBIDDEN_SCOPES = ["P4_RESTRICTED"]
+
+SENSITIVE_CONTENT_PATTERNS = [
+    ("api_key_pattern", re.compile(r'(?:api[_-]?key|apikey)\s*[:=]\s*[\'"\w]+', re.IGNORECASE)),
+    ("token_pattern", re.compile(r'(?:access[_-]?token|refresh[_-]?token)\s*[:=]\s*[\'"\w\.\-]+', re.IGNORECASE)),
+    ("private_key_pattern", re.compile(r'(?:private[_-]?key|secret[_-]?key)\s*[:=]', re.IGNORECASE)),
+    ("password_pattern", re.compile(r'(?:password|passwd)\s*[:=]\s*[\'"]\S+[\'"]', re.IGNORECASE)),
+    ("github_token_pattern", re.compile(r'(?:ghp_|gho_|github_pat_|sk-)[\w]{20,}', re.IGNORECASE)),
+    ("pem_key_pattern", re.compile(r'(?:-----BEGIN\s+(?:RSA\s+)?PRIVATE\s+KEY-----)', re.IGNORECASE)),
+]
+
+
+def _is_in_allowed_paths(target_path: Path) -> bool:
+    resolved = target_path.resolve()
+    for allowed in ALLOWED_PATHS:
+        try:
+            resolved.relative_to(Path(allowed).resolve())
+            return True
+        except ValueError:
+            continue
+    skills_root = _get_skills_root()
+    if skills_root:
+        try:
+            resolved.relative_to(skills_root.resolve())
+            return True
+        except ValueError:
+            pass
+    return False
+
+
+def _scan_new_content(content: str) -> Tuple[bool, str]:
+    for pattern_id, pattern in SENSITIVE_CONTENT_PATTERNS:
+        if pattern.search(content):
+            return True, f"forbidden_content_denied: {pattern_id}"
+    return False, ""
+
+
+def _redact_diff(diff_text: str) -> str:
+    for _, pattern in SENSITIVE_CONTENT_PATTERNS:
+        diff_text = pattern.sub("***REDACTED***", diff_text)
+    return diff_text
+
+
+def get_preauthorization_profile() -> Dict[str, Any]:
+    return {
+        "profile": "chatgpt-hermes-high-trust-v1",
+        "allowed_scopes": ALLOWED_SCOPES,
+        "forbidden_scopes": FORBIDDEN_SCOPES,
+        "allowed_paths": [f"{p}/**" for p in ALLOWED_PATHS],
+        "max_output_chars": MAX_OUTPUT_CHARS,
+        "max_read_lines": MAX_READ_LINES,
+        "version": "0.2.0",
+        "p3_pr_create": "policy_declared_only",
+        "p3_pr_create_note": "PR creation is handled by the GitHub connector.",
+    }
+
+
+def _create_backup_metadata(
+    target_path: Path, skill_name: str, actual_file_path: Path,
+    existed_before: bool
+) -> Tuple[Optional[Path], Dict[str, Any]]:
+    """Create a unique backup and metadata for the actual file.
+
+    Always creates metadata even if the file doesn't exist (existed_before=False).
+    """
+    ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+    suffix = str(uuid.uuid4())[:8]
+    backup_base = Path("/tmp/hermes-skill-backups")
+    backup_dir = backup_base / f"{ts}-{suffix}" / skill_name
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    skill_dir = _get_skill_dir(target_path)
+    relative = str(actual_file_path.relative_to(skill_dir)) if actual_file_path.is_relative_to(skill_dir) else actual_file_path.name
+
+    backup_file_path = None
+    try:
+        if existed_before:
+            # Preserve nested directory structure
+            dest = backup_dir / relative
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(actual_file_path), str(dest))
+            backup_file_path = str(dest)
+
+        # Always back up SKILL.md if it exists
+        if target_path.exists():
+            shutil.copy2(str(target_path), str(backup_dir / "SKILL.md"))
+
+        refs_src = skill_dir / "references"
+        if refs_src.exists():
+            refs_dest = backup_dir / "references"
+            shutil.copytree(str(refs_src), str(refs_dest), dirs_exist_ok=True)
+
+        scripts_src = skill_dir / "scripts"
+        if scripts_src.exists():
+            scripts_dest = backup_dir / "scripts"
+            shutil.copytree(str(scripts_src), str(scripts_dest), dirs_exist_ok=True)
+
+    except Exception as e:
+        return None, {"error_code": "backup_failed", "error": str(e)}
+
+    return backup_dir, {
+        "backup_path": str(backup_dir),
+        "timestamp": ts,
+        "original_target_path": str(target_path),
+        "actual_file_path": str(actual_file_path),
+        "relative_file_path": relative,
+        "skill_dir": str(skill_dir),
+        "backup_file_path": backup_file_path,
+        "skill_name": skill_name,
+        "existed_before": existed_before,
+    }
+
+
+def run_preauthorized_skill_patch(manifest: Dict[str, Any]) -> Dict[str, Any]:
+    """Execute a preauthorized skill file patch.
+
+    Write transaction model:
+    1. Validate file_path (relative, no .., no hidden segments, no forbidden)
+    2. Determine if target exists (existed_before)
+    3. Create backup metadata regardless
+    4. Write new content
+    5. Return redacted diff + smoke check
+    """
+    skill_name = manifest.get("skill_name", "")
+    file_path = manifest.get("file_path", "SKILL.md")
+    new_content = manifest.get("new_content", "")
+    action = manifest.get("action", "replace")
+
+    if not skill_name:
+        return {"error_code": "skill_uri_not_found", "error": "skill_name is required"}
+
+    # === Validate file_path ===
+    path_obj = Path(file_path)
+    if path_obj.is_absolute():
+        return {"error_code": "forbidden_path_denied", "error": "file_path must be relative"}
+    if ".." in path_obj.parts:
+        return {"error_code": "forbidden_path_denied", "error": "path traversal denied"}
+    if any(part.startswith(".") for part in path_obj.parts):
+        return {"error_code": "forbidden_path_denied", "error": "hidden path segment denied"}
+
+    path, meta = _resolve_skill_path(skill_name)
+    if not path or not meta["exists"]:
+        result = dict(meta)
+        result["skill_name"] = skill_name
+        return result
+
+    skill_dir = _get_skill_dir(path).resolve()
+    actual_target = (skill_dir / path_obj).resolve()
+
+    try:
+        actual_target.relative_to(skill_dir)
+    except ValueError:
+        return {"error_code": "patch_target_not_in_allowed_paths", "error": "target outside skill_dir"}
+
+    if not _is_in_allowed_paths(actual_target):
+        return {"error_code": "patch_target_not_in_allowed_paths", "error": "not in allowed_paths"}
+
+    is_forbidden, reason = _is_forbidden_path(actual_target)
+    if is_forbidden:
+        return {"error_code": reason}
+
+    # Symlink check
+    if actual_target.exists() and actual_target.is_symlink():
+        skills_root = _get_skills_root()
+        if skills_root:
+            allowed, reason = _validate_symlink_target(actual_target, skills_root)
+            if not allowed:
+                return {"error_code": reason}
+
+    if action == "delete" and file_path == ".":
+        return {"error_code": "delete_skill_dir_denied"}
+
+    # === Content scan ===
+    found_sensitive, scan_reason = _scan_new_content(new_content)
+    if found_sensitive:
+        return {"error_code": scan_reason}
+
+    # === Determine existed_before ===
+    existed_before = actual_target.exists()
+
+    # === Read old content (if exists) ===
+    old_content = ""
+    if existed_before:
+        try:
+            old_content = actual_target.read_text(encoding="utf-8")
+        except Exception as e:
+            return {"error_code": "skill_read_stream_interrupted", "error": str(e)}
+
+    # === Create backup metadata ===
+    backup_path, backup_meta = _create_backup_metadata(path, skill_name, actual_target, existed_before)
+    if not backup_path:
+        return backup_meta
+
+    # === Write new content ===
+    try:
+        actual_target.parent.mkdir(parents=True, exist_ok=True)
+        actual_target.write_text(new_content, encoding="utf-8")
+    except Exception as e:
+        return {"error_code": "skill_patch_validation_failed", "error": str(e)}
+
+    # === Redacted diff ===
+    diff = _redact_diff(
+        "\n".join(difflib.unified_diff(
+            old_content.splitlines(keepends=True),
+            new_content.splitlines(keepends=True),
+            fromfile=f"a/{file_path}",
+            tofile=f"b/{file_path}",
+        ))
+    )
+
+    smoke_result = smoke_skill_access(skill_name)
+
+    return {
+        "skill_name": skill_name,
+        "file_path": str(actual_target),
+        "action": action,
+        "backup_path": backup_meta.get("backup_path"),
+        "backup_metadata": backup_meta,
+        "diff": diff,
+        "diff_lines": len(diff.split("\n")) - 1 if diff else 0,
+        "files_written": [str(actual_target)],
+        "old_size_bytes": len(old_content),
+        "new_size_bytes": len(new_content),
+        "existed_before": existed_before,
+        "validation": {
+            "smoke_skill_access": smoke_result["overall"],
+            "smoke_checks": smoke_result["checks"],
+        },
+        "status": "ok" if smoke_result["overall"] in ("PASS", "WARN") else "validation_failed",
+    }
+
+
+def rollback_skill_patch(backup_path: str) -> Dict[str, Any]:
+    """Rollback a skill patch using backup metadata.
+
+    For each backed-up file:
+      - existed_before=true: restore original content
+      - existed_before=false: delete the newly created file
+    Supports all target types: SKILL.md, README.md, references/*, scripts/*, nested paths.
+    """
+    backup_dir = Path(backup_path).resolve()
+    backup_root = Path("/tmp/hermes-skill-backups").resolve()
+
+    try:
+        backup_dir.relative_to(backup_root)
+    except ValueError:
+        return {"error_code": "forbidden_path_denied", "error": "backup not under /tmp/hermes-skill-backups/"}
+
+    if not backup_dir.exists():
+        return {"error_code": "backup_path_not_found"}
+
+    skill_name = backup_dir.name
+    skill_md_path = backup_dir / "SKILL.md"
+    if not skill_md_path.exists():
+        return {"error_code": "backup_path_not_found", "error": "SKILL.md not found in backup"}
+
+    path, meta = _resolve_skill_path(skill_name)
+    if not path:
+        return {"error_code": "skill_uri_not_found"}
+
+    skill_dir = _get_skill_dir(path).resolve()
+    skills_root = _get_skills_root()
+    if not skills_root:
+        return {"error_code": "hermes_namespace_unavailable"}
+    try:
+        skill_dir.relative_to(skills_root.resolve())
+    except ValueError:
+        return {"error_code": "forbidden_path_denied", "error": "target outside skills root"}
+
+    restored = []
+    deleted = []
+    try:
+        # Restore root-level backup files (non-SKILL.md, non-dir)
+        for f in backup_dir.iterdir():
+            if f.is_file() and f.name != "SKILL.md":
+                dest = skill_dir / f.name
+                dest.write_text(f.read_text(encoding="utf-8"))
+                restored.append(str(dest))
+
+        # Restore SKILL.md
+        original_content = skill_md_path.read_text(encoding="utf-8")
+        path.write_text(original_content, encoding="utf-8")
+        restored.append(str(path))
+
+        # Restore references (preserving nested structure)
+        refs_backup = backup_dir / "references"
+        if refs_backup.exists():
+            refs_original = skill_dir / "references"
+            refs_original.mkdir(exist_ok=True)
+            for f in refs_backup.rglob("*"):
+                if f.is_file():
+                    rel = f.relative_to(refs_backup)
+                    dest = refs_original / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(f), str(dest))
+                    restored.append(str(dest))
+
+        # Restore scripts (preserving nested structure)
+        scripts_backup = backup_dir / "scripts"
+        if scripts_backup.exists():
+            scripts_original = skill_dir / "scripts"
+            scripts_original.mkdir(exist_ok=True)
+            for f in scripts_backup.rglob("*"):
+                if f.is_file():
+                    rel = f.relative_to(scripts_backup)
+                    dest = scripts_original / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(f), str(dest))
+                    restored.append(str(dest))
+
+        # Remove files that were newly created by the patch (existed_before=false)
+        for f in skill_dir.rglob("*"):
+            if f.is_file() and str(f) not in restored:
+                # Check if this file was created by the patch (not in backup)
+                if not any(str(f).startswith(str(r)) for r in restored):
+                    f.unlink()
+                    deleted.append(str(f))
+
+    except Exception as e:
+        return {"error_code": "rollback_failed", "error": str(e)}
+
+    smoke_result = smoke_skill_access(skill_name)
+    return {
+        "rollback": "ok",
+        "backup_path": str(backup_dir),
+        "skill_name": skill_name,
+        "restored_files": restored,
+        "deleted_files": deleted,
+        "count_restored": len(restored),
+        "count_deleted": len(deleted),
+        "validation": {
+            "smoke_skill_access": smoke_result["overall"],
+            "smoke_checks": smoke_result["checks"],
+        },
+    }
