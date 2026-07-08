@@ -1229,8 +1229,10 @@ def _build_sse_app(
       mount_path="/"   → Mount("/",   app=sse_app) → /sse, /messages
       mount_path="/mcp" → Mount("/mcp", app=sse_app) → /mcp/sse, /mcp/messages
 
-    The middleware protects both the actual routes (under mount_path) and
-    raw /sse, /messages paths as a safety net.
+    Note: FastMCP sse_app() is called with mount_path="/" (unprefixed) so it
+    advertises message endpoints at /messages/... (not /mcp/messages/...).
+    The Starlette Mount() adds the prefix externally, preventing double-
+    prefixing (e.g. /mcp/mcp/messages).
     """
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
@@ -1239,7 +1241,8 @@ def _build_sse_app(
     from starlette.responses import Response
     from starlette.routing import Mount, Route
 
-    sse_app = server.sse_app(mount_path=mount_path)
+    # FastMCP child app at unprefixed root — Starlette Mount adds prefix
+    sse_app = server.sse_app(mount_path="/")
 
     # Normalise mount_path
     _mp = mount_path.rstrip("/") if mount_path and mount_path != "/" else ""

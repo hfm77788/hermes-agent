@@ -1502,6 +1502,43 @@ class TestSseTransportSecurity:
         assert resp.status_code != 401, \
             f"/mcp/messages with valid token got 401"
 
+        # /mcp/mcp/messages (double-prefixed) should NOT be a valid route
+        resp = client.post("/mcp/mcp/messages?session_id=x",
+                           headers={"Authorization": "Bearer tok"})
+        assert resp.status_code in (401, 404, 405), \
+            f"/mcp/mcp/messages should not be reachable, got {resp.status_code}"
+
+    def test_c_mount_path_sse_endpoint_no_double_prefix(self, monkeypatch):
+        """Double-prefixed message paths should not be reachable.
+
+        SSE endpoint is streaming and cannot be tested with TestClient,
+        but the /mcp/mcp/messages path should not exist for any mount_path."""
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        from starlette.testclient import TestClient
+        import mcp_serve
+        server = mcp_serve.create_mcp_server(transport_security={
+            "allowed_hosts": ["testserver", "testserver:*", "127.0.0.1"],
+            "allowed_origins": ["http://testserver", "http://testserver:*"],
+        })
+
+        for mp, auth_token in [("/", None), ("/mcp", None),
+                                ("/", "tok"), ("/mcp", "tok")]:
+            app = mcp_serve._build_sse_app(server, mp, auth_token)
+            client = TestClient(app, raise_server_exceptions=False)
+
+            # The actual message route under mount_path should work
+            msg = f"{mp.rstrip('/')}/messages" if mp != "/" else "/messages"
+            hdrs = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+            resp = client.post(msg + "?session_id=x", headers=hdrs)
+            assert resp.status_code != 404, \
+                f"Actual message route {msg} mount={mp} should not 404"
+
+            # Double-prefixed path should NOT be reachable (no /mcp/mcp/messages)
+            double = f"/mcp/{mp.lstrip('/')}messages" if mp == "/mcp" else "/mcp/messages"
+            resp2 = client.post(double + "?session_id=x", headers=hdrs)
+            assert resp2.status_code in (401, 404, 405), \
+                f"Double-prefixed {double} mount={mp} should be unreachable, got {resp2.status_code}"
+
     # === D: skill patch endgame still works ===
 
     def test_d_skill_patch_endgame_still_works(self):
