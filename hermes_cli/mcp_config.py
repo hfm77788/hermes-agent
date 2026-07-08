@@ -918,7 +918,15 @@ def mcp_command(args):
 
     if action == "serve":
         from mcp_serve import run_mcp_server
-        run_mcp_server(verbose=getattr(args, "verbose", False))
+        run_mcp_server(
+            verbose=getattr(args, "verbose", False),
+            transport=getattr(args, "transport", "stdio"),
+            host=getattr(args, "host", "127.0.0.1"),
+            port=getattr(args, "port", 8000),
+            mount_path=getattr(args, "mount_path", "/"),
+            allowed_host=getattr(args, "allowed_host", None),
+            auth_token_env=getattr(args, "auth_token_env", None),
+        )
         return
 
     # Catalog subcommands live in mcp_picker / mcp_catalog. Import lazily so

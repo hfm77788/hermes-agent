@@ -19,7 +19,7 @@ from tools.mcp_skill_tools import (
     _validate_symlink_target, _safe_read_index,
     get_preauthorization_profile, run_preauthorized_skill_patch,
     rollback_skill_patch, _is_in_allowed_paths,
-    _scan_new_content, _redact_diff,
+    _scan_new_content, _redact_diff, _compute_diff,
 )
 
 
@@ -335,3 +335,100 @@ class TestContentScanning:
     def test_redact_diff(self):
         redacted = _redact_diff("+\n+api_key = 'secret'\n+ok")
         assert "secret" not in redacted
+
+
+class TestDryRun:
+    def test_dry_run_returns_diff_without_writing(self, tmp_path_factory):
+        """Dry-run must validate, compute diff, report would_change, and NOT write."""
+        # Use a real skill from the skills directory
+        skills_root = _get_skills_root()
+        if not skills_root:
+            return
+        # Find a skill that exists
+        skill_dirs = list(skills_root.iterdir())
+        if not skill_dirs:
+            return
+        ref_skill = None
+        for d in skill_dirs:
+            md = d / "SKILL.md"
+            if md.exists():
+                ref_skill = d.name
+                break
+        if not ref_skill:
+            return
+
+        original = read_skill_bundle(ref_skill)
+        import json as _json
+        summary = _json.loads(original) if isinstance(original, str) else original
+        assert summary.get("exists", False), f"Skill {ref_skill} must exist"
+
+        # Dry-run with new content
+        result = run_preauthorized_skill_patch({
+            "skill_name": ref_skill,
+            "file_path": "SKILL.md",
+            "new_content": "# Modified\n\nDry run test content.\n",
+            "dry_run": True,
+        })
+        assert result["dry_run"] is True
+        assert result["status"] == "dry_run_ok"
+        assert "diff" in result
+        assert "would_change" in result
+        assert result["would_change"] is True
+        assert "backup_path" not in result
+        assert "backup_metadata" not in result
+        # Verify the file was NOT modified
+        re_read = read_skill_bundle(ref_skill)
+        re_summary = _json.loads(re_read) if isinstance(re_read, str) else re_read
+        assert re_summary.get("line_count") == summary.get("line_count"), \
+            "Dry-run must not modify the file"
+
+    def test_dry_run_no_change_when_same_content(self):
+        """Dry-run with identical content should report would_change=False."""
+        from tools.mcp_skill_tools import _resolve_skill_path
+        skills_root = _get_skills_root()
+        if not skills_root:
+            return
+        skill_dirs = list(skills_root.iterdir())
+        if not skill_dirs:
+            return
+        ref_skill = None
+        for d in skill_dirs:
+            md = d / "SKILL.md"
+            if md.exists():
+                ref_skill = d.name
+                break
+        if not ref_skill:
+            return
+
+        path, _ = _resolve_skill_path(ref_skill)
+        if not path or not path.exists():
+            return
+        original_content = path.read_text(encoding="utf-8")
+
+        result = run_preauthorized_skill_patch({
+            "skill_name": ref_skill,
+            "file_path": "SKILL.md",
+            "new_content": original_content,
+            "dry_run": True,
+        })
+        assert result["dry_run"] is True
+        assert result["would_change"] is False
+        assert result["diff"] == ""
+
+    def test_dry_run_forbidden_path(self):
+        """Dry-run must reject forbidden paths the same as real patch."""
+        result = run_preauthorized_skill_patch({
+            "skill_name": "reference-writing",
+            "file_path": "../.env",
+            "new_content": "test",
+            "dry_run": True,
+        })
+        assert "error_code" in result
+        assert "forbidden" in result.get("error_code", "").lower() or \
+               "denied" in result.get("error_code", "").lower()
+
+    def test_compute_diff_redacted(self):
+        """_compute_diff must redact sensitive content."""
+        diff = _compute_diff("test.md", "old content", 'api_key = "sk-abc123"')
+        assert "sk-abc123" not in diff
+        assert "REDACTED" in diff or diff == "" or "***" in diff

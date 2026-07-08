@@ -484,13 +484,46 @@ class EventBridge:
 # MCP Server
 # ---------------------------------------------------------------------------
 
-def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
-    """Create and return the Hermes MCP server with all tools registered."""
+def create_mcp_server(
+    event_bridge: Optional[EventBridge] = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    mount_path: str = "/",
+    transport_security: Optional[dict] = None,
+) -> "FastMCP":
+    """Create and return the Hermes MCP server with all tools registered.
+
+    Args:
+        event_bridge: Optional EventBridge for conversation events.
+        host: Listen address for SSE transport (default: 127.0.0.1).
+              Passed to FastMCP at construction time so transport_security
+              is initialized correctly.
+        port: Listen port for SSE transport (default: 8000).
+        mount_path: Mount path for SSE app (default: "/").
+        transport_security: Optional dict with keys 'allowed_hosts' and
+                           'allowed_origins' lists. When provided, overrides
+                           the default FastMCP transport security for non-
+                           localhost hosts. Set to None to use FastMCP auto-
+                           detection (default for localhost addresses).
+    """
     if not _MCP_SERVER_AVAILABLE:
         raise ImportError(
             "MCP server requires the 'mcp' package. "
             f"Install with: {sys.executable} -m pip install 'mcp'"
         )
+
+    # Build TransportSecuritySettings if explicitly provided
+    ts = None
+    if transport_security is not None:
+        try:
+            from mcp.server.fastmcp.server import TransportSecuritySettings
+            ts = TransportSecuritySettings(
+                enable_dns_rebinding_protection=True,
+                allowed_hosts=transport_security.get("allowed_hosts", []),
+                allowed_origins=transport_security.get("allowed_origins", []),
+            )
+        except ImportError:
+            pass
 
     mcp = FastMCP(
         "hermes",
@@ -499,6 +532,10 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
             "conversations across Telegram, Discord, Slack, WhatsApp, Signal, "
             "Matrix, and other connected platforms."
         ),
+        host=host,
+        port=port,
+        mount_path=mount_path,
+        transport_security=ts,
     )
 
     bridge = event_bridge or EventBridge()
@@ -985,8 +1022,10 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 
         @mcp.tool()
         def run_preauthorized_skill_patch(manifest: str) -> str:
-            """Execute a preauthorized skill file patch.
-            Args: manifest JSON with skill_name, file_path, new_content."""
+            """Execute or dry-run a preauthorized skill file patch.
+            Args: manifest JSON with skill_name, file_path, new_content,
+                  action, and optional dry_run (bool, default false).
+            Dry-run: validates + shows diff without writing."""
             try:
                 manifest_dict = json.loads(manifest)
             except json.JSONDecodeError as e:
@@ -1005,8 +1044,32 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 # Entry point
 # ---------------------------------------------------------------------------
 
-def run_mcp_server(verbose: bool = False) -> None:
-    """Start the Hermes MCP server on stdio."""
+def run_mcp_server(
+    verbose: bool = False,
+    transport: str = "stdio",
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    mount_path: str = "/",
+    allowed_host: Optional[str] = None,
+    auth_token_env: Optional[str] = None,
+) -> None:
+    """Start the Hermes MCP server.
+
+    Args:
+        verbose: Enable debug logging.
+        transport: Transport mode - "stdio" (default) or "sse".
+        host: Listen address for SSE (default: 127.0.0.1).
+              Use "0.0.0.0" to bind all interfaces.
+        port: Listen port for SSE (default: 8000).
+        mount_path: Mount path for SSE app (default: "/").
+        allowed_host: External hostname/IP for SSE clients. When set,
+                      added to DNS rebinding allowlist regardless of
+                      bind address.
+        auth_token_env: Env var name containing Bearer auth token.
+                       Required for non-loopback SSE binds.
+                       Loopback (127.0.0.1/localhost/::1) allows
+                       no-token access for local development.
+    """
     if not _MCP_SERVER_AVAILABLE:
         print(
             "Error: MCP server requires the 'mcp' package.\n"
@@ -1023,17 +1086,193 @@ def run_mcp_server(verbose: bool = False) -> None:
     bridge = EventBridge()
     bridge.start()
 
-    server = create_mcp_server(event_bridge=bridge)
-
     import asyncio
 
-    async def _run():
+    if transport == "sse":
+        _is_loopback = host in ("127.0.0.1", "localhost", "::1")
+
+        # --- Auth check ---
+        auth_token = None
+        if not _is_loopback and not auth_token_env:
+            print(
+                "Error: Non-loopback SSE bind requires --auth-token-env.\n"
+                "Public/internal network SSE endpoints (including --host 0.0.0.0)\n"
+                "must be authenticated.\n"
+                f"Add --auth-token-env HERMES_MCP_AUTH_TOKEN to your command.\n"
+                f"For local development use --host 127.0.0.1 instead.",
+                file=sys.stderr,
+            )
+            bridge.stop()
+            sys.exit(1)
+
+        if auth_token_env:
+            auth_token = os.environ.get(auth_token_env, "")
+            if not auth_token:
+                print(
+                    f"Error: Auth token env var '{auth_token_env}' is empty or unset.\n"
+                    f"Set it to a bearer token value before starting the server.",
+                    file=sys.stderr,
+                )
+                bridge.stop()
+                sys.exit(1)
+            if _is_loopback:
+                print(
+                    f"Hermes MCP SSE: loopback bind with auth_token_env="
+                    f"'{auth_token_env}', Bearer auth enabled.",
+                    file=sys.stderr,
+                )
+
+        # --- Build transport security allowlist ---
+        _need_transport_sec = host not in ("127.0.0.1", "localhost", "::1") or bool(allowed_host)
+        ts_config = None
+        if _need_transport_sec:
+            ts_hosts = [
+                "127.0.0.1:*", "localhost:*", "[::1]:*",
+                "127.0.0.1", "localhost", "[::1]",
+            ]
+            ts_origins = [
+                "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*",
+                "http://127.0.0.1", "http://localhost", "http://[::1]",
+            ]
+            if host != "0.0.0.0":
+                ts_hosts.append(host)
+                ts_hosts.append(f"{host}:*")
+                ts_origins.append(f"http://{host}")
+                ts_origins.append(f"https://{host}")
+                ts_origins.append(f"http://{host}:*")
+                ts_origins.append(f"https://{host}:*")
+            if allowed_host:
+                ts_hosts.append(allowed_host)
+                ts_hosts.append(f"{allowed_host}:*")
+                ts_origins.append(f"http://{allowed_host}")
+                ts_origins.append(f"https://{allowed_host}")
+                ts_origins.append(f"http://{allowed_host}:*")
+                ts_origins.append(f"https://{allowed_host}:*")
+            elif host == "0.0.0.0" and not allowed_host:
+                print(
+                    "Warning: --host 0.0.0.0 requires --allowed-host to "
+                    "set DNS rebinding protection. Without it, external "
+                    "clients may be rejected.\n"
+                    "Usage: --host 0.0.0.0 --allowed-host <your-hostname>",
+                    file=sys.stderr,
+                )
+            ts_config = {"allowed_hosts": ts_hosts, "allowed_origins": ts_origins}
+
+        # --- Build the SSE server (always via Starlette + uvicorn) ---
+        server = create_mcp_server(
+            event_bridge=bridge,
+            host=host,
+            port=port,
+            mount_path=mount_path,
+            transport_security=ts_config,
+        )
+
+        # Unify Starlette app: auth_token controls whether Bearer check
+        # is active. Routing structure (mount_path) is identical for both.
+        starlette_app = _build_sse_app(server, mount_path, auth_token)
+
+        async def _run_sse():
+            import uvicorn
+            try:
+                if auth_token:
+                    label = f" (Bearer auth via {auth_token_env})"
+                else:
+                    label = " (no auth, localhost only)"
+                print(
+                    f"Hermes MCP SSE server listening on "
+                    f"http://{host}:{port}{mount_path}{label}",
+                    file=sys.stderr,
+                )
+                config = uvicorn.Config(
+                    starlette_app,
+                    host=host,
+                    port=port,
+                    log_level="debug" if verbose else "warning",
+                )
+                uvicorn_server = uvicorn.Server(config)
+                await uvicorn_server.serve()
+            finally:
+                bridge.stop()
+
         try:
-            await server.run_stdio_async()
-        finally:
+            asyncio.run(_run_sse())
+        except KeyboardInterrupt:
+            bridge.stop()
+    else:
+        # stdio: use default FastMCP settings (no host/port needed)
+        server = create_mcp_server(event_bridge=bridge)
+
+        async def _run_stdio():
+            try:
+                await server.run_stdio_async()
+            finally:
+                bridge.stop()
+
+        try:
+            asyncio.run(_run_stdio())
+        except KeyboardInterrupt:
             bridge.stop()
 
-    try:
-        asyncio.run(_run())
-    except KeyboardInterrupt:
-        bridge.stop()
+
+def _build_sse_app(
+    server: "FastMCP",
+    mount_path: str,
+    token: Optional[str] = None,
+) -> "Starlette":
+    """Build a Starlette app wrapping the FastMCP SSE server, mounted at mount_path.
+
+    The auth layer (Bearer token check) is controlled by the ``token`` param:
+      - token is a str → BearerAuthMiddleware enforces it on SSE/message routes.
+      - token is None → auth middleware is a no-op pass-through (local dev).
+
+    Routing structure is identical in both cases:
+      mount_path="/"   → Mount("/",   app=sse_app) → /sse, /messages
+      mount_path="/mcp" → Mount("/mcp", app=sse_app) → /mcp/sse, /mcp/messages
+
+    Note: FastMCP sse_app() is called with mount_path="/" (unprefixed) so it
+    advertises message endpoints at /messages/... (not /mcp/messages/...).
+    The Starlette Mount() adds the prefix externally, preventing double-
+    prefixing (e.g. /mcp/mcp/messages).
+    """
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.requests import Request
+    from starlette.responses import Response
+    from starlette.routing import Mount, Route
+
+    # FastMCP child app at unprefixed root — Starlette Mount adds prefix
+    sse_app = server.sse_app(mount_path="/")
+
+    # Normalise mount_path
+    _mp = mount_path.rstrip("/") if mount_path and mount_path != "/" else ""
+
+    # Build protected paths
+    _protected = {"/sse", "/messages"}
+    if _mp:
+        _protected.add(f"{_mp}/sse")
+        _protected.add(f"{_mp}/messages")
+
+    _msg_prefixes = ["/messages"]
+    if _mp:
+        _msg_prefixes.append(f"{_mp}/messages")
+
+    class BearerAuthMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            path = request.url.path.rstrip("/")
+            if path in _protected or any(
+                path.startswith(p + "/") for p in _msg_prefixes
+            ):
+                if token is not None:
+                    auth_header = request.headers.get("authorization", "")
+                    if not auth_header.startswith("Bearer "):
+                        return Response("Unauthorized", status_code=401)
+                    provided = auth_header[len("Bearer "):]
+                    if provided != token:
+                        return Response("Unauthorized", status_code=401)
+            return await call_next(request)
+
+    return Starlette(
+        routes=[Mount(_mp or "/", app=sse_app)],
+        middleware=[Middleware(BearerAuthMiddleware)],
+    )
