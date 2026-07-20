@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
@@ -667,7 +668,61 @@ class CredentialPool:
         device_code-sourced entries; env/API-key-sourced entries have no
         auth.json shadow to sync from.
         """
-        if self.provider != "openai-codex" or entry.source != "device_code":
+        if self.provider != "openai-codex":
+            return entry
+        if entry.source not in ("device_code", "manual:device_code"):
+            return entry
+        # Manual device-code entries: clear stale exhausted markers so the
+        # entry becomes selectable again, but never sync tokens from the
+        # singleton (which may belong to a different account).  DEAD entries
+        # are left alone — the 24h prune in _available_entries handles them.
+        # Respect last_error_reset_at cooldown (e.g. 429 weekly TTL).
+        if entry.source == "manual:device_code":
+            if entry.last_status == STATUS_EXHAUSTED and entry.access_token:
+                exhausted_until = _exhausted_until(entry)
+                now = time.time()
+                if exhausted_until is not None and now < exhausted_until:
+                    return entry  # still in cooldown
+                updated = replace(
+                    entry,
+                    last_status=None,
+                    last_status_at=None,
+                    last_error_code=None,
+                    last_error_reason=None,
+                    last_error_message=None,
+                    last_error_reset_at=None,
+                )
+                self._replace_entry(entry, updated)
+                self._persist()
+                return updated
+            return entry
+        # Multi-account Codex pool: the singleton only reflects the most
+        # recent device-code login.  Syncing from it would overwrite one
+        # pool entry with another account's identity, causing serial-number
+        # drift.  Per-entry tokens are the source of truth in this case.
+        device_code_entries = [e for e in self._entries if e.source == "device_code"]
+        if len(device_code_entries) > 1:
+            # Still clear stale DEAD markers so the entry can self-recover
+            # via _refresh_entry later in _available_entries.  Do NOT clear
+            # exhausted_until (ChatGPT weekly quota) — that TTL is intentional.
+            if entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD} and entry.access_token:
+                exhausted_until = _exhausted_until(entry)
+                now = datetime.now(timezone.utc).timestamp()
+                # DEAD: clear immediately (no TTL makes sense for dead-in-pool)
+                # EXHAUSTED: only clear if the cooldown has actually passed
+                if entry.last_status == STATUS_DEAD and entry.access_token:
+                    updated = replace(
+                        entry,
+                        last_status=None,
+                        last_status_at=None,
+                        last_error_code=None,
+                        last_error_reason=None,
+                        last_error_message=None,
+                        last_error_reset_at=None,
+                    )
+                    self._replace_entry(entry, updated)
+                    self._persist()
+                    return updated
             return entry
         try:
             with _auth_store_lock():
@@ -1238,13 +1293,12 @@ class CredentialPool:
                         logger.debug(
                             "Failed to clear terminal Codex OAuth state: %s", clear_exc
                         )
-                    removed_ids = [
-                        item.id for item in self._entries
-                        if item.source == "device_code"
-                    ]
+                    # Remove this specific entry — do not remove
+                    # other entries from a multi-account pool.
+                    removed_ids = [entry.id]
                     self._entries = [
                         item for item in self._entries
-                        if item.source != "device_code"
+                        if item.id != entry.id
                     ]
                     if self._current_id == entry.id:
                         self._current_id = None
@@ -1403,7 +1457,7 @@ class CredentialPool:
             # frozen behind last_error_reset_at (can be hours in the
             # future for ChatGPT weekly windows).
             if (self.provider == "openai-codex"
-                    and entry.source == "device_code"
+                    and entry.source in ("device_code", "manual:device_code")
                     and entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}):
                 synced = self._sync_codex_entry_from_auth_store(entry)
                 if synced is not entry:
@@ -1692,12 +1746,58 @@ class CredentialPool:
         return entry
 
 
+def _extract_codex_account_id(token: str) -> Optional[str]:
+    """Extract chatgpt_account_id from a Codex JWT access token."""
+    if not isinstance(token, str) or token.count(".") != 2:
+        return None
+    import base64 as _b64
+    payload_part = token.split(".")[1]
+    payload_part += "=" * ((4 - len(payload_part) % 4) % 4)
+    try:
+        raw = _b64.urlsafe_b64decode(payload_part.encode("utf-8"))
+        claims = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(claims, dict):
+        return None
+    auth_info = claims.get("https://api.openai.com/auth")
+    if isinstance(auth_info, dict):
+        return auth_info.get("chatgpt_account_id")
+    return None
+
+
 def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, payload: Dict[str, Any]) -> bool:
+    # Multi-account matching: when several entries share the same source
+    # (e.g. multiple Codex device_code logins), disambiguate by explicit id
+    # first, then by JWT account_id, then fall back to single-candidate
+    # source match.  If truly ambiguous, append a new entry.
+    candidates = [(idx, e) for idx, e in enumerate(entries) if e.source == source]
+
     existing_idx = None
-    for idx, entry in enumerate(entries):
-        if entry.source == source:
-            existing_idx = idx
-            break
+    payload_id = payload.get("id")
+    if payload_id and candidates:
+        for idx, entry in candidates:
+            if entry.id == payload_id:
+                existing_idx = idx
+                break
+
+    if existing_idx is None and len(candidates) > 1:
+        # Try JWT account_id matching
+        payload_token = str(payload.get("access_token") or "")
+        payload_account = _extract_codex_account_id(payload_token) if payload_token else None
+        if payload_account:
+            for idx, entry in candidates:
+                entry_account = _extract_codex_account_id(str(entry.access_token or ""))
+                if entry_account == payload_account:
+                    existing_idx = idx
+                    break
+
+    if existing_idx is None and len(candidates) == 1:
+        existing_idx = candidates[0][0]
+
+    if existing_idx is None and len(candidates) > 1:
+        # Ambiguous — append new entry rather than overwriting the wrong one
+        existing_idx = None  # fall through to append path
 
     if existing_idx is None:
         payload.setdefault("id", uuid.uuid4().hex[:6])
@@ -2041,6 +2141,13 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         # existing Codex CLI credentials get a one-time, explicit prompt
         # via `hermes auth openai-codex`.
         if isinstance(tokens, dict) and tokens.get("access_token"):
+            # Multi-account Codex pool must NOT be re-seeded from the
+            # singleton because the singleton only reflects the most
+            # recent device-code login and would overwrite one pool entry
+            # with another account's identity.
+            existing_device_code = [e for e in entries if e.source == "device_code"]
+            if len(existing_device_code) > 1:
+                return changed, active_sources
             active_sources.add("device_code")
             custom_label = str(state.get("label") or "").strip()
             changed |= _upsert_entry(
