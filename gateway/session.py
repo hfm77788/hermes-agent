@@ -744,6 +744,7 @@ def is_shared_multi_user_session(
     *,
     group_sessions_per_user: bool = True,
     thread_sessions_per_user: bool = False,
+    shared_group_session_chat_ids: Optional[List[str]] = None,
 ) -> bool:
     """Return True when a non-DM session is shared across participants.
 
@@ -752,9 +753,13 @@ def is_shared_multi_user_session(
       - Threads are shared unless ``thread_sessions_per_user`` is True.
       - Non-thread group/channel sessions are shared unless
         ``group_sessions_per_user`` is True (default: True = isolated).
+      - ``shared_group_session_chat_ids`` overrides: listed chat IDs are always shared.
     """
     if source.chat_type == "dm":
         return False
+    if shared_group_session_chat_ids and source.chat_id:
+        if source.chat_id in shared_group_session_chat_ids:
+            return True
     if source.thread_id:
         return not thread_sessions_per_user
     return not group_sessions_per_user
@@ -785,6 +790,7 @@ def build_session_key(
     group_sessions_per_user: bool = True,
     thread_sessions_per_user: bool = False,
     profile: Optional[str] = None,
+    shared_group_session_chat_ids: Optional[List[str]] = None,
 ) -> str:
     """Build a deterministic session key from a message source.
 
@@ -813,9 +819,18 @@ def build_session_key(
       - Without participant identifiers, or when isolation is disabled, messages fall back to one
         shared session per chat.
       - Without identifiers, messages fall back to one session per platform/chat_type.
+      - ``shared_group_session_chat_ids`` overrides ``group_sessions_per_user`` for the listed
+        chat IDs: when a chat_id is in this list, ``group_sessions_per_user`` is forced to False
+        regardless of the global setting, so all participants share one session.
     """
     ns = _session_key_namespace(profile)
     platform = source.platform.value
+
+    # --- shared_group_session_chat_ids override ---
+    if shared_group_session_chat_ids and source.chat_id:
+        if source.chat_id in shared_group_session_chat_ids:
+            group_sessions_per_user = False
+    # --- end override ---
     if source.chat_type == "dm":
         dm_chat_id = source.chat_id
         if source.platform == Platform.WHATSAPP:
@@ -1056,6 +1071,7 @@ class SessionStore:
             group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
             profile=self._resolve_profile_for_key(source),
+            shared_group_session_chat_ids=getattr(self.config, "shared_group_session_chat_ids", None),
         )
 
     def _create_entry_from_recovered_row(
@@ -1950,6 +1966,7 @@ def build_session_context(
             source,
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
+            shared_group_session_chat_ids=getattr(config, "shared_group_session_chat_ids", None),
         ),
     )
     

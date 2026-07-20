@@ -455,9 +455,22 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if agent.pass_session_id and agent.session_id:
         timestamp_line += f"\nSession ID: {agent.session_id}"
     if agent.model:
-        timestamp_line += f"\nModel: {agent.model}"
-    if agent.provider:
-        timestamp_line += f"\nProvider: {agent.provider}"
+        # When the credential pool is exhausted at session startup, the
+        # first API call will immediately fallback to the first fallback
+        # model.  Report that model instead of the configured model so the
+        # agent doesn't misreport its identity when asked.
+        if (not getattr(agent, '_credential_pool_viable', True)
+                and getattr(agent, '_fallback_chain', None)):
+            fb = agent._fallback_chain[0]
+            reported_model = fb.get('model', agent.model)
+            reported_provider = fb.get('provider', agent.provider)
+            timestamp_line += f"\nModel: {reported_model} (fallback from {agent.model})"
+            if reported_provider:
+                timestamp_line += f"\nProvider: {reported_provider}"
+        else:
+            timestamp_line += f"\nModel: {agent.model}"
+            if agent.provider:
+                timestamp_line += f"\nProvider: {agent.provider}"
     volatile_parts.append(timestamp_line)
 
     return {
