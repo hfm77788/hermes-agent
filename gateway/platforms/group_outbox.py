@@ -47,8 +47,7 @@ class GroupOutboxMixin:
         self._group_outbox_db_path: Optional[Path] = None
         self._group_wakeup: asyncio.Event = asyncio.Event()
         self._group_worker_tasks: Dict[str, asyncio.Task] = {}
-        self._owner_token: Optional[str] = None
-        self._owner_chat_id: Optional[str] = None
+        self._owner_tokens: Dict[str, str] = {}
         self._outbox_metrics: Dict[str, int] = {
             "enqueue_inserted": 0, "enqueue_duplicate": 0, "enqueue_failed": 0,
             "dequeue_success": 0, "dequeue_failed": 0,
@@ -87,6 +86,11 @@ class GroupOutboxMixin:
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_msg ON outbox(chat_id, message_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_dequeue ON outbox(chat_id, state, seq)")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_token ON outbox(lease_token)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS outbox_owner_lease (
+            chat_id TEXT PRIMARY KEY,
+            owner_token TEXT NOT NULL,
+            owner_expires REAL NOT NULL
+        )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS conversation_state (
             chat_id TEXT PRIMARY KEY,
             last_speaker_id TEXT,
@@ -344,73 +348,127 @@ class GroupOutboxMixin:
     # ── Owner lease ─────────────────────────────────────────────────────────
 
     def _try_acquire_owner_lease(self, chat_id: str) -> bool:
-        """Try to acquire chat-level owner lease. Returns True if acquired."""
+        """Atomically acquire the dedicated per-chat owner lease."""
         try:
             db_path = self._ensure_outbox_db()
             conn = sqlite3.connect(str(db_path))
             conn.execute("PRAGMA busy_timeout=5000")
             conn.execute("BEGIN IMMEDIATE")
             now = time.time()
-            row = conn.execute("SELECT owner_token, owner_expires FROM outbox"
-                               " WHERE chat_id=? AND owner_token IS NOT NULL LIMIT 1",
-                               (chat_id,)).fetchone()
-            if row and row[1] and row[1] > now:
+            row = conn.execute(
+                "SELECT owner_token, owner_expires FROM outbox_owner_lease"
+                " WHERE chat_id=?",
+                (chat_id,),
+            ).fetchone()
+            if row and row[1] > now:
                 conn.rollback()
                 conn.close()
                 return False
             owner_token = str(uuid.uuid4())
-            conn.execute("UPDATE outbox SET owner_token=?, owner_expires=? WHERE chat_id=?",
-                         (owner_token, now + self.OWNER_LEASE_TIMEOUT_SECONDS, chat_id))
+            conn.execute(
+                """INSERT INTO outbox_owner_lease
+                   (chat_id, owner_token, owner_expires)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(chat_id) DO UPDATE SET
+                     owner_token=excluded.owner_token,
+                     owner_expires=excluded.owner_expires""",
+                (
+                    chat_id,
+                    owner_token,
+                    now + self.OWNER_LEASE_TIMEOUT_SECONDS,
+                ),
+            )
             conn.commit()
             conn.close()
-            self._owner_token = owner_token
-            self._owner_chat_id = chat_id
+            self._owner_tokens[chat_id] = owner_token
             return True
         except Exception:
+            logger.warning(
+                "[%s] Failed to acquire shared-group owner lease for %s",
+                self.name,
+                chat_id,
+                exc_info=True,
+            )
             return False
 
     def _recover_expired_leases(self, chat_id: str) -> None:
-        """Recover expired leases."""
+        """Recover expired row leases."""
         try:
             db_path = self._ensure_outbox_db()
             conn = sqlite3.connect(str(db_path))
             conn.execute("PRAGMA busy_timeout=5000")
             now = time.time()
-            conn.execute("UPDATE outbox SET state='queued', leased_at=NULL, lease_expires=NULL, lease_token=NULL,"
-                         " retry_count=retry_count+1 WHERE state='leased' AND lease_expires < ? AND chat_id=?",
-                         (now, chat_id))
+            cur = conn.execute(
+                "UPDATE outbox SET state='queued', leased_at=NULL,"
+                " lease_expires=NULL, lease_token=NULL,"
+                " retry_count=retry_count+1"
+                " WHERE state='leased' AND lease_expires < ? AND chat_id=?",
+                (now, chat_id),
+            )
             conn.commit()
             conn.close()
-            self._outbox_metrics["leases_recovered"] += 1
+            self._outbox_metrics["leases_recovered"] += max(cur.rowcount, 0)
         except Exception:
-            pass
+            logger.warning(
+                "[%s] Failed to recover row leases for %s",
+                self.name,
+                chat_id,
+                exc_info=True,
+            )
 
-    def _renew_owner_lease(self, chat_id: str) -> None:
-        """Renew the owner lease for the given chat (extend expiry)."""
+    def _renew_owner_lease(self, chat_id: str) -> bool:
+        """Renew this worker's per-chat lease; return False if ownership is lost."""
+        owner_token = self._owner_tokens.get(chat_id)
+        if not owner_token:
+            return False
         try:
             db_path = self._ensure_outbox_db()
             conn = sqlite3.connect(str(db_path))
             conn.execute("PRAGMA busy_timeout=5000")
-            now = time.time()
-            conn.execute("UPDATE outbox SET owner_expires=? WHERE chat_id=? AND owner_token=?",
-                         (now + self.OWNER_LEASE_TIMEOUT_SECONDS, chat_id, self._owner_token or ""))
+            cur = conn.execute(
+                "UPDATE outbox_owner_lease SET owner_expires=?"
+                " WHERE chat_id=? AND owner_token=?",
+                (
+                    time.time() + self.OWNER_LEASE_TIMEOUT_SECONDS,
+                    chat_id,
+                    owner_token,
+                ),
+            )
             conn.commit()
             conn.close()
+            return cur.rowcount == 1
         except Exception:
-            pass
+            logger.warning(
+                "[%s] Failed to renew shared-group owner lease for %s",
+                self.name,
+                chat_id,
+                exc_info=True,
+            )
+            return False
 
     def _release_owner_lease(self, chat_id: str) -> None:
-        """Release the owner lease for the given chat."""
+        """Release only this worker's dedicated per-chat owner lease."""
+        owner_token = self._owner_tokens.pop(chat_id, "")
+        if not owner_token:
+            return
         try:
             db_path = self._ensure_outbox_db()
             conn = sqlite3.connect(str(db_path))
             conn.execute("PRAGMA busy_timeout=5000")
-            conn.execute("UPDATE outbox SET owner_token=NULL, owner_expires=NULL WHERE chat_id=? AND owner_token=?",
-                         (chat_id, self._owner_token or ""))
+            conn.execute(
+                "DELETE FROM outbox_owner_lease"
+                " WHERE chat_id=? AND owner_token=?",
+                (chat_id, owner_token),
+            )
             conn.commit()
             conn.close()
         except Exception:
-            pass
+            logger.warning(
+                "[%s] Failed to release shared-group owner lease for %s",
+                self.name,
+                chat_id,
+                exc_info=True,
+            )
 
     # ── Worker lifecycle ────────────────────────────────────────────────────
 
@@ -440,7 +498,13 @@ class GroupOutboxMixin:
             try:
                 self._recover_expired_leases(chat_id)
                 while True:
-                    adapter_ref._renew_owner_lease(chat_id)
+                    if not adapter_ref._renew_owner_lease(chat_id):
+                        logger.warning(
+                            "[%s] Shared-group worker lost owner lease for %s",
+                            self.name,
+                            chat_id,
+                        )
+                        return
 
                     # A processing task may drain the next row from its finally
                     # block.  Wait for that canonical session owner before
@@ -450,7 +514,16 @@ class GroupOutboxMixin:
                         active_task = self._session_tasks.get(session_key)
                         if active_task is not None and not active_task.done():
                             try:
-                                await asyncio.shield(active_task)
+                                await asyncio.wait_for(
+                                    asyncio.shield(active_task),
+                                    timeout=max(
+                                        1.0,
+                                        self.OWNER_LEASE_TIMEOUT_SECONDS / 3,
+                                    ),
+                                )
+                            except asyncio.TimeoutError:
+                                # Renew the owner lease during long model calls.
+                                continue
                             except asyncio.CancelledError:
                                 current = asyncio.current_task()
                                 if current is not None and current.cancelling():
@@ -860,10 +933,10 @@ class GroupOutboxMixin:
                 pending = conn.execute(
                     "SELECT COUNT(*) FROM outbox WHERE chat_id=? AND state='queued'", (chat_id,)
                 ).fetchone()[0]
-                # 3. Clear expired owner leases so we can re-acquire
+                # 3. Clear expired dedicated owner leases so we can re-acquire
                 conn.execute(
-                    "UPDATE outbox SET owner_token=NULL, owner_expires=NULL"
-                    " WHERE chat_id=? AND owner_expires IS NOT NULL AND owner_expires < ?",
+                    "DELETE FROM outbox_owner_lease"
+                    " WHERE chat_id=? AND owner_expires < ?",
                     (chat_id, now),
                 )
                 conn.commit()
