@@ -461,6 +461,24 @@ class TestWeixinChunkDelivery:
         assert send_message_mock.await_count == 1
         assert adapter._rate_limit_cooldown_remaining() > 0
 
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_zero_retry_budget_skips_tokenless_fallback(self, send_message_mock):
+        adapter = self._connected_adapter()
+        adapter._send_chunk_retries = 0
+        adapter._rate_limit_circuit_threshold = 1
+        send_message_mock.return_value = {
+            "ret": weixin.RATE_LIMIT_ERRCODE,
+            "errcode": None,
+            "errmsg": "rate limited",
+        }
+
+        result = asyncio.run(adapter.send("wxid_test123", "no retry"))
+
+        assert result.success is False
+        assert "cooldown" in (result.error or "")
+        assert send_message_mock.await_count == 1
+        assert send_message_mock.await_args.kwargs["context_token"] == "ctx-token"
+
     @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
     @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
     def test_repeated_rate_limits_open_circuit_for_followup_sends(self, send_message_mock, sleep_mock):
