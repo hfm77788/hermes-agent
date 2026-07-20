@@ -4661,16 +4661,19 @@ class BasePlatformAdapter(GroupOutboxMixin, ABC):
         shared_ids = self.config.extra.get("shared_group_session_chat_ids") or []
         source_chat = getattr(event.source, "chat_id", "") if event.source else ""
         if source_chat in shared_ids:
-            self._enqueue_group_event(source_chat, event)
-            if session_key not in self._active_sessions:
-                # No active session — dequeue and process immediately
-                next_event = self._dequeue_group_event(source_chat, session_key)
-                if next_event is not None:
-                    self._start_session_processing(next_event, session_key)
-            else:
-                # Active session exists — ensure worker is draining the outbox
+            enqueue_result = self._enqueue_group_event(source_chat, event)
+            if enqueue_result.get("status") != "failed":
+                # The owner-leased worker is the only consumer.  This keeps all
+                # adapters and restarts on one FIFO path and one canonical
+                # session key instead of spawning a second busy-session path.
                 self._start_group_worker(source_chat)
-            return
+                return
+            logger.error(
+                "[%s] Shared-group outbox unavailable for %s; "
+                "falling back to in-memory dispatch",
+                self.name,
+                source_chat,
+            )
 
         # On-entry self-heal
         # entry for this key but the owner task has already exited (done or
