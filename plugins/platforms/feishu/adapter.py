@@ -1531,89 +1531,101 @@ class FeishuAdapter(BasePlatformAdapter):
         self._init_group_context_buffer()
 
     def _init_group_context_buffer(self) -> None:
-        """Initialize the SQLite ring buffer for registered project groups."""
+        """Initialize one shared SQLite ring buffer for every registered group."""
         registry = self._load_project_group_registry()
         if not registry:
             return
         workspaces = registry.get("workspaces")
         if not isinstance(workspaces, list):
             return
-        for workspace in workspaces:
-            if not isinstance(workspace, dict):
-                continue
-            if workspace.get("context_buffer") is not True:
-                continue
-            chat_id = str(workspace.get("chat_id") or "").strip()
-            if not chat_id:
-                continue
-            self._group_buffer_chat_ids.add(chat_id)
-            project_dir = get_hermes_home() / "projects" / "ma-secretary-interaction-system"
-            project_dir.mkdir(parents=True, exist_ok=True)
-            db_path = project_dir / "group_buffer.db"
-            self._group_buffer_db_path = db_path
-            import sqlite3
-            conn = sqlite3.connect(str(db_path))
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS group_messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    chat_id TEXT NOT NULL,
-                    message_id TEXT NOT NULL,
-                    sender_open_id TEXT,
-                    reply_to_message_id TEXT,
-                    create_time INTEGER NOT NULL,
-                    message_type TEXT NOT NULL DEFAULT 'text',
-                    content TEXT,
-                    recorded_at REAL NOT NULL
-                )
-            """)
-            conn.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_group_msg_id
-                ON group_messages(chat_id, message_id)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_group_chat_time
-                ON group_messages(chat_id, create_time DESC)
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS buffer_watermark (
-                    chat_id TEXT PRIMARY KEY,
-                    last_message_id TEXT,
-                    last_create_time INTEGER,
-                    has_gap INTEGER NOT NULL DEFAULT 0,
-                    continuity_state TEXT NOT NULL DEFAULT 'unknown',
-                    disconnect_epoch REAL NOT NULL DEFAULT 0.0,
-                    last_reconciled_at REAL NOT NULL DEFAULT 0.0,
-                    updated_at REAL NOT NULL
-                )
-            """)
-            # ── Migrate existing rows: add missing columns ─────────────────
-            try:
-                conn.execute(
-                    "ALTER TABLE buffer_watermark ADD COLUMN continuity_state TEXT NOT NULL DEFAULT 'unknown'"
-                )
-            except sqlite3.OperationalError:
-                pass
-            try:
-                conn.execute(
-                    "ALTER TABLE buffer_watermark ADD COLUMN disconnect_epoch REAL NOT NULL DEFAULT 0.0"
-                )
-            except sqlite3.OperationalError:
-                pass
-            try:
-                conn.execute(
-                    "ALTER TABLE buffer_watermark ADD COLUMN last_reconciled_at REAL NOT NULL DEFAULT 0.0"
-                )
-            except sqlite3.OperationalError:
-                pass
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.commit()
-            conn.close()
-            os.chmod(str(db_path), 0o600)
-            logger.info(
-                "[Feishu] Group context buffer initialized: chat_id=%s db=%s",
-                chat_id, db_path,
+
+        enabled_chat_ids = {
+            str(workspace.get("chat_id") or "").strip()
+            for workspace in workspaces
+            if isinstance(workspace, dict)
+            and workspace.get("context_buffer") is True
+            and str(workspace.get("chat_id") or "").strip()
+        }
+        if not enabled_chat_ids:
+            return
+        self._group_buffer_chat_ids.update(enabled_chat_ids)
+
+        project_dir = (
+            get_hermes_home()
+            / "projects"
+            / "ma-secretary-interaction-system"
+        )
+        project_dir.mkdir(parents=True, exist_ok=True)
+        db_path = project_dir / "group_buffer.db"
+        self._group_buffer_db_path = db_path
+
+        import sqlite3
+
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS group_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                sender_open_id TEXT,
+                reply_to_message_id TEXT,
+                create_time INTEGER NOT NULL,
+                message_type TEXT NOT NULL DEFAULT 'text',
+                content TEXT,
+                recorded_at REAL NOT NULL
             )
-            break  # Single DB for all registered groups
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_group_msg_id
+            ON group_messages(chat_id, message_id)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_group_chat_time
+            ON group_messages(chat_id, create_time DESC)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS buffer_watermark (
+                chat_id TEXT PRIMARY KEY,
+                last_message_id TEXT,
+                last_create_time INTEGER,
+                has_gap INTEGER NOT NULL DEFAULT 0,
+                continuity_state TEXT NOT NULL DEFAULT 'unknown',
+                disconnect_epoch REAL NOT NULL DEFAULT 0.0,
+                last_reconciled_at REAL NOT NULL DEFAULT 0.0,
+                updated_at REAL NOT NULL
+            )
+        """)
+        # ── Migrate existing rows: add missing columns ─────────────────
+        try:
+            conn.execute(
+                "ALTER TABLE buffer_watermark ADD COLUMN "
+                "continuity_state TEXT NOT NULL DEFAULT 'unknown'"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                "ALTER TABLE buffer_watermark ADD COLUMN "
+                "disconnect_epoch REAL NOT NULL DEFAULT 0.0"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                "ALTER TABLE buffer_watermark ADD COLUMN "
+                "last_reconciled_at REAL NOT NULL DEFAULT 0.0"
+            )
+        except sqlite3.OperationalError:
+            pass
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.commit()
+        conn.close()
+        os.chmod(str(db_path), 0o600)
+        logger.info(
+            "[Feishu] Group context buffer initialized: chats=%d db=%s",
+            len(enabled_chat_ids),
+            db_path,
+        )
 
     def _record_to_group_buffer(
         self, chat_id: str, message_id: str, sender_open_id: str,
