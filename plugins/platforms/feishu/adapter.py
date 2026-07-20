@@ -1547,7 +1547,7 @@ class FeishuAdapter(BasePlatformAdapter):
             if not chat_id:
                 continue
             self._group_buffer_chat_ids.add(chat_id)
-            project_dir = Path.home() / ".hermes" / "projects" / "ma-secretary-interaction-system"
+            project_dir = get_hermes_home() / "projects" / "ma-secretary-interaction-system"
             project_dir.mkdir(parents=True, exist_ok=True)
             db_path = project_dir / "group_buffer.db"
             self._group_buffer_db_path = db_path
@@ -5098,7 +5098,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     def _load_project_group_registry(self) -> Optional[Dict[str, Any]]:
         """Load the project registry that defines group sender routing."""
-        registry_path = Path.home() / ".hermes" / "projects" / "ma-secretary-interaction-system" / "group-registry.yaml"
+        registry_path = get_hermes_home() / "projects" / "ma-secretary-interaction-system" / "group-registry.yaml"
         try:
             stat = registry_path.stat()
         except FileNotFoundError:
