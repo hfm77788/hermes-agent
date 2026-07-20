@@ -457,6 +457,43 @@ class TestWeixinChunkDelivery:
         sleep_mock.assert_not_awaited()
 
     @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_multichunk_send_probes_stale_token_only_once(self, send_message_mock):
+        adapter = self._connected_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 12
+        adapter._send_chunk_delay_seconds = 0
+        adapter._send_chunk_retries = 3
+        adapter._send_chunk_retry_delay_seconds = 0
+        tokens = {("test-account", "wxid_test123"): "ctx-token"}
+        adapter._token_store.get = lambda account_id, chat_id: tokens.get(
+            (account_id, chat_id)
+        )
+        adapter._token_store.delete = lambda account_id, chat_id: tokens.pop(
+            (account_id, chat_id), None
+        )
+        send_message_mock.side_effect = [
+            {
+                "ret": weixin.RATE_LIMIT_ERRCODE,
+                "errcode": None,
+                "errmsg": "rate limited",
+            },
+            {"errcode": 0},
+            {"errcode": 0},
+            {"errcode": 0},
+        ]
+
+        result = asyncio.run(
+            adapter.send("wxid_test123", "first\n\nsecond\n\nthird")
+        )
+
+        assert result.success is True
+        assert send_message_mock.await_count == 4
+        assert [
+            call.kwargs["context_token"]
+            for call in send_message_mock.await_args_list
+        ] == ["ctx-token", None, None, None]
+        assert tokens == {}
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
     def test_true_rate_limit_with_context_token_keeps_stored_token(
         self, send_message_mock
     ):
