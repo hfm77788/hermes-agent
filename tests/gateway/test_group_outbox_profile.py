@@ -19,6 +19,7 @@ class _OutboxHost(GroupOutboxMixin):
 def test_group_outbox_uses_active_hermes_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     host = _OutboxHost()
+    host.name = "test"
     host._init_group_outbox()
 
     db_path = host._ensure_outbox_db()
@@ -87,7 +88,7 @@ async def test_group_worker_uses_canonical_session_key_and_guard():
     worker = host._group_worker_tasks[chat_id]
     worker.cancel()
     with suppress(asyncio.CancelledError):
-        await worker
+        await asyncio.wait_for(worker, timeout=1.0)
 
     expected_key = build_session_key(
         source,
@@ -209,10 +210,13 @@ async def test_attachment_only_shared_group_turn_is_acked():
     host._dequeue_group_event = lambda _chat_id, _session_key: None
     host._cleanup_finished_session_task = lambda *_args, **_kwargs: None
 
-    await BasePlatformAdapter._process_message_background(
-        host,
-        event,
-        session_key,
+    await asyncio.wait_for(
+        BasePlatformAdapter._process_message_background(
+            host,
+            event,
+            session_key,
+        ),
+        timeout=1.0,
     )
 
     assert [(chat, path) for chat, path, _meta in sent_documents] == [
