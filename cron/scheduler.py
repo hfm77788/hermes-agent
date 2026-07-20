@@ -47,6 +47,20 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 
+def _log_hermes_feishu_card_failure(exc: BaseException) -> None:
+    """Log real hook failures while treating an absent optional package as disabled."""
+    missing_name = getattr(exc, "name", "") if isinstance(exc, ModuleNotFoundError) else ""
+    if missing_name == "hermes_feishu_card" or missing_name.startswith(
+        "hermes_feishu_card."
+    ):
+        return
+    logger.warning(
+        "[hermes-feishu-card] hook failed: %s: %s",
+        exc.__class__.__name__,
+        exc,
+    )
+
+
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     """Return a compact one-line failure message for chat delivery.
 
@@ -1236,11 +1250,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         if _hfc_emit_cron(locals()):
             return None
     except Exception as _hfc_exc:
-        try:
-            import sys as _hfc_sys
-            print("[hermes-feishu-card] hook failed: " + _hfc_exc.__class__.__name__ + ": " + str(_hfc_exc), file=_hfc_sys.stderr)
-        except Exception:
-            pass
+        _log_hermes_feishu_card_failure(_hfc_exc)
     # HERMES_FEISHU_CARD_CRON_PATCH_END
     targets = _resolve_delivery_targets(job)
     if not targets:
