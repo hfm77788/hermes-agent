@@ -178,13 +178,13 @@ def test_codex_manual_entry_clears_stale_status_without_singleton_overwrite(tmp_
     assert selected is not None
     assert selected.id == "cred-manual"
     assert selected.access_token == manual_token
-    assert selected.last_status is None
+    assert selected.last_status == "ok"
 
     auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
     persisted = auth_payload["credential_pool"]["openai-codex"][0]
     assert persisted["access_token"] == manual_token
     assert persisted["refresh_token"] == "rt-manual"
-    assert persisted["last_status"] is None
+    assert persisted["last_status"] == "ok"
 
 
 def test_codex_upsert_entry_matches_by_id_when_source_shared():
@@ -3312,7 +3312,18 @@ def test_codex_oauth_terminal_refresh_clears_auth_json_and_removes_pool_entries(
     assert selected is not None
     assert selected.source == "device_code"
 
-    # Add a manual API-key entry that must survive the quarantine.
+    # Add another device-code account and a manual API-key entry.  A
+    # terminal failure must remove only the selected singleton account.
+    pool.add_entry(PooledCredential.from_dict("openai-codex", {
+        "id": "backup-device",
+        "source": "device_code",
+        "auth_type": "oauth",
+        "access_token": _codex_jwt(
+            "backup@example.com",
+            "9bd29047-28e2-4c2b-90d7-6707809bb189",
+        ),
+        "refresh_token": "backup-refresh-token",
+    }))
     pool.add_entry(PooledCredential.from_dict("openai-codex", {
         "id": "manual-key",
         "source": "manual",
@@ -3335,8 +3346,11 @@ def test_codex_oauth_terminal_refresh_clears_auth_json_and_removes_pool_entries(
 
     assert pool.try_refresh_current() is None
 
-    # Only the manual entry survives.
-    assert [entry.id for entry in pool.entries()] == ["manual-key"]
+    # The failing singleton is gone; the other accounts survive.
+    assert [entry.id for entry in pool.entries()] == [
+        "backup-device",
+        "manual-key",
+    ]
 
     # Auth.json tokens must be cleared.
     auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
@@ -3347,8 +3361,11 @@ def test_codex_oauth_terminal_refresh_clears_auth_json_and_removes_pool_entries(
     assert codex_state["last_auth_error"]["code"] == "codex_refresh_failed"
     assert codex_state["last_auth_error"]["relogin_required"] is True
 
-    # Persisted pool must also have only the manual entry.
-    assert [entry["id"] for entry in auth_payload["credential_pool"]["openai-codex"]] == ["manual-key"]
+    # The persisted pool retains the healthy device and manual entries.
+    assert [
+        entry["id"]
+        for entry in auth_payload["credential_pool"]["openai-codex"]
+    ] == ["backup-device", "manual-key"]
 
     # A second try_refresh_current must not call refresh_codex_oauth_pure again.
     assert pool.try_refresh_current() is None
