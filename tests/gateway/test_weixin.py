@@ -469,6 +469,32 @@ class TestWeixinChunkDelivery:
         assert adapter.send.await_args_list[2].kwargs["content"] == "hello"
         assert sleep_mock.await_count == 2
 
+    @pytest.mark.asyncio
+    @patch("gateway.platforms.base.asyncio.sleep", new_callable=AsyncMock)
+    async def test_retryable_backpressure_without_retry_after_uses_backoff(
+        self, sleep_mock
+    ):
+        adapter = _make_adapter()
+        adapter.send = AsyncMock(
+            side_effect=[
+                SendResult(
+                    success=False,
+                    error="Too Many Requests",
+                    retryable=True,
+                ),
+                SendResult(success=True, message_id="delivered"),
+            ]
+        )
+
+        result = await adapter._send_with_retry(
+            "wxid_test123", "hello", max_retries=1, base_delay=0
+        )
+
+        assert result.success is True
+        assert adapter.send.await_count == 2
+        assert adapter.send.await_args_list[1].kwargs["content"] == "hello"
+        sleep_mock.assert_awaited_once()
+
     def _connected_adapter(self) -> WeixinAdapter:
         adapter = _make_adapter()
         adapter._session = object()

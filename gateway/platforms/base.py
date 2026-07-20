@@ -4134,6 +4134,7 @@ class BasePlatformAdapter(ABC):
         # immediately sending a second plain-text copy.
         if (
             result.retry_after is None
+            and not result.retryable
             and self._is_delivery_backpressure_error(error_str)
         ):
             return result
