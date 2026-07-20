@@ -414,9 +414,20 @@ class GroupOutboxMixin:
 
     # ── Worker lifecycle ────────────────────────────────────────────────────
 
+    def _build_group_session_key(self, event: Any) -> str:
+        """Build the same canonical key used by BasePlatformAdapter."""
+        from gateway.session import build_session_key
+
+        extra = getattr(getattr(self, "config", None), "extra", {}) or {}
+        return build_session_key(
+            event.source,
+            group_sessions_per_user=extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
+            shared_group_session_chat_ids=extra.get("shared_group_session_chat_ids"),
+        )
+
     def _start_group_worker(self, chat_id: str) -> None:
-        """Start the per-group worker that drains the outbox."""
-        # Guard: don't start duplicate workers for the same chat
+        """Start the owner-leased worker that serially drains one group."""
         existing = self._group_worker_tasks.get(chat_id)
         if existing is not None and not existing.done():
             return
@@ -425,41 +436,104 @@ class GroupOutboxMixin:
         adapter_ref = self  # type: ignore[assignment]
 
         async def _worker() -> None:
+            session_key: Optional[str] = None
             try:
                 self._recover_expired_leases(chat_id)
                 while True:
-                    # Renew owner lease each cycle
                     adapter_ref._renew_owner_lease(chat_id)
-                    evt = self._dequeue_group_event(chat_id, f"worker:{chat_id}")
+
+                    # A processing task may drain the next row from its finally
+                    # block.  Wait for that canonical session owner before
+                    # leasing more work, otherwise two responses can run in
+                    # parallel against the same conversation.
+                    if session_key and session_key in self._active_sessions:
+                        active_task = self._session_tasks.get(session_key)
+                        if active_task is not None and not active_task.done():
+                            try:
+                                await asyncio.shield(active_task)
+                            except asyncio.CancelledError:
+                                current = asyncio.current_task()
+                                if current is not None and current.cancelling():
+                                    raise
+                            except Exception:
+                                logger.error(
+                                    "[%s] Shared-group session task failed for %s",
+                                    self.name,
+                                    session_key,
+                                    exc_info=True,
+                                )
+                            continue
+                        # Heal an impossible/stale guard rather than deadlock
+                        # the durable queue forever.
+                        self._session_tasks.pop(session_key, None)
+                        self._active_sessions.pop(session_key, None)
+
+                    evt = self._dequeue_group_event(chat_id, session_key or "")
                     if evt is None:
-                        # No pending messages — wait for wakeup or timeout, then loop
+                        # Wakeups are process-local.  Poll briefly as well so
+                        # an enqueue from another adapter/process is not delayed
+                        # by the full lease timeout.
                         try:
-                            await asyncio.wait_for(self._group_wakeup.wait(), timeout=30.0)
+                            await asyncio.wait_for(
+                                self._group_wakeup.wait(),
+                                timeout=1.0,
+                            )
                         except asyncio.TimeoutError:
-                            pass  # timeout = no new messages, loop again
+                            pass
                         self._group_wakeup.clear()
                         continue
-                    session_key = f"group:{chat_id}"
+
                     try:
-                        await self._process_message_background(evt, session_key)
-                    except asyncio.CancelledError:
-                        # Immediate nack on cancel
-                        seq = getattr(evt, "_outbox_seq", None)
-                        token = getattr(evt, "_outbox_token", "")
-                        if seq is not None:
-                            self._nack_group_event(chat_id, seq, lease_token=token)
-                        raise
+                        session_key = self._build_group_session_key(evt)
                     except Exception:
-                        # Immediate nack on handler crash
                         seq = getattr(evt, "_outbox_seq", None)
                         token = getattr(evt, "_outbox_token", "")
                         if seq is not None:
-                            self._nack_group_event(chat_id, seq, lease_token=token)
-                        logger.error("[%s] Group worker handler crashed for seq=%s", self.name, seq, exc_info=True)
+                            self._nack_group_event(
+                                chat_id,
+                                seq,
+                                lease_token=token,
+                                permanent=True,
+                            )
+                        logger.error(
+                            "[%s] Cannot build session key for shared-group row %s",
+                            self.name,
+                            seq,
+                            exc_info=True,
+                        )
+                        continue
+
+                    # A live handler may have claimed the same session between
+                    # the loop check and the row lease.  Return the row and let
+                    # that owner drain it from its normal completion path.
+                    if session_key in self._active_sessions:
+                        self._nack_group_event(
+                            chat_id,
+                            getattr(evt, "_outbox_seq"),
+                            lease_token=getattr(evt, "_outbox_token", ""),
+                        )
+                        continue
+
+                    try:
+                        started = self._start_session_processing(evt, session_key)
+                    except Exception:
+                        started = False
+                        logger.error(
+                            "[%s] Failed to start shared-group session %s",
+                            self.name,
+                            session_key,
+                            exc_info=True,
+                        )
+                    if not started:
+                        self._nack_group_event(
+                            chat_id,
+                            getattr(evt, "_outbox_seq"),
+                            lease_token=getattr(evt, "_outbox_token", ""),
+                        )
+                        await asyncio.sleep(0.1)
             except asyncio.CancelledError:
                 pass
             finally:
-                # Release owner lease on exit
                 adapter_ref._release_owner_lease(chat_id)
 
         task = asyncio.create_task(_worker())
