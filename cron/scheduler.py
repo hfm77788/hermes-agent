@@ -1228,6 +1228,20 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     Returns None on success, or an error string on failure.
     """
+    # HERMES_FEISHU_CARD_CRON_PATCH_BEGIN
+    try:
+        from hermes_feishu_card.hook_runtime import emit_cron_delivery as _hfc_emit_cron
+        _hfc_cron_metadata = {"delivery_kind": "cron"}
+        # event_name="message.completed"
+        if _hfc_emit_cron(locals()):
+            return None
+    except Exception as _hfc_exc:
+        try:
+            import sys as _hfc_sys
+            print("[hermes-feishu-card] hook failed: " + _hfc_exc.__class__.__name__ + ": " + str(_hfc_exc), file=_hfc_sys.stderr)
+        except Exception:
+            pass
+    # HERMES_FEISHU_CARD_CRON_PATCH_END
     targets = _resolve_delivery_targets(job)
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))

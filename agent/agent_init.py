@@ -1026,6 +1026,29 @@ def init_agent(
             print(f"🔄 Fallback chain ({len(agent._fallback_chain)} providers): " +
                   " → ".join(f"{f['model']} ({f['provider']})" for f in agent._fallback_chain))
 
+    # ── Credential pool viability check (session startup) ──────────────
+    # When the agent is configured with a provider that uses credential
+    # pooling (openai-codex), check at session init whether the pool has
+    # any viable entries.  If not, the system prompt's Model: line will
+    # report the first fallback model instead of the configured model,
+    # because the first API call will immediately fallback.
+    # Uses peek() which is read-only — no credential rotation, no network
+    # calls, no side effects.  Safe to call during session init.
+    agent._credential_pool_viable = True
+    if (agent.provider == "openai-codex"
+            and agent._credential_pool is not None
+            and agent._fallback_chain):
+        try:
+            peeked = agent._credential_pool.peek()
+            if peeked is None:
+                agent._credential_pool_viable = False
+                fb = agent._fallback_chain[0]
+                if not agent.quiet_mode:
+                    print(f"⚠️  Credential pool exhausted for {agent.provider} — "
+                          f"system prompt will report fallback model: {fb['model']} ({fb['provider']})")
+        except Exception:
+            pass  # Pool check is best-effort — don't block init
+
     # Get available tools with filtering. Capture the registry generation this
     # snapshot is derived from FIRST, so a later concurrent refresh can tell
     # whether it holds a newer or staler view (see refresh_agent_mcp_tools).

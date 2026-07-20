@@ -669,6 +669,34 @@ class CredentialPool:
         """
         if self.provider != "openai-codex" or entry.source != "device_code":
             return entry
+        # Multi-account Codex pool: the singleton only reflects the most
+        # recent device-code login.  Syncing from it would overwrite one
+        # pool entry with another account's identity, causing serial-number
+        # drift.  Per-entry tokens are the source of truth in this case.
+        device_code_entries = [e for e in self._entries if e.source == "device_code"]
+        if len(device_code_entries) > 1:
+            # Still clear stale DEAD markers so the entry can self-recover
+            # via _refresh_entry later in _available_entries.  Do NOT clear
+            # exhausted_until (ChatGPT weekly quota) — that TTL is intentional.
+            if entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD} and entry.access_token:
+                exhausted_until = _exhausted_until(entry)
+                now = datetime.now(timezone.utc).timestamp()
+                # DEAD: clear immediately (no TTL makes sense for dead-in-pool)
+                # EXHAUSTED: only clear if the cooldown has actually passed
+                if entry.last_status == STATUS_DEAD and entry.access_token:
+                    updated = replace(
+                        entry,
+                        last_status=None,
+                        last_status_at=None,
+                        last_error_code=None,
+                        last_error_reason=None,
+                        last_error_message=None,
+                        last_error_reset_at=None,
+                    )
+                    self._replace_entry(entry, updated)
+                    self._persist()
+                    return updated
+            return entry
         try:
             with _auth_store_lock():
                 auth_store = _load_auth_store()
@@ -1238,17 +1266,20 @@ class CredentialPool:
                         logger.debug(
                             "Failed to clear terminal Codex OAuth state: %s", clear_exc
                         )
-                    removed_ids = [
-                        item.id for item in self._entries
-                        if item.source == "device_code"
-                    ]
-                    self._entries = [
-                        item for item in self._entries
-                        if item.source != "device_code"
-                    ]
+                    # Mark this specific entry as DEAD — do not remove
+                    # other entries from a multi-account pool.
+                    dead_entry = replace(
+                        entry,
+                        last_status=STATUS_DEAD,
+                        last_status_at=time.time(),
+                        last_error_code=getattr(exc, 'status_code', None) or 401,
+                        last_error_reason=getattr(exc, 'code', 'refresh_token_invalidated'),
+                        last_error_message=str(exc),
+                    )
+                    self._replace_entry(entry, dead_entry)
                     if self._current_id == entry.id:
                         self._current_id = None
-                    self._persist(removed_ids=removed_ids)
+                    self._persist()
                     return None
             # For nous: another process may have consumed the refresh token
             # between our proactive sync and the HTTP call.  Re-sync from
@@ -2041,6 +2072,13 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         # existing Codex CLI credentials get a one-time, explicit prompt
         # via `hermes auth openai-codex`.
         if isinstance(tokens, dict) and tokens.get("access_token"):
+            # Multi-account Codex pool must NOT be re-seeded from the
+            # singleton because the singleton only reflects the most
+            # recent device-code login and would overwrite one pool entry
+            # with another account's identity.
+            existing_device_code = [e for e in entries if e.source == "device_code"]
+            if len(existing_device_code) > 1:
+                return changed, active_sources
             active_sources.add("device_code")
             custom_label = str(state.get("label") or "").strip()
             changed |= _upsert_entry(

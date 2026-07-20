@@ -558,6 +558,7 @@ class GatewayConfig:
     # Session isolation in shared chats
     group_sessions_per_user: bool = True  # Isolate group/channel sessions per participant when user IDs are available
     thread_sessions_per_user: bool = False  # When False (default), threads are shared across all participants
+    shared_group_session_chat_ids: List[str] = field(default_factory=list)  # Chat IDs that force shared sessions (group_sessions_per_user=False)
     max_concurrent_sessions: Optional[int] = None  # Positive int caps simultaneous active chat sessions
 
     # Multi-profile multiplexing (opt-in; default off preserves one-gateway-per-profile).
@@ -679,6 +680,7 @@ class GatewayConfig:
             "stt_enabled": self.stt_enabled,
             "group_sessions_per_user": self.group_sessions_per_user,
             "thread_sessions_per_user": self.thread_sessions_per_user,
+            "shared_group_session_chat_ids": list(self.shared_group_session_chat_ids),
             "max_concurrent_sessions": self.max_concurrent_sessions,
             "multiplex_profiles": self.multiplex_profiles,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
@@ -753,6 +755,11 @@ class GatewayConfig:
         except (TypeError, ValueError):
             session_store_max_age_days = 90
 
+        shared_group_session_chat_ids_raw = data.get("shared_group_session_chat_ids")
+        shared_group_session_chat_ids: List[str] = []
+        if isinstance(shared_group_session_chat_ids_raw, list):
+            shared_group_session_chat_ids = [str(x) for x in shared_group_session_chat_ids_raw if x]
+
         return cls(
             platforms=platforms,
             default_reset_policy=default_policy,
@@ -768,6 +775,7 @@ class GatewayConfig:
             stt_enabled=_coerce_bool(stt_enabled, True),
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
+            shared_group_session_chat_ids=shared_group_session_chat_ids,
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
@@ -874,6 +882,9 @@ def load_gateway_config() -> GatewayConfig:
 
             if "thread_sessions_per_user" in yaml_cfg:
                 gw_data["thread_sessions_per_user"] = yaml_cfg["thread_sessions_per_user"]
+
+            if "shared_group_session_chat_ids" in yaml_cfg:
+                gw_data["shared_group_session_chat_ids"] = yaml_cfg["shared_group_session_chat_ids"]
 
             # Multiplexing flag: accept both the top-level key and the nested
             # gateway.multiplex_profiles form (from_dict resolves the nested
@@ -1042,7 +1053,7 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["group_allow_admin_from"] = platform_cfg["group_allow_admin_from"]
                 if "group_user_allowed_commands" in platform_cfg:
                     bridged["group_user_allowed_commands"] = platform_cfg["group_user_allowed_commands"]
-                if plat in {Platform.DISCORD, Platform.SLACK} and "channel_skill_bindings" in platform_cfg:
+                if plat in {Platform.DISCORD, Platform.SLACK, Platform.FEISHU} and "channel_skill_bindings" in platform_cfg:
                     bridged["channel_skill_bindings"] = platform_cfg["channel_skill_bindings"]
                 if "channel_prompts" in platform_cfg:
                     channel_prompts = platform_cfg["channel_prompts"]

@@ -28,6 +28,7 @@ def _build_adapter(extra=None):
     adapter._resolve_sender_profile = AsyncMock(
         return_value={"user_id": "u1", "user_name": "Alice", "user_id_alt": None}
     )
+    adapter._maybe_persist_sender_memory_request = AsyncMock(return_value=None)
     adapter._resolve_source_chat_type = Mock(return_value="group")
     adapter.build_source = Mock(return_value=SimpleNamespace(thread_id=None))
     adapter._dispatch_inbound_event = AsyncMock()
@@ -86,3 +87,24 @@ def test_inbound_event_no_prompt_when_unconfigured():
     adapter = _build_adapter({"channel_prompts": {"oc_other": "Different chat."}})
     event = _run_inbound(adapter, chat_id="oc_chat")
     assert event.channel_prompt is None
+
+
+def test_extract_sender_memory_payload_supports_directive():
+    from plugins.platforms.feishu.adapter import FeishuAdapter
+
+    assert FeishuAdapter._extract_sender_memory_payload("记住老板特别帅") == "老板特别帅"
+    assert FeishuAdapter._extract_sender_memory_payload("偏好：叫我小年糕") == "叫我小年糕"
+    assert FeishuAdapter._extract_sender_memory_payload("今天开会") is None
+
+
+def test_inbound_event_appends_platform_memory_note():
+    adapter = _build_adapter({"channel_prompts": {"oc_chat": "Feishu role prompt."}})
+    adapter._maybe_persist_sender_memory_request = AsyncMock(
+        return_value="[平台侧记忆已写入]\n对象：小年糕\nbank：xiaoniangao_v2_bge_m3\n内容：老板特别帅"
+    )
+
+    event = _run_inbound(adapter, chat_id="oc_chat")
+
+    assert "Feishu role prompt." in event.channel_prompt
+    assert "[平台侧记忆已写入]" in event.channel_prompt
+    assert "xiaoniangao_v2_bge_m3" in event.channel_prompt

@@ -24,7 +24,7 @@ from tools.registry import registry
 logger = logging.getLogger(__name__)
 
 
-HINDSIGHT_API_URL = os.environ.get("HINDSIGHT_API_URL", "http://localhost:8888")
+HINDSIGHT_API_URL = os.environ.get("HINDSIGHT_API_URL", "http://localhost:8889")
 DEFAULT_BANK_ID = os.environ.get("HINDSIGHT_BANK_ID", "hermes")
 DEFAULT_TIMEOUT = 30
 
