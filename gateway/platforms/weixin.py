@@ -1795,24 +1795,26 @@ class WeixinAdapter(BasePlatformAdapter):
                             or errcode == SESSION_EXPIRED_ERRCODE
                             or _is_stale_session_ret(ret, errcode, resp.get("errmsg"))
                         )
-                        # Session expired — strip token and retry once
-                        if (
-                            is_session_expired
-                            and not retried_without_token
-                            and context_token
-                            and attempt < self._send_chunk_retries
-                        ):
-                            retried_without_token = True
-                            stale_context_token = context_token
-                            context_token = None
-                            self._token_store.delete_if_matches(
-                                self._account_id, chat_id, stale_context_token
+                        # Session expired — strip the token even when retries
+                        # are disabled, so future sends do not replay it.
+                        if is_session_expired:
+                            if context_token and not retried_without_token:
+                                stale_context_token = context_token
+                                self._token_store.delete_if_matches(
+                                    self._account_id, chat_id, stale_context_token
+                                )
+                                if attempt < self._send_chunk_retries:
+                                    retried_without_token = True
+                                    context_token = None
+                                    logger.warning(
+                                        "[%s] session expired for %s; retrying without context_token",
+                                        self.name, _safe_id(chat_id),
+                                    )
+                                    continue
+                            errmsg = resp.get("errmsg") or resp.get("msg") or "session expired"
+                            raise RuntimeError(
+                                f"iLink sendmessage session expired: ret={ret} errcode={errcode} errmsg={errmsg}"
                             )
-                            logger.warning(
-                                "[%s] session expired for %s; retrying without context_token",
-                                self.name, _safe_id(chat_id),
-                            )
-                            continue
                         # Rate limit (-2) is ambiguous in iLink: a stale
                         # context_token can produce the same response as a
                         # genuine throttle. Retry once without the token before

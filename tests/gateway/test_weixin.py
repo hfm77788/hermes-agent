@@ -754,6 +754,39 @@ class TestWeixinChunkDelivery:
         assert send_message_mock.await_count == 1
         assert send_message_mock.await_args.kwargs["context_token"] == "ctx-token"
 
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_zero_retry_budget_clears_confirmed_stale_token(
+        self, send_message_mock, tmp_path
+    ):
+        for response in (
+            {
+                "errcode": weixin.SESSION_EXPIRED_ERRCODE,
+                "errmsg": "session expired",
+            },
+            {
+                "ret": weixin.RATE_LIMIT_ERRCODE,
+                "errmsg": "unknown error",
+            },
+        ):
+            adapter = self._connected_adapter()
+            adapter._send_chunk_retries = 0
+            adapter._token_store = ContextTokenStore(str(tmp_path))
+            adapter._token_store.set(
+                "test-account", "wxid_test123", "ctx-token"
+            )
+            send_message_mock.reset_mock()
+            send_message_mock.return_value = response
+
+            result = asyncio.run(adapter.send("wxid_test123", "stale"))
+
+            assert result.success is False
+            assert "cooldown" not in (result.error or "")
+            assert adapter._token_store.get(
+                "test-account", "wxid_test123"
+            ) is None
+            assert send_message_mock.await_count == 1
+            assert send_message_mock.await_args.kwargs["context_token"] == "ctx-token"
+
     @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
     @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
     def test_repeated_rate_limits_open_circuit_for_followup_sends(self, send_message_mock, sleep_mock):
