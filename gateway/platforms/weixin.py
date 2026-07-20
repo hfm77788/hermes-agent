@@ -1772,6 +1772,7 @@ class WeixinAdapter(BasePlatformAdapter):
         last_error: Optional[Exception] = None
         retried_without_token = False
         probed_context_token: Optional[str] = None
+        tokenless_probe_rate_limited = False
         for attempt in range(self._send_chunk_retries + 1):
             if self._rate_limit_cooldown_remaining() > 0:
                 raise self._rate_limit_error()
@@ -1841,6 +1842,8 @@ class WeixinAdapter(BasePlatformAdapter):
                             )
                             continue
                         if is_rate_limited:
+                            if probed_context_token and context_token is None:
+                                tokenless_probe_rate_limited = True
                             errmsg = resp.get("errmsg") or resp.get("msg") or "rate limited"
                             # Record the error so we raise a descriptive
                             # RuntimeError (instead of AssertionError) if the
@@ -1864,7 +1867,7 @@ class WeixinAdapter(BasePlatformAdapter):
                         raise RuntimeError(
                             f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg}"
                         )
-                if probed_context_token:
+                if probed_context_token and not tokenless_probe_rate_limited:
                     # The tokenless probe succeeded, confirming that the stored
                     # token was stale rather than the account being throttled.
                     # Remove that exact value durably, but preserve a newer token

@@ -750,6 +750,38 @@ class TestWeixinChunkDelivery:
         assert adapter._rate_limit_cooldown_remaining() > 0
 
     @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_tokenless_rate_limit_never_deletes_original_token_on_later_success(
+        self, send_message_mock
+    ):
+        adapter = self._connected_adapter()
+        adapter._send_chunk_retries = 2
+        adapter._send_chunk_retry_delay_seconds = 0
+        adapter._rate_limit_circuit_threshold = 3
+        send_message_mock.side_effect = [
+            {
+                "ret": weixin.RATE_LIMIT_ERRCODE,
+                "errcode": None,
+                "errmsg": "rate limited",
+            },
+            {
+                "ret": weixin.RATE_LIMIT_ERRCODE,
+                "errcode": weixin.RATE_LIMIT_ERRCODE,
+                "errmsg": "frequency limit",
+            },
+            {"errcode": 0},
+        ]
+
+        with patch.object(adapter._token_store, "delete_if_matches") as delete_mock:
+            result = asyncio.run(adapter.send("wxid_test123", "recover"))
+
+        assert result.success is True
+        assert send_message_mock.await_count == 3
+        assert [
+            call.kwargs["context_token"] for call in send_message_mock.await_args_list
+        ] == ["ctx-token", None, None]
+        delete_mock.assert_not_called()
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
     def test_true_rate_limit_without_context_token_opens_circuit_once(
         self, send_message_mock
     ):
