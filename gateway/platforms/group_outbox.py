@@ -19,6 +19,8 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
+from hermes_constants import get_hermes_home
+
 if TYPE_CHECKING:
     from gateway.platforms.base import MessageEvent
 
@@ -59,7 +61,7 @@ class GroupOutboxMixin:
     def _ensure_outbox_db(self) -> Path:
         if self._group_outbox_db_path is not None:
             return self._group_outbox_db_path
-        db_path = Path.home() / ".hermes" / "data" / "group_session_outbox.db"
+        db_path = get_hermes_home() / "data" / "group_session_outbox.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(db_path))
         conn.execute("PRAGMA busy_timeout=5000")
