@@ -1800,6 +1800,7 @@ class WeixinAdapter(BasePlatformAdapter):
                             is_rate_limited
                             and context_token
                             and not retried_without_token
+                            and attempt < self._send_chunk_retries
                         ):
                             retried_without_token = True
                             context_token = None
@@ -1807,7 +1808,7 @@ class WeixinAdapter(BasePlatformAdapter):
                                 self._token_store._key(self._account_id, chat_id), None
                             )
                             logger.warning(
-                                "[%s] ret=-2 for %s; retrying once without context_token",
+                                "[%s] iLink rate-limit code for %s; retrying once without context_token",
                                 self.name,
                                 _safe_id(chat_id),
                             )
