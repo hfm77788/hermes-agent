@@ -5097,6 +5097,7 @@ def _is_terminal_codex_oauth_refresh_error(exc: Exception) -> bool:
             "codex_auth_missing_refresh_token",
             "invalid_grant",
             "invalid_token",
+            "refresh_token_invalidated",
             "refresh_token_reused",
         }
         and bool(exc.relogin_required)

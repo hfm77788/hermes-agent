@@ -1706,6 +1706,20 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _log_hermes_feishu_card_failure(exc: BaseException) -> None:
+    """Log real hook failures while treating an absent optional package as disabled."""
+    missing_name = getattr(exc, "name", "") if isinstance(exc, ModuleNotFoundError) else ""
+    if missing_name == "hermes_feishu_card" or missing_name.startswith(
+        "hermes_feishu_card."
+    ):
+        return
+    logger.warning(
+        "[hermes-feishu-card] hook failed: %s: %s",
+        exc.__class__.__name__,
+        exc,
+    )
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -3310,6 +3324,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
             profile=_profile,
+            shared_group_session_chat_ids=getattr(config, "shared_group_session_chat_ids", None),
         )
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
@@ -6651,6 +6666,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         error_message=None,
                     )
                     logger.info("✓ %s connected", platform.value)
+                    # ── Group outbox startup recovery ──
+                    if hasattr(adapter, "recover_group_outbox_on_startup"):
+                        try:
+                            n = adapter.recover_group_outbox_on_startup()
+                            if n:
+                                logger.info(
+                                    "Group outbox startup recovery: %d worker(s) restarted for %s",
+                                    n, platform.value,
+                                )
+                        except Exception:
+                            logger.warning(
+                                "Group outbox startup recovery failed for %s",
+                                platform.value, exc_info=True,
+                            )
                 else:
                     logger.warning("✗ %s failed to connect", platform.value)
                     # Defensive cleanup: a failed connect() may have
@@ -7121,6 +7150,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             dest_source,
             group_sessions_per_user=extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
+            shared_group_session_chat_ids=getattr(self.config, "shared_group_session_chat_ids", None),
         )
 
         # Make sure there's an entry in the session_store for this key. If
@@ -8193,6 +8223,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "thread_sessions_per_user",
                 getattr(self.config, "thread_sessions_per_user", False),
             )
+            config.extra.setdefault(
+                "shared_group_session_chat_ids",
+                getattr(self.config, "shared_group_session_chat_ids", []),
+            )
 
         # ── Plugin-registered platforms (checked first) ───────────────────
         try:
@@ -8826,6 +8860,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         auto_skill=event.auto_skill,
                         channel_prompt=event.channel_prompt,
                         internal=event.internal,
+                        metadata=dict(getattr(event, "metadata", {}) or {}),
                         timestamp=event.timestamp,
                     )
                     self._enqueue_fifo(_quick_key, queued_event, adapter)
@@ -8854,6 +8889,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             source=event.source,
                             message_id=event.message_id,
                             channel_prompt=event.channel_prompt,
+                            metadata=dict(getattr(event, "metadata", {}) or {}),
                         )
                         adapter._pending_messages[_quick_key] = queued_event
                     return "Agent still starting — /steer queued for the next turn."
@@ -8876,6 +8912,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         source=event.source,
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
+                        metadata=dict(getattr(event, "metadata", {}) or {}),
                     )
                     adapter._pending_messages[_quick_key] = queued_event
                 return "No active agent — /steer queued for the next turn."
@@ -9635,6 +9672,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _unavail_msg = _check_unavailable_skill(command)
                     if _unavail_msg:
                         return _unavail_msg
+                    # Last-chance check for user-defined quick commands of type "exec".
+                    # The main quick-command block above (line ~8520) normally catches
+                    # these, but it can be skipped when the session is in a startup /
+                    # draining / busy state.  This fallthrough guard runs the exec
+                    # command inline so the user never sees "Unknown command" for a
+                    # configured quick-command shortcut.
+                    if isinstance(self.config, dict):
+                        _fallback_qc = self.config.get("quick_commands", {}) or {}
+                    else:
+                        _fallback_qc = getattr(self.config, "quick_commands", {}) or {}
+                    if isinstance(_fallback_qc, dict) and command in _fallback_qc:
+                        _fqc = _fallback_qc[command]
+                        if _fqc.get("type") == "exec":
+                            exec_cmd = _fqc.get("command", "")
+                            if exec_cmd:
+                                try:
+                                    from tools.environments.local import _sanitize_subprocess_env
+                                    sanitized_env = _sanitize_subprocess_env(os.environ.copy())
+                                    proc = await asyncio.create_subprocess_shell(
+                                        exec_cmd,
+                                        stdout=asyncio.subprocess.PIPE,
+                                        stderr=asyncio.subprocess.PIPE,
+                                        env=sanitized_env,
+                                    )
+                                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+                                    output = (stdout or stderr).decode().strip()
+                                    if output:
+                                        from agent.redact import redact_sensitive_text
+                                        output = redact_sensitive_text(output)
+                                    return output if output else f"`/{command}` executed (no output)"
+                                except asyncio.TimeoutError:
+                                    return f"Quick command `/{command}` timed out (30s)."
+                                except Exception as e:
+                                    return f"Quick command `/{command}` error: {e}"
+                            return f"Quick command `/{command}` has no command defined."
                     # Genuinely unrecognized /command: not a built-in, not a
                     # plugin, not a skill, not a known-inactive skill. Warn
                     # the user instead of silently forwarding it to the LLM
@@ -9824,6 +9896,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source,
             group_sessions_per_user=_group_sessions_per_user,
             thread_sessions_per_user=_thread_sessions_per_user,
+            shared_group_session_chat_ids=getattr(self.config, "shared_group_session_chat_ids", None),
         )
         if _is_shared_multi_user and source.user_name:
             message_text = f"[{source.user_name}] {message_text}"
@@ -10128,15 +10201,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        # HERMES_FEISHU_CARD_PATCH_BEGIN
+        # HERMES_FEISHU_CARD_STRATEGY gateway_run_013_plus
+        try:
+            from hermes_feishu_card.hook_runtime import emit_from_hermes_locals as _hfc_emit
+            _hfc_started_message_id = None
+            try:
+                _hfc_started_message_id = self._reply_anchor_for_event(event)
+            except Exception:
+                _hfc_started_message_id = getattr(event, "message_id", None)
+            _hfc_emit({**locals(), "message_id": _hfc_started_message_id})
+        except Exception as _hfc_exc:
+            _log_hermes_feishu_card_failure(_hfc_exc)
+        # HERMES_FEISHU_CARD_PATCH_END
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         _reply_id = getattr(event, "reply_to_message_id", None)
         _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
+        _sender_meta = getattr(event, "metadata", None) or {}
         logger.info(
-            "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
-            _platform_name, source.user_name or source.user_id or "unknown",
-            source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
+            "inbound message: platform=%s user=%s chat=%s sender_open_id=%s sender_user_id=%s sender_union_id=%s sender_role=%s msg=%r reply_to_id=%s reply_to_text=%r",
+            _platform_name,
+            source.user_name or source.user_id or "unknown",
+            source.chat_id or "unknown",
+            _sender_meta.get("sender_open_id") or source.user_id or "<missing>",
+            _sender_meta.get("sender_user_id") or "<missing>",
+            _sender_meta.get("sender_union_id") or source.user_id_alt or "<missing>",
+            _sender_meta.get("sender_role") or "<missing>",
+            _msg_preview,
+            _reply_id,
+            _reply_txt,
         )
 
         # Get or create session
@@ -11433,6 +11528,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.debug("trailing footer send failed: %s", _e)
                 return None
 
+            # HERMES_FEISHU_CARD_COMPLETE_PATCH_BEGIN
+            try:
+                from hermes_feishu_card.hook_runtime import build_event as _hfc_build_event
+                from hermes_feishu_card.hook_runtime import emit_from_hermes_locals_async as _hfc_emit_async
+                from hermes_feishu_card.hook_runtime import should_suppress_native_response as _hfc_should_suppress
+                _hfc_completed_locals = {
+                    **locals(),
+                    "answer": response,
+                    "duration": _response_time,
+                    "model": agent_result.get("model", ""),
+                    "tokens": {
+                        "input_tokens": agent_result.get("input_tokens", 0),
+                        "output_tokens": agent_result.get("output_tokens", 0),
+                    },
+                    "context": {
+                        "used_tokens": agent_result.get("last_prompt_tokens", 0),
+                        "max_tokens": agent_result.get("context_length", 0),
+                    },
+                }
+                _hfc_completed_event = _hfc_build_event("message.completed", _hfc_completed_locals, preview=True)
+                _hfc_attachments = []
+                if _hfc_completed_event is not None:
+                    _hfc_attachments = _hfc_completed_event.get("data", {}).get("attachments", [])
+                _hfc_card_delivered = await _hfc_emit_async(_hfc_completed_locals, event_name="message.completed")
+                _hfc_platform = getattr(source.platform, "value", source.platform)
+                if _hfc_should_suppress(_hfc_platform, _hfc_card_delivered, _hfc_attachments):
+                    return None
+            except Exception as _hfc_exc:
+                _log_hermes_feishu_card_failure(_hfc_exc)
+            # HERMES_FEISHU_CARD_COMPLETE_PATCH_END
             return response
             
         except Exception as e:
@@ -16089,6 +16214,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
+            # HERMES_FEISHU_CARD_TOOL_PATCH_BEGIN
+            try:
+                from hermes_feishu_card.hook_runtime import emit_from_hermes_locals_threadsafe as _hfc_emit_threadsafe
+                if event_type in ("tool.started", "tool.completed") and _run_still_current():
+                    if _hfc_emit_threadsafe({
+                        **locals(),
+                        "source": source,
+                        "message_id": event_message_id,
+                        "_hfc_loop": _loop_for_step,
+                        "tool_id": tool_name or "tool",
+                        "name": tool_name or "tool",
+                        "status": "completed" if event_type == "tool.completed" else "running",
+                        "detail": preview or "",
+                    }, event_name="tool.updated"):
+                        return
+            except Exception as _hfc_exc:
+                _log_hermes_feishu_card_failure(_hfc_exc)
+            # HERMES_FEISHU_CARD_TOOL_PATCH_END
             if not progress_queue or not _run_still_current():
                 return
 
@@ -16893,6 +17036,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         if _want_stream_deltas:
                             def _stream_delta_cb(text: str) -> None:
+                                # HERMES_FEISHU_CARD_ANSWER_DELTA_PATCH_BEGIN
+                                try:
+                                    from hermes_feishu_card.hook_runtime import emit_from_hermes_locals_threadsafe as _hfc_emit_threadsafe
+                                    if text and _run_still_current():
+                                        if _hfc_emit_threadsafe({
+                                            **locals(),
+                                            "source": source,
+                                            "message_id": event_message_id,
+                                            "_hfc_loop": _loop_for_step,
+                                            "text": text,
+                                        }, event_name="answer.delta"):
+                                            return
+                                except Exception as _hfc_exc:
+                                    _log_hermes_feishu_card_failure(_hfc_exc)
+                                # HERMES_FEISHU_CARD_ANSWER_DELTA_PATCH_END
                                 if _run_still_current():
                                     _stream_consumer.on_delta(text)
                         stream_consumer_holder[0] = _stream_consumer
@@ -16900,6 +17058,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
 
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+                # HERMES_FEISHU_CARD_THINKING_DELTA_PATCH_BEGIN
+                try:
+                    from hermes_feishu_card.hook_runtime import emit_from_hermes_locals_threadsafe as _hfc_emit_threadsafe
+                    if text and not already_streamed and _run_still_current():
+                        if _hfc_emit_threadsafe({
+                            **locals(),
+                            "source": source,
+                            "message_id": event_message_id,
+                            "_hfc_loop": _loop_for_step,
+                            "text": text,
+                            "mode": "append_block",
+                        }, event_name="thinking.delta"):
+                            return
+                except Exception as _hfc_exc:
+                    _log_hermes_feishu_card_failure(_hfc_exc)
+                # HERMES_FEISHU_CARD_THINKING_DELTA_PATCH_END
                 if not _run_still_current():
                     return
                 if _stream_consumer is not None:
@@ -17221,6 +17395,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # rather than hang forever).
             # ------------------------------------------------------------------
             def _clarify_callback_sync(question: str, choices) -> str:
+                # HERMES_FEISHU_CARD_CLARIFY_PATCH_BEGIN
+                try:
+                    from hermes_feishu_card.hook_runtime import request_clarify_response_from_hermes_locals as _hfc_request_clarify
+                    from uuid import uuid4 as _hfc_uuid4
+                    if choices and _run_still_current():
+                        _hfc_clarify_response = _hfc_request_clarify({
+                            **locals(),
+                            "source": source,
+                            "chat_id": _status_chat_id,
+                            "conversation_id": session_key or _status_chat_id,
+                            "message_id": event_message_id,
+                            "_hfc_loop": locals().get("_loop_for_step"),
+                            "kind": "clarify",
+                        }, interaction_id="clarify_" + _hfc_uuid4().hex[:10], question=question, choices=choices)
+                        if _hfc_clarify_response is not None:
+                            return _hfc_clarify_response
+                except Exception as _hfc_exc:
+                    _log_hermes_feishu_card_failure(_hfc_exc)
+                # HERMES_FEISHU_CARD_CLARIFY_PATCH_END
                 from tools import clarify_gateway as _clarify_mod
                 import uuid as _uuid
 
@@ -17364,6 +17557,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # is active.  The approval message send auto-clears the Slack
                 # status; pausing prevents _keep_typing from re-setting it.
                 # Typing resumes in _handle_approve_command/_handle_deny_command.
+                # HERMES_FEISHU_CARD_APPROVAL_PATCH_BEGIN
+                try:
+                    from hermes_feishu_card.hook_runtime import request_approval_choice_from_hermes_locals as _hfc_request_approval
+                    from uuid import uuid4 as _hfc_uuid4
+                    if _run_still_current():
+                        _hfc_approval_choice = _hfc_request_approval({
+                            **locals(),
+                            "source": source,
+                            "chat_id": _status_chat_id,
+                            "conversation_id": _approval_session_key or _status_chat_id,
+                            "message_id": event_message_id,
+                            "_hfc_loop": locals().get("_loop_for_step"),
+                        }, approval_data, interaction_id="approval_" + _hfc_uuid4().hex[:10])
+                        if _hfc_approval_choice:
+                            from tools.approval import resolve_gateway_approval as _hfc_resolve_gateway_approval
+                            _hfc_resolve_gateway_approval(_approval_session_key, _hfc_approval_choice)
+                            return
+                except Exception as _hfc_exc:
+                    _log_hermes_feishu_card_failure(_hfc_exc)
+                # HERMES_FEISHU_CARD_APPROVAL_PATCH_END
                 _status_adapter.pause_typing_for_chat(_status_chat_id)
 
                 cmd = approval_data.get("command", "")
@@ -18542,6 +18755,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         first_response,
                         previewed=_previewed,
                     )
+                    # HERMES_FEISHU_CARD_QUEUED_COMPLETE_PATCH_BEGIN
+                    try:
+                        from hermes_feishu_card.hook_runtime import build_event as _hfc_build_event
+                        from hermes_feishu_card.hook_runtime import emit_from_hermes_locals_async as _hfc_emit_async
+                        from hermes_feishu_card.hook_runtime import should_suppress_native_response as _hfc_should_suppress
+                        if first_response and not _already_streamed:
+                            _hfc_completed_locals = {
+                                **locals(),
+                                "answer": first_response,
+                                "duration": result.get("duration", 0.0) if isinstance(result, dict) else 0.0,
+                                "model": result.get("model", "") if isinstance(result, dict) else "",
+                                "tokens": {
+                                    "input_tokens": result.get("input_tokens", 0) if isinstance(result, dict) else 0,
+                                    "output_tokens": result.get("output_tokens", 0) if isinstance(result, dict) else 0,
+                                },
+                                "context": {
+                                    "used_tokens": result.get("last_prompt_tokens", 0) if isinstance(result, dict) else 0,
+                                    "max_tokens": result.get("context_length", 0) if isinstance(result, dict) else 0,
+                                },
+                            }
+                            _hfc_completed_event = _hfc_build_event("message.completed", _hfc_completed_locals, preview=True)
+                            _hfc_attachments = []
+                            if _hfc_completed_event is not None:
+                                _hfc_attachments = _hfc_completed_event.get("data", {}).get("attachments", [])
+                            _hfc_card_delivered = await _hfc_emit_async(_hfc_completed_locals, event_name="message.completed")
+                            _hfc_platform = getattr(source.platform, "value", source.platform)
+                            if _hfc_should_suppress(_hfc_platform, _hfc_card_delivered, _hfc_attachments):
+                                _already_streamed = True
+                    except Exception as _hfc_exc:
+                        _log_hermes_feishu_card_failure(_hfc_exc)
+                    # HERMES_FEISHU_CARD_QUEUED_COMPLETE_PATCH_END
                     if first_response and not _already_streamed:
                         try:
                             logger.info(

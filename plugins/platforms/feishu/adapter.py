@@ -71,6 +71,15 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+import yaml
+
+from plugins.platforms.feishu.group_registry import (
+    GroupRegistryLoader,
+    RegistryError,
+    SenderResolutionError,
+    CatalogKeyError,
+)
+
 # aiohttp/websockets are independent optional deps — import outside lark_oapi
 # so they remain available for tests and webhook mode even if lark_oapi is missing.
 try:
@@ -101,6 +110,8 @@ try:
         P2ImMessageMessageReadV1,
         ReplyMessageRequest,
         ReplyMessageRequestBody,
+        PatchMessageRequest,
+        PatchMessageRequestBody,
         UpdateMessageRequest,
         UpdateMessageRequestBody,
     )
@@ -129,6 +140,7 @@ FEISHU_WEBSOCKET_AVAILABLE = websockets is not None
 FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
 
 from gateway.config import Platform, PlatformConfig
+from gateway.display_config import resolve_display_setting
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -1369,6 +1381,7 @@ def check_feishu_requirements() -> bool:
             GetChatRequest, GetMessageRequest, GetMessageResourceRequest,
             P2ImMessageMessageReadV1,
             ReplyMessageRequest, ReplyMessageRequestBody,
+            PatchMessageRequest, PatchMessageRequestBody,
             UpdateMessageRequest, UpdateMessageRequestBody,
         )
         from lark_oapi.core import AccessTokenType, HttpMethod
@@ -1394,6 +1407,8 @@ def check_feishu_requirements() -> bool:
             "P2ImMessageMessageReadV1": P2ImMessageMessageReadV1,
             "ReplyMessageRequest": ReplyMessageRequest,
             "ReplyMessageRequestBody": ReplyMessageRequestBody,
+            "PatchMessageRequest": PatchMessageRequest,
+            "PatchMessageRequestBody": PatchMessageRequestBody,
             "UpdateMessageRequest": UpdateMessageRequest,
             "UpdateMessageRequestBody": UpdateMessageRequestBody,
             "AccessTokenType": AccessTokenType,
@@ -1458,6 +1473,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._dedup_state_path = get_hermes_home() / "feishu_seen_message_ids.json"
         self._dedup_lock = threading.Lock()
         self._sender_name_cache: Dict[str, tuple[str, float]] = {}  # sender_id → (name, expire_at)
+        self._ma_secretary_registry_cache: Optional[tuple[float, Dict[str, Any]]] = None
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
         self._card_action_tokens: Dict[str, float] = {}  # token → first_seen_time
@@ -1490,7 +1506,412 @@ class FeishuAdapter(BasePlatformAdapter):
         # Feishu reaction deletion requires the opaque reaction_id returned
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
+        self._streaming_session_active: bool = False
         self._load_seen_message_ids()
+
+        # ── Group context buffer (ma-secretary registered groups only) ──────
+        self._group_buffer_db_path: Optional[Path] = None
+        self._group_buffer_max_messages: int = 100
+        self._group_buffer_max_age_seconds: int = 72 * 3600
+        self._group_buffer_chat_ids: set[str] = set()
+        self._group_buffer_watermarks: Dict[str, int] = {}  # chat_id → watermark
+        self._group_buffer_gaps: Dict[str, bool] = {}  # chat_id → has_gap
+        # ── v2 write metrics (sanitized — no chat content or identity fields) ──
+        self._v2_metrics: Dict[str, int] = {
+            "bypass_count": 0,
+            "write_attempts": 0,
+            "write_successes": 0,
+            "write_failures": 0,
+            "recall_attempts": 0,
+            "recall_mismatches": 0,
+            "upsert_count": 0,
+            "correction_count": 0,
+        }
+        self._v2_last_error_category: Optional[str] = None
+        self._init_group_context_buffer()
+
+    def _init_group_context_buffer(self) -> None:
+        """Initialize one shared SQLite ring buffer for every registered group."""
+        registry = self._load_project_group_registry()
+        if not registry:
+            return
+        workspaces = registry.get("workspaces")
+        if not isinstance(workspaces, list):
+            return
+
+        enabled_chat_ids = {
+            str(workspace.get("chat_id") or "").strip()
+            for workspace in workspaces
+            if isinstance(workspace, dict)
+            and workspace.get("context_buffer") is True
+            and str(workspace.get("chat_id") or "").strip()
+        }
+        if not enabled_chat_ids:
+            return
+        self._group_buffer_chat_ids.update(enabled_chat_ids)
+
+        project_dir = (
+            get_hermes_home()
+            / "projects"
+            / "ma-secretary-interaction-system"
+        )
+        project_dir.mkdir(parents=True, exist_ok=True)
+        db_path = project_dir / "group_buffer.db"
+        self._group_buffer_db_path = db_path
+
+        import sqlite3
+
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS group_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                sender_open_id TEXT,
+                reply_to_message_id TEXT,
+                create_time INTEGER NOT NULL,
+                message_type TEXT NOT NULL DEFAULT 'text',
+                content TEXT,
+                recorded_at REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_group_msg_id
+            ON group_messages(chat_id, message_id)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_group_chat_time
+            ON group_messages(chat_id, create_time DESC)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS buffer_watermark (
+                chat_id TEXT PRIMARY KEY,
+                last_message_id TEXT,
+                last_create_time INTEGER,
+                has_gap INTEGER NOT NULL DEFAULT 0,
+                continuity_state TEXT NOT NULL DEFAULT 'unknown',
+                disconnect_epoch REAL NOT NULL DEFAULT 0.0,
+                last_reconciled_at REAL NOT NULL DEFAULT 0.0,
+                updated_at REAL NOT NULL
+            )
+        """)
+        # ── Migrate existing rows: add missing columns ─────────────────
+        try:
+            conn.execute(
+                "ALTER TABLE buffer_watermark ADD COLUMN "
+                "continuity_state TEXT NOT NULL DEFAULT 'unknown'"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                "ALTER TABLE buffer_watermark ADD COLUMN "
+                "disconnect_epoch REAL NOT NULL DEFAULT 0.0"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                "ALTER TABLE buffer_watermark ADD COLUMN "
+                "last_reconciled_at REAL NOT NULL DEFAULT 0.0"
+            )
+        except sqlite3.OperationalError:
+            pass
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.commit()
+        conn.close()
+        os.chmod(str(db_path), 0o600)
+        logger.info(
+            "[Feishu] Group context buffer initialized: chats=%d db=%s",
+            len(enabled_chat_ids),
+            db_path,
+        )
+
+    def _record_to_group_buffer(
+        self, chat_id: str, message_id: str, sender_open_id: str,
+        reply_to_message_id: str, create_time: int, message_type: str, content: str,
+    ) -> None:
+        """Record a message into the group context buffer (ring buffer)."""
+        if chat_id not in getattr(self, "_group_buffer_chat_ids", set()):
+            return
+        if not self._group_buffer_db_path:
+            return
+        import sqlite3
+        try:
+            conn = sqlite3.connect(str(self._group_buffer_db_path))
+            now = time.time()
+            # Insert
+            conn.execute(
+                """INSERT OR IGNORE INTO group_messages
+                   (chat_id, message_id, sender_open_id, reply_to_message_id,
+                    create_time, message_type, content, recorded_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (chat_id, message_id, sender_open_id, reply_to_message_id,
+                 create_time, message_type, content, now),
+            )
+            conn.commit()
+            # Update watermark with continuity tracking
+            prev = conn.execute(
+                "SELECT last_create_time, continuity_state FROM buffer_watermark"
+                " WHERE chat_id=?",
+                (chat_id,),
+            ).fetchone()
+            prev_ct = prev[0] if prev else None
+            prev_continuity = str(prev[1] or "unknown") if prev and len(prev) > 1 else "unknown"
+
+            # Detect out-of-order: message create_time older than last seen
+            if prev_ct and create_time < prev_ct:
+                conn.execute(
+                    "UPDATE buffer_watermark SET has_gap=1, continuity_state='gap_detected',"
+                    " updated_at=? WHERE chat_id=?",
+                    (now, chat_id),
+                )
+            else:
+                # Upsert: preserve existing continuity_state if it was already degraded
+                conn.execute(
+                    """INSERT INTO buffer_watermark
+                       (chat_id, last_message_id, last_create_time, has_gap,
+                        continuity_state, disconnect_epoch, last_reconciled_at, updated_at)
+                       VALUES (?, ?, ?, 0, 'continuous', 0.0, 0.0, ?)
+                       ON CONFLICT(chat_id) DO UPDATE SET
+                        last_message_id=excluded.last_message_id,
+                        last_create_time=excluded.last_create_time,
+                        has_gap=0,
+                        continuity_state=CASE
+                            WHEN buffer_watermark.continuity_state IN ('unknown','gap_detected')
+                            THEN buffer_watermark.continuity_state
+                            ELSE 'continuous'
+                        END,
+                        updated_at=excluded.updated_at""",
+                    (chat_id, message_id, create_time, now),
+                )
+            conn.commit()
+            # Enforce cap: delete oldest if over limit
+            count = conn.execute(
+                "SELECT COUNT(*) FROM group_messages WHERE chat_id=?", (chat_id,),
+            ).fetchone()[0]
+            if count > self._group_buffer_max_messages:
+                excess = count - self._group_buffer_max_messages
+                conn.execute(
+                    """DELETE FROM group_messages WHERE id IN (
+                        SELECT id FROM group_messages WHERE chat_id=?
+                        ORDER BY create_time ASC LIMIT ?
+                    )""",
+                    (chat_id, excess),
+                )
+                conn.commit()
+            # Enforce age: delete oldest beyond 72 hours
+            cutoff = now - self._group_buffer_max_age_seconds
+            conn.execute(
+                "DELETE FROM group_messages WHERE chat_id=? AND recorded_at < ?",
+                (chat_id, cutoff),
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            logger.debug("[Feishu] Group buffer write failed", exc_info=True)
+
+    def _get_group_context_packet(
+        self, chat_id: str, *, exclude_message_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Build a structured group_context_packet from the buffer.
+
+        Args:
+            chat_id: The group chat to build context for.
+            exclude_message_id: If provided, the current trigger message_id is
+                excluded from the packet so the model sees it exactly once (L0).
+        """
+        if chat_id not in getattr(self, "_group_buffer_chat_ids", set()):
+            return None
+        if not self._group_buffer_db_path:
+            return None
+        import sqlite3
+        try:
+            conn = sqlite3.connect(str(self._group_buffer_db_path))
+            wm = conn.execute(
+                "SELECT has_gap, last_message_id, last_create_time,"
+                " continuity_state, last_reconciled_at, disconnect_epoch"
+                " FROM buffer_watermark WHERE chat_id=?",
+                (chat_id,),
+            ).fetchone()
+            has_gap = bool(wm[0]) if wm else True
+            continuity_state = str(wm[3] or "unknown") if wm and len(wm) > 3 else "unknown"
+            rows = conn.execute(
+                """SELECT message_id, sender_open_id, reply_to_message_id,
+                          create_time, message_type, content
+                   FROM group_messages WHERE chat_id=?
+                   ORDER BY create_time DESC LIMIT ?""",
+                (chat_id, self._group_buffer_max_messages),
+            ).fetchall()
+            conn.close()
+
+            # ── Identity mapping from group-registry ──────────────────────
+            workspace = None
+            bos_id = None
+            emp_id = None
+            try:
+                workspace = self._get_project_workspace(chat_id)
+                if workspace:
+                    bos_id = str(workspace.get("boss_open_id") or "").strip()
+                    emp_id = str(workspace.get("employee_open_id") or "").strip()
+            except Exception:
+                pass
+
+            def _identity_label(sender_open_id: str) -> str:
+                if bos_id and sender_open_id == bos_id:
+                    return "speaker_role=boss speaker_label=老板"
+                if emp_id and sender_open_id == emp_id:
+                    return "speaker_role=employee speaker_label=小年糕"
+                return "speaker_role=unknown speaker_label=未知成员"
+
+            # ── Build packet ──────────────────────────────────────────────
+            filtered_rows = [
+                row for row in rows
+                if exclude_message_id is None or row[0] != exclude_message_id
+            ]
+            if not filtered_rows:
+                return None
+
+            lines = [
+                "[group_context_packet]",
+                f"chat_id={chat_id}",
+                f"source=buffer",
+                f"continuity={continuity_state}",
+                f"message_count={len(filtered_rows)}",
+                "---",
+            ]
+            for row in reversed(filtered_rows):
+                msg_id, snd, reply, ct, mtype, content = row
+                ts = datetime.fromtimestamp(ct / 1000.0).strftime("%H:%M:%S") if ct else "?"
+                reply_mark = f" (reply_to={reply})" if reply else ""
+                content_short = (content or "")[:200]
+                identity = _identity_label(snd or "")
+                lines.append(
+                    f"[{ts}] {identity} sender_open_id={snd or '?'}{reply_mark}: {content_short}"
+                )
+            return "\n".join(lines)
+        except Exception:
+            logger.debug("[Feishu] Group buffer read failed", exc_info=True)
+            return None
+
+    def _mark_buffer_disconnect(self, chat_ids: Optional[set[str]] = None) -> None:
+        """Mark registered group buffers as disconnected (continuity=unknown).
+
+        Called on WebSocket reconnect / gateway startup to signal that the
+        buffer may have missed messages during the gap.
+        """
+        if not self._group_buffer_db_path:
+            return
+        targets = chat_ids or getattr(self, "_group_buffer_chat_ids", set())
+        if not targets:
+            return
+        import sqlite3
+        now = time.time()
+        try:
+            conn = sqlite3.connect(str(self._group_buffer_db_path))
+            for cid in targets:
+                conn.execute(
+                    "UPDATE buffer_watermark SET continuity_state='unknown',"
+                    " disconnect_epoch=?, updated_at=?"
+                    " WHERE chat_id=?",
+                    (now, now, cid),
+                )
+            conn.commit()
+            conn.close()
+            logger.info(
+                "[Feishu] Marked buffer disconnect for %d chat_ids", len(targets),
+            )
+        except Exception:
+            logger.debug("[Feishu] Buffer disconnect mark failed", exc_info=True)
+
+    def _recover_outbox_on_startup(self) -> None:
+        """Startup recovery: recover expired leases and drain queued outbox items."""
+        import sqlite3
+        shared_ids = self.config.extra.get("shared_group_session_chat_ids") or []
+        if not shared_ids:
+            return
+        try:
+            db_path = self._ensure_outbox_db()
+            conn = sqlite3.connect(str(db_path))
+            conn.execute("PRAGMA busy_timeout=5000")
+            now = time.time()
+            # Recover expired leases
+            for chat_id in shared_ids:
+                conn.execute(
+                    "UPDATE outbox SET state='queued', leased_at=NULL, lease_expires=NULL, lease_token=NULL,"
+                    " retry_count=retry_count+1 WHERE state='leased' AND lease_expires < ? AND chat_id=?",
+                    (now, chat_id),
+                )
+            conn.commit()
+            # Check for queued items and start workers
+            for chat_id in shared_ids:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM outbox WHERE chat_id=? AND state='queued'", (chat_id,)
+                ).fetchone()
+                if row and row[0] > 0:
+                    self._start_group_worker(chat_id)
+            conn.close()
+            logger.info("[Feishu] Outbox startup recovery completed for %d shared groups", len(shared_ids))
+        except Exception:
+            logger.debug("[Feishu] Outbox startup recovery failed", exc_info=True)
+
+    def _reconcile_group_buffer(
+        self, chat_id: str, feishu_messages: list[dict],
+    ) -> bool:
+        """Reconcile buffer continuity by merging server-side messages.
+
+        Args:
+            chat_id: The group chat to reconcile.
+            feishu_messages: Messages from Feishu server (list of dicts with
+                message_id, sender_open_id, reply_to, create_time, msg_type, content).
+
+        Returns:
+            True if reconciliation succeeded and continuity is restored.
+        """
+        if not self._group_buffer_db_path:
+            return False
+        import sqlite3
+        now = time.time()
+        try:
+            conn = sqlite3.connect(str(self._group_buffer_db_path))
+            merged = 0
+            for msg in feishu_messages:
+                msg_id = str(msg.get("message_id") or "")
+                if not msg_id:
+                    continue
+                conn.execute(
+                    """INSERT OR IGNORE INTO group_messages
+                       (chat_id, message_id, sender_open_id, reply_to_message_id,
+                        create_time, message_type, content, recorded_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        chat_id, msg_id,
+                        str(msg.get("sender_open_id") or ""),
+                        str(msg.get("reply_to") or ""),
+                        int(msg.get("create_time") or 0),
+                        str(msg.get("msg_type") or "text"),
+                        str(msg.get("content") or "")[:500],
+                        now,
+                    ),
+                )
+                if conn.execute("SELECT changes()").fetchone()[0]:
+                    merged += 1
+            # Mark reconciled
+            conn.execute(
+                "UPDATE buffer_watermark SET continuity_state='continuous',"
+                " last_reconciled_at=?, updated_at=? WHERE chat_id=?",
+                (now, now, chat_id),
+            )
+            conn.commit()
+            conn.close()
+            logger.info(
+                "[Feishu] Buffer reconciled: chat_id=%s merged=%d",
+                chat_id, merged,
+            )
+            return True
+        except Exception:
+            logger.debug("[Feishu] Buffer reconcile failed", exc_info=True)
+            return False
 
     @staticmethod
     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:
@@ -1746,6 +2167,10 @@ class FeishuAdapter(BasePlatformAdapter):
             self._loop = asyncio.get_running_loop()
             await self._connect_with_retry()
             self._mark_connected()
+            # ── Mark group buffers as potentially gapped after reconnect ──
+            self._mark_buffer_disconnect()
+            # ── Startup recovery: recover expired leases + drain queued outbox ──
+            self._recover_outbox_on_startup()
             logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
             return True
         except Exception as exc:
@@ -1854,7 +2279,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         try:
             for chunk in chunks:
-                msg_type, payload = self._build_outbound_payload(chunk)
+                msg_type, payload = self._build_streaming_aware_outbound_payload(chunk)
                 try:
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
@@ -1864,16 +2289,38 @@ class FeishuAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
                 except Exception as exc:
-                    if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
+                    if msg_type == "interactive":
+                        logger.warning("[Feishu] Interactive card send failed; falling back to legacy text/post: %s", exc)
+                        msg_type, payload = self._build_outbound_payload(chunk)
+                        response = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type=msg_type,
+                            payload=payload,
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                    elif msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
                         raise
-                    logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
+                    else:
+                        logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
+                        response = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type="text",
+                            payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                if msg_type == "interactive" and not self._response_succeeded(response):
+                    logger.warning("[Feishu] Interactive card send rejected by API response; falling back to legacy text/post")
+                    fallback_type, fallback_payload = self._build_outbound_payload(chunk)
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
-                        msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+                        msg_type=fallback_type,
+                        payload=fallback_payload,
                         reply_to=reply_to,
                         metadata=metadata,
                     )
+                    msg_type = fallback_type
                 if (
                     msg_type == "post"
                     and not self._response_succeeded(response)
@@ -1889,7 +2336,8 @@ class FeishuAdapter(BasePlatformAdapter):
                     )
                 last_response = response
 
-            return self._finalize_send_result(last_response, "send failed")
+            result = self._finalize_send_result(last_response, "send failed")
+            return result
         except Exception as exc:
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
@@ -1902,17 +2350,24 @@ class FeishuAdapter(BasePlatformAdapter):
         *,
         finalize: bool = False,
     ) -> SendResult:
-        """Edit a previously sent Feishu text/post message."""
+        """Edit a previously sent Feishu message."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
         content = self.format_message(content)
         try:
-            msg_type, payload = self._build_outbound_payload(content)
+            msg_type, payload = self._build_streaming_aware_outbound_payload(content)
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
             request = self._build_update_message_request(message_id=message_id, request_body=body)
             response = await self._run_blocking(self._client.im.v1.message.update, request)
             result = self._finalize_send_result(response, "update failed")
+            if not result.success and msg_type == "interactive":
+                logger.warning("[Feishu] Interactive card update failed; falling back to legacy text/post")
+                msg_type, payload = self._build_outbound_payload(content)
+                body = self._build_update_message_body(msg_type=msg_type, content=payload)
+                request = self._build_update_message_request(message_id=message_id, request_body=body)
+                response = await self._run_blocking(self._client.im.v1.message.update, request)
+                result = self._finalize_send_result(response, "update failed")
             if not result.success and msg_type == "post" and _POST_CONTENT_INVALID_RE.search(result.error or ""):
                 logger.warning("[Feishu] Invalid post update payload rejected by API; falling back to plain text")
                 fallback_body = self._build_update_message_body(
@@ -2511,6 +2966,25 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
             return
 
+        # ── Group context buffer: record ALL human messages before admission ──
+        chat_id = str(getattr(message, "chat_id", "") or "")
+        if chat_id in getattr(self, "_group_buffer_chat_ids", set()):
+            sender_obj = getattr(sender, "sender_id", None)
+            sender_open_id = str(getattr(sender_obj, "open_id", "") or "")
+            reply_to = str(getattr(message, "root_id", "") or
+                           getattr(message, "parent_id", "") or "")
+            msg_type = str(getattr(message, "message_type", "text") or "text")
+            create_time_ms = int(getattr(message, "create_time", "0") or "0")
+            if create_time_ms and len(str(create_time_ms)) < 13:
+                create_time_ms = create_time_ms * 1000
+            raw_content = str(getattr(message, "content", "") or "")[:500]
+            self._record_to_group_buffer(
+                chat_id=chat_id, message_id=message_id,
+                sender_open_id=sender_open_id, reply_to_message_id=reply_to,
+                create_time=create_time_ms, message_type=msg_type,
+                content=raw_content,
+            )
+
         reason = self._admit(sender, message)
         if reason is not None:
             logger.info("[Feishu] dropping inbound event: %s message_type=%s", reason, getattr(message, "message_type", "?"))
@@ -2905,7 +3379,7 @@ class FeishuAdapter(BasePlatformAdapter):
         action = "added" if "created" in event_type else "removed"
         synthetic_text = f"reaction:{action}:{emoji_type}"
 
-        sender_profile = await self._resolve_sender_profile(user_id_obj)
+        sender_profile = await self._resolve_sender_profile(user_id_obj, chat_id=chat_id)
         chat_info = await self.get_chat_info(chat_id)
         source = self.build_source(
             chat_id=chat_id,
@@ -2968,7 +3442,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 pass
 
         sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
-        sender_profile = await self._resolve_sender_profile(sender_id)
+        sender_profile = await self._resolve_sender_profile(sender_id, chat_id=chat_id)
         chat_info = await self.get_chat_info(chat_id)
         source = self.build_source(
             chat_id=chat_id,
@@ -3227,7 +3701,10 @@ class FeishuAdapter(BasePlatformAdapter):
             if hint:
                 text = f"{hint}\n\n{text}" if text else hint
 
-        thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None) or None
+        # Only use real Feishu thread_id, NOT root_id (reply-to chain).
+        # Using root_id as thread_id causes each reply to create a different
+        # session key, losing conversation context for the same user.
+        thread_id = getattr(message, "thread_id", None) or None
         reply_to_message_id = (
             getattr(message, "parent_id", None)
             or getattr(message, "upper_message_id", None)
@@ -3256,7 +3733,37 @@ class FeishuAdapter(BasePlatformAdapter):
 
         chat_id = getattr(message, "chat_id", "") or ""
         chat_info = await self.get_chat_info(chat_id)
-        sender_profile = await self._resolve_sender_profile(sender_id, is_bot=is_bot)
+        sender_profile = await self._resolve_sender_profile(sender_id, is_bot=is_bot, chat_id=chat_id)
+        workspace = self._get_project_workspace(chat_id)
+        if (
+            workspace
+            and sender_profile.get("sender_role") == "unresolved"
+            and not sender_profile.get("user_id")
+        ):
+            sender_profile["user_id"] = f"unresolved:{message_id}"
+        sender_open_id = str(getattr(sender_id, "open_id", "") or "") or None
+        sender_user_id = str(getattr(sender_id, "user_id", "") or "") or None
+        sender_union_id = str(getattr(sender_id, "union_id", "") or "") or None
+        sender_metadata = {
+            "sender_open_id": sender_open_id,
+            "sender_user_id": sender_user_id,
+            "sender_union_id": sender_union_id,
+            "sender_primary_id": sender_profile["user_id"],
+            "sender_display_name": sender_profile["user_name"],
+            "chat_id": chat_id,
+            "chat_type": chat_type,
+            "is_bot_sender": is_bot,
+            "sender_role": sender_profile.get("sender_role"),
+            "sender_identity_resolved": sender_profile.get("sender_role") in {"boss", "employee"},
+        }
+        logger.info(
+            "[Feishu][DEBUG] normalized sender metadata: chat_id=%s open_id=%s user_id=%s union_id=%s resolved=%s",
+            chat_id,
+            sender_open_id or "<missing>",
+            sender_user_id or "<missing>",
+            sender_union_id or "<missing>",
+            sender_profile["user_name"] or "<missing>",
+        )
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
@@ -3267,6 +3774,25 @@ class FeishuAdapter(BasePlatformAdapter):
             user_id_alt=sender_profile["user_id_alt"],
             is_bot=is_bot,
         )
+        sender_memory_note = await self._maybe_persist_sender_memory_request(
+            sender_id,
+            chat_id=chat_id,
+            user_text=text,
+            message_id=message_id,
+        )
+        sender_prompt = self._resolve_sender_profile_prompt(sender_id, chat_id=chat_id)
+        sender_context = await self._resolve_sender_profile_context(sender_id, chat_id=chat_id, user_text=text)
+        channel_prompt = self._resolve_channel_prompt(chat_id, thread_id or None)
+
+        # ── Inject group context packet for registered groups ──────────────
+        group_packet = self._get_group_context_packet(chat_id, exclude_message_id=message_id)
+        if group_packet:
+            channel_prompt = f"{group_packet}\n\n{channel_prompt}" if channel_prompt else group_packet
+
+        extra_prompt_parts = [part for part in (sender_prompt, sender_context, sender_memory_note) if part]
+        if extra_prompt_parts:
+            appended = "\n\n".join(extra_prompt_parts)
+            channel_prompt = f"{channel_prompt}\n\n{appended}" if channel_prompt else appended
         normalized = MessageEvent(
             text=text,
             message_type=inbound_type,
@@ -3277,7 +3803,8 @@ class FeishuAdapter(BasePlatformAdapter):
             media_types=media_types,
             reply_to_message_id=reply_to_message_id,
             reply_to_text=reply_to_text,
-            channel_prompt=self._resolve_channel_prompt(chat_id, thread_id or None),
+            channel_prompt=channel_prompt,
+            metadata=sender_metadata,
             timestamp=datetime.now(),
         )
         await self._dispatch_inbound_event(normalized)
@@ -3309,6 +3836,7 @@ class FeishuAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            shared_group_session_chat_ids=self.config.extra.get("shared_group_session_chat_ids"),
         )
         return f"{session_key}:media:{event.message_type.value}"
 
@@ -3605,6 +4133,7 @@ class FeishuAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            shared_group_session_chat_ids=self.config.extra.get("shared_group_session_chat_ids"),
         )
 
     @staticmethod
@@ -4005,11 +4534,506 @@ class FeishuAdapter(BasePlatformAdapter):
             return "dm"
         return "group"
 
+    async def _resolve_sender_profile_context(
+        self,
+        sender_id: Any,
+        *,
+        chat_id: str = "",
+        user_text: str = "",
+    ) -> Optional[str]:
+        """Fetch a short mental-model excerpt for the current sender.
+
+        The mental model is the runtime-facing distilled layer. The bank should
+        already have been absorbed into it via Hindsight refresh, so this path
+        reads the model directly instead of doing bank recall or reflection per
+        turn.
+        """
+        identity = self._resolve_sender_identity_from_group_registry(sender_id, chat_id=chat_id)
+        role = identity.get("role")
+        display_name = identity.get("display_name") or ""
+        registry = self._load_project_group_registry() or {}
+        workspaces = registry.get("workspaces") if isinstance(registry, dict) else None
+        workspace = None
+        if isinstance(workspaces, list):
+            open_id = getattr(sender_id, "open_id", None) or None
+            for item in workspaces:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("chat_id") or "").strip() != chat_id:
+                    continue
+                if open_id and (open_id == item.get("boss_open_id") or open_id == item.get("employee_open_id")):
+                    workspace = item
+                    break
+        if role == "boss":
+            bank_id = self._resolve_bank_from_catalog(sender_id, chat_id=chat_id, role="boss") or ""
+            model_id = str((workspace or {}).get("boss_profile_model") or "hou-fangming").strip()
+            focus_keywords = ["决策", "沟通", "工具", "业务", "合规", "团队", "格式", "授权", "风险"]
+        elif role == "employee":
+            bank_id = self._resolve_bank_from_catalog(sender_id, chat_id=chat_id, role="employee") or ""
+            model_id = str((workspace or {}).get("employee_profile_model") or "xiaoniangao-work-focus").strip()
+            focus_keywords = ["AILD", "应急", "基金会", "日常事务", "近期事项", "协作模式", "工作重心"]
+        else:
+            return None
+
+        if not bank_id or not model_id:
+            return None
+
+        api_url = os.environ.get("HINDSIGHT_API_URL", "http://localhost:8889").strip() or "http://localhost:8889"
+        api_key = os.environ.get("HINDSIGHT_API_KEY")
+        timeout = 6.0
+        try:
+            from hindsight_client import Hindsight
+        except Exception:
+            logger.debug("[Feishu] Hindsight client unavailable for mental model fetch", exc_info=True)
+            return None
+
+        try:
+            client = Hindsight(base_url=api_url, api_key=api_key or None, timeout=timeout)
+        except Exception:
+            logger.debug("[Feishu] Failed to create Hindsight client for mental model fetch", exc_info=True)
+            return None
+
+        try:
+            resp = await asyncio.wait_for(
+                client.mental_models.get_mental_model(bank_id, model_id, detail="content"),
+                timeout=timeout,
+            )
+        except Exception:
+            logger.debug("[Feishu] Hindsight mental model fetch failed", exc_info=True)
+            return None
+        finally:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+        content = str(getattr(resp, "content", None) or "").strip()
+        if not content:
+            return None
+
+        lines = content.splitlines()
+        sections: List[str] = []
+        current_heading = None
+        current_lines: List[str] = []
+
+        def flush_section() -> None:
+            if not current_heading or not current_lines:
+                return
+            heading_blob = current_heading.lower()
+            if not any(keyword.lower() in heading_blob for keyword in focus_keywords):
+                return
+            body_lines: List[str] = []
+            for line in current_lines:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                body_lines.append(stripped)
+                if len(body_lines) >= 4:
+                    break
+            if body_lines:
+                sections.append(f"{current_heading}\n" + "\n".join(body_lines))
+
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                flush_section()
+                current_heading = stripped
+                current_lines = []
+                continue
+            if current_heading:
+                current_lines.append(line)
+        flush_section()
+
+        if not sections:
+            fallback_lines = [line.strip() for line in lines if line.strip()][:18]
+            sections = ["\n".join(fallback_lines)] if fallback_lines else []
+        if not sections:
+            return None
+
+        header_name = display_name or ("老板" if role == "boss" else "员工")
+        excerpt = "\n\n".join(sections[:2])
+        return (
+            f"[相关 mental model]\n对象：{header_name}\nmental model：{model_id}\nbank：{bank_id}\n"
+            f"{excerpt}"
+        )
+
+    @staticmethod
+    def _extract_sender_memory_payload(user_text: str) -> Optional[str]:
+        """Return the memory payload from an explicit sender-memory instruction."""
+        text = str(user_text or "").strip()
+        if not text:
+            return None
+
+        patterns = [
+            r"^(?:请)?记住[：:，,\s]*(.+?)$",
+            r"^(?:请)?记一下[：:，,\s]*(.+?)$",
+            r"^以后按这个来[：:，,\s]*(.+?)$",
+            r"^默认[：:，,\s]*(.+?)$",
+            r"^偏好[：:，,\s]*(.+?)$",
+            r"^禁忌[：:，,\s]*(.+?)$",
+            r"^边界[：:，,\s]*(.+?)$",
+        ]
+        for pattern in patterns:
+            match = re.match(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            payload = (match.group(1) or "").strip(" \t\n\r。！!？?；;，,")
+            if payload:
+                return payload
+        return None
+
+    async def _maybe_persist_sender_memory_request(
+        self,
+        sender_id: Any,
+        *,
+        chat_id: str = "",
+        user_text: str = "",
+        message_id: str = "",
+    ) -> Optional[str]:
+        """Platform-side Hindsight write for explicit sender memory instructions.
+
+        For registered groups with chat_memory_v2_enforced=True, this is
+        DISABLED — all memory writes must go through the ma.chat-memory.v2
+        protocol with stable document_id.
+        """
+        # ── Check if this group enforces v2 memory protocol ────────────────
+        workspace = self._get_project_workspace(chat_id)
+        if workspace and workspace.get("chat_memory_v2_enforced") is True:
+            # ── Record bypass metric (sanitized) ───────────────────────────
+            self._v2_metrics["bypass_count"] += 1
+            logger.debug(
+                "[Feishu] Skipping old-style sender memory write for v2-enforced group:"
+                " chat_id=%s bypass_count=%d",
+                chat_id, self._v2_metrics["bypass_count"],
+            )
+            return None
+
+        payload = self._extract_sender_memory_payload(user_text)
+        if not payload:
+            return None
+
+        identity = self._resolve_sender_identity_from_group_registry(sender_id, chat_id=chat_id)
+        role = identity.get("role")
+        display_name = identity.get("display_name") or ("老板" if role == "boss" else "员工")
+        workspace = self._get_project_workspace(chat_id)
+        if role not in {"boss", "employee"} or not workspace:
+            return None
+
+        if role == "boss":
+            bank_id = self._resolve_bank_from_catalog(sender_id, chat_id=chat_id, role="boss") or ""
+            model_id = str((workspace or {}).get("boss_profile_model") or "hou-fangming").strip()
+            role_cn = "老板"
+        else:
+            bank_id = self._resolve_bank_from_catalog(sender_id, chat_id=chat_id, role="employee") or ""
+            model_id = str((workspace or {}).get("employee_profile_model") or "xiaoniangao-work-focus").strip()
+            role_cn = "员工"
+        if not bank_id or not model_id:
+            return None
+
+        record_content = (
+            f"[FEISHU_SENDER_MEMORY_{datetime.now().strftime('%Y_%m_%d')}] "
+            f"{display_name}（{role_cn}）在飞书群中明确要求记住：{payload}"
+        )
+        tags = [f"{role}-profile", model_id, "sender-memory", "feishu-group-auto"]
+
+        api_url = os.environ.get("HINDSIGHT_API_URL", "http://localhost:8889").strip() or "http://localhost:8889"
+        api_key = os.environ.get("HINDSIGHT_API_KEY")
+        timeout = 15.0
+
+        def _post() -> Dict[str, Any]:
+            body = json.dumps(
+                {
+                    "items": [
+                        {
+                            "content": record_content,
+                            "fact_type": "experience",
+                            "tags": tags,
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+            req = Request(
+                f"{api_url.rstrip('/')}/v1/default/banks/{bank_id}/memories",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            if api_key:
+                req.add_header("Authorization", f"Bearer {api_key}")
+            with urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+
+        try:
+            result = await asyncio.to_thread(_post)
+        except Exception:
+            logger.warning(
+                "[Feishu] Sender memory direct-write failed: chat_id=%s message_id=%s role=%s",
+                chat_id,
+                message_id or "<missing>",
+                role or "<missing>",
+                exc_info=True,
+            )
+            return None
+
+        if not result.get("success") or result.get("async") is True:
+            logger.warning(
+                "[Feishu] Sender memory direct-write returned non-sync result: chat_id=%s message_id=%s bank=%s resp=%s",
+                chat_id,
+                message_id or "<missing>",
+                bank_id,
+                result,
+            )
+            return None
+
+        logger.info(
+            "[Feishu] Sender memory direct-write stored: chat_id=%s message_id=%s bank=%s role=%s payload=%r",
+            chat_id,
+            message_id or "<missing>",
+            bank_id,
+            role,
+            payload,
+        )
+        return (
+            f"[平台侧记忆已写入]\n对象：{display_name}\nbank：{bank_id}\n内容：{payload}\n"
+            f"这条‘记住/偏好/禁忌/边界’请求已由平台层直写 Hindsight。"
+            f"回复时直接说明“已记入 {bank_id}”，不要再说没有工具、只写本地快照，"
+            f"也不要改写成记到其他 bank。"
+        )
+
+    async def _v2_memory_write(
+        self,
+        *,
+        document_id: str,
+        content: str,
+        bank_id: str,
+        memory_type: str,
+        chat_id: str,
+        source_message_id: str,
+        speaker_id: str = "",
+        subject_id: str = "",
+        canonical_root_message_id: str = "",
+        last_message_create_time: str = "",
+        status: str = "current",
+        confidence: str = "confirmed",
+        confirmation: str = "shared_confirmed",
+        verify_timeout: float = 10.0,
+        verify_poll_interval: float = 1.0,
+    ) -> Dict[str, Any]:
+        """Program-callable v2 memory write with state machine.
+
+        State flow: write accepted → pending_verification → verified / failed.
+        Only returns state='verified' after exact document lookup confirms.
+        Uses injectable ``self._v2_client`` for unit testing (defaults to Hindsight API).
+
+        Returns:
+            dict with: state, document_id, bank_id, is_correction, error_category.
+        """
+        self._v2_metrics["write_attempts"] += 1
+        client = getattr(self, "_v2_client", None)
+        if client is None:
+            api_url = os.environ.get("HINDSIGHT_API_URL", "http://localhost:8889").strip() or "http://localhost:8889"
+            api_key = os.environ.get("HINDSIGHT_API_KEY")
+            timeout = 15.0
+
+        tags = ["ma-chat-memory-v2", f"chat:{chat_id}", f"type:{memory_type}"]
+        if status != "current":
+            tags.append(f"status:{status}")
+
+        record_content = (
+            f"[ma.chat-memory.v2]\n"
+            f"document_id={document_id}\n"
+            f"memory_type={memory_type}\n"
+            f"source_message_id={source_message_id}\n"
+            f"---\n{content}"
+        )
+
+        # ── Phase 1: Write ─────────────────────────────────────────────────
+        if client is not None:
+            try:
+                write_result = client.write(bank_id=bank_id, content=record_content, tags=tags)
+            except Exception as e:
+                self._v2_metrics["write_failures"] += 1
+                return {"state": "failed", "document_id": document_id, "bank_id": bank_id,
+                        "is_correction": False, "error_category": type(e).__name__}
+        else:
+            def _post() -> Dict[str, Any]:
+                body = json.dumps({"items": [{"content": record_content, "fact_type": "observation", "tags": tags}]},
+                                  ensure_ascii=False).encode("utf-8")
+                req = Request(f"{api_url.rstrip('/')}/v1/default/banks/{bank_id}/memories",
+                              data=body, headers={"Content-Type": "application/json"}, method="POST")
+                if api_key:
+                    req.add_header("Authorization", f"Bearer {api_key}")
+                with urlopen(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            try:
+                write_result = await asyncio.to_thread(_post)
+            except Exception as e:
+                self._v2_metrics["write_failures"] += 1
+                return {"state": "failed", "document_id": document_id, "bank_id": bank_id,
+                        "is_correction": False, "error_category": type(e).__name__}
+
+        if not write_result.get("success") or write_result.get("async") is True:
+            self._v2_metrics["write_failures"] += 1
+            return {"state": "failed", "document_id": document_id, "bank_id": bank_id,
+                    "is_correction": False, "error_category": "write_result_not_sync"}
+
+        # ── Phase 2: Bounded polling for exact document lookup ──────────────
+        self._v2_metrics["recall_attempts"] += 1
+        start = time.monotonic()
+        is_correction = False
+        while time.monotonic() - start < verify_timeout:
+            if client is not None:
+                try:
+                    docs = client.list_memories(bank_id=bank_id, limit=200)
+                except Exception:
+                    docs = []
+            else:
+                try:
+                    def _list() -> Dict[str, Any]:
+                        req = Request(f"{api_url.rstrip('/')}/v1/default/banks/{bank_id}/memories/list?limit=200",
+                                      method="GET")
+                        if api_key:
+                            req.add_header("Authorization", f"Bearer {api_key}")
+                        with urlopen(req, timeout=timeout) as resp:
+                            return json.loads(resp.read().decode("utf-8"))
+                    list_result = await asyncio.to_thread(_list)
+                    docs = list_result.get("items", [])
+                except Exception:
+                    docs = []
+
+            # Exact document lookup: document_id must appear in text field
+            found = [d for d in docs if document_id in (d.get("text", "") or "")]
+            if found:
+                self._v2_metrics["write_successes"] += 1
+                # Correction detection: more than one doc with same document_id
+                if len(found) > 1:
+                    self._v2_metrics["upsert_count"] += 1
+                    is_correction = True
+                logger.info("[Feishu] v2 write verified: doc_id=%s bank=%s type=%s", document_id, bank_id, memory_type)
+                return {"state": "verified", "document_id": document_id, "bank_id": bank_id,
+                        "is_correction": is_correction}
+
+            await asyncio.sleep(verify_poll_interval)
+
+        # Timeout — still pending
+        self._v2_metrics["recall_mismatches"] += 1
+        logger.warning("[Feishu] v2 write pending verification: doc_id=%s bank=%s timeout=%.1fs",
+                       document_id, bank_id, verify_timeout)
+        return {"state": "pending_verification", "document_id": document_id, "bank_id": bank_id,
+                "is_correction": False, "error_category": "verify_timeout"}
+
+    def _v2_exact_lookup(self, bank_id: str, document_id: str) -> List[Dict[str, Any]]:
+        """Exact document lookup by document_id via Hindsight API.
+
+        Uses memories/list and filters by document_id in text field.
+        Returns list of matching documents.
+        """
+        client = getattr(self, "_v2_client", None)
+        if client is not None:
+            return client.exact_lookup(bank_id, document_id) if hasattr(client, "exact_lookup") else []
+        api_url = os.environ.get("HINDSIGHT_API_URL", "http://localhost:8889").strip() or "http://localhost:8889"
+        api_key = os.environ.get("HINDSIGHT_API_KEY")
+        try:
+            def _list() -> Dict[str, Any]:
+                req = Request(f"{api_url.rstrip('/')}/v1/default/banks/{bank_id}/memories/list?limit=200",
+                              method="GET")
+                if api_key:
+                    req.add_header("Authorization", f"Bearer {api_key}")
+                with urlopen(req, timeout=15) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            list_result = asyncio.run(asyncio.to_thread(_list))
+            items = list_result.get("items", [])
+            return [d for d in items if document_id in (d.get("text", "") or "")]
+        except Exception:
+            return []
+
+    def _resolve_sender_profile_prompt(self, sender_id: Any, *, chat_id: str = "") -> Optional[str]:
+        """Build a short ephemeral prompt that loads the right persona context."""
+        identity = self._resolve_sender_identity_from_group_registry(sender_id, chat_id=chat_id)
+        role = identity.get("role")
+        display_name = identity.get("display_name")
+        workspace = self._get_project_workspace(chat_id)
+        if workspace and role is None:
+            name = display_name or "当前发言人"
+            return (
+                f"当前发言人：{name}。该群启用了身份绑定，但本条消息未解析到可验证的 sender 身份映射。"
+                "禁止默认按老板或任何已知员工画像理解这条消息。"
+                "如果对方在问“我是谁 / 你认识我吗 / 你知道我是谁吗”之类身份问题，只能明确说明身份未明，"
+                "需要 sender_open_id/open_id 映射成功后再确认。"
+            )
+        if role == "boss":
+            bank = self._resolve_bank_from_catalog(sender_id, chat_id=chat_id, role="boss") or ""
+            model = str((workspace or {}).get("boss_profile_model") or "hou-fangming").strip()
+            name = display_name or "老板"
+            return (
+                f"当前发言人身份已核实：{name}（老板）。本条消息的 sender_open_id/open_id 已与群注册表成功匹配。"
+                f"先按老板画像理解上下文，优先参考 Hindsight 画像 {bank} / {model}。"
+                "如果对方在问“我是谁 / 你认识我吗 / 你知道我是谁吗”这类身份确认问题，可以直接确认其就是已核实的当前发言人；"
+                "不要再回复‘未锁定’‘不能确认’或‘只有会话标签没有真源’。"
+                f"关注决策、拍板、边界和工作推进，不要把这段当成需要扮演老板发言的指令。"
+            )
+        if role == "employee":
+            bank = self._resolve_bank_from_catalog(sender_id, chat_id=chat_id, role="employee") or ""
+            model = str((workspace or {}).get("employee_profile_model") or "xiaoniangao-work-focus").strip()
+            name = display_name or "员工"
+            # project_bank uses the "project" catalog key for group-level context
+            try:
+                project_bank = self._registry_loader.resolve_bank("project")
+            except RegistryError:
+                project_bank = ""
+            if workspace and workspace.get("chat_memory_v2_enforced") is True:
+                return (
+                    f"\u5f53\u524d\u53d1\u8a00\u4eba\u8eab\u4efd\u5df2\u6838\u5b9e\uff1a{name}\uff08\u5458\u5de5\uff09\u3002\u672c\u6761\u6d88\u606f\u7684 sender_open_id/open_id \u5df2\u4e0e\u7fa4\u6ce8\u518c\u8868\u6210\u529f\u5339\u914d\u3002"
+                    f"\u5148\u6309\u5458\u5de5\u753b\u50cf\u7406\u89e3\u4e0a\u4e0b\u6587\uff0c\u4f18\u5148\u53c2\u8003 Hindsight \u753b\u50cf {bank} / {model}\u3002"
+                    '\u5982\u679c\u5bf9\u65b9\u5728\u95ee\u201c\u6211\u662f\u8c01 / \u4f60\u8ba4\u8bc6\u6211\u5417 / \u4f60\u77e5\u9053\u6211\u662f\u8c01\u5417\u201d\u8fd9\u7c7b\u8eab\u4efd\u786e\u8ba4\u95ee\u9898\uff0c\u53ef\u4ee5\u76f4\u63a5\u786e\u8ba4\u5176\u5c31\u662f\u5df2\u6838\u5b9e\u7684\u5f53\u524d\u53d1\u8a00\u4eba\uff1b'
+                    '\u4e0d\u8981\u518d\u56de\u590d\u201c\u672a\u9501\u5b9a\u201d\u201c\u4e0d\u80fd\u786e\u8ba4\u201d\u6216\u201c\u53ea\u6709\u4f1a\u8bdd\u6807\u7b7e\u6ca1\u6709\u771f\u6e90\u201d\u3002'
+                    f"\u5982\u9700\u5de5\u4f5c\u80cc\u666f\uff0c\u518d\u8054\u60f3\u9879\u76ee\u603b\u63a7 bank {project_bank}\u3002\u5173\u6ce8\u504f\u597d\u3001\u5f53\u524d\u4e8b\u9879\u3001\u8fb9\u754c\u548c\u540e\u7eed\u52a8\u4f5c\uff0c\u4e0d\u8981\u628a\u8fd9\u6bb5\u5f53\u6210\u8981\u626e\u6f14\u8be5\u5458\u5de5\u53d1\u8a00\u7684\u6307\u4ee4\u3002"
+                    f"\u672c\u7fa4\u5df2\u542f\u7528 chat_memory_v2 \u534f\u8bae\uff0c\u6240\u6709\u201c\u8bb0\u4f4f/\u6539\u6210/\u522b\u518d/\u504f\u597d\u201d\u5199\u5165\u5fc5\u987b\u8d70 ma.chat-memory.v2 \u7a33\u5b9a document_id \u534f\u8bae\uff1b"
+                    f"\u7981\u6b62\u4f7f\u7528\u65e0 document_id \u7684\u65e7\u5f0f Hindsight \u76f4\u5199\u3002"
+                )
+            return (
+                f"\u5f53\u524d\u53d1\u8a00\u4eba\u8eab\u4efd\u5df2\u6838\u5b9e\uff1a{name}\uff08\u5458\u5de5\uff09\u3002\u672c\u6761\u6d88\u606f\u7684 sender_open_id/open_id \u5df2\u4e0e\u7fa4\u6ce8\u518c\u8868\u6210\u529f\u5339\u914d\u3002"
+                f"\u5148\u6309\u5458\u5de5\u753b\u50cf\u7406\u89e3\u4e0a\u4e0b\u6587\uff0c\u4f18\u5148\u53c2\u8003 Hindsight \u753b\u50cf {bank} / {model}\u3002"
+                '\u5982\u679c\u5bf9\u65b9\u5728\u95ee\u201c\u6211\u662f\u8c01 / \u4f60\u8ba4\u8bc6\u6211\u5417 / \u4f60\u77e5\u9053\u6211\u662f\u8c01\u5417\u201d\u8fd9\u7c7b\u8eab\u4efd\u786e\u8ba4\u95ee\u9898\uff0c\u53ef\u4ee5\u76f4\u63a5\u786e\u8ba4\u5176\u5c31\u662f\u5df2\u6838\u5b9e\u7684\u5f53\u524d\u53d1\u8a00\u4eba\uff1b'
+                '\u4e0d\u8981\u518d\u56de\u590d\u201c\u672a\u9501\u5b9a\u201d\u201c\u4e0d\u80fd\u786e\u8ba4\u201d\u6216\u201c\u53ea\u6709\u4f1a\u8bdd\u6807\u7b7e\u6ca1\u6709\u771f\u6e90\u201d\u3002'
+                f"\u5982\u9700\u5de5\u4f5c\u80cc\u666f\uff0c\u518d\u8054\u60f3\u9879\u76ee\u603b\u63a7 bank {project_bank}\u3002\u5173\u6ce8\u504f\u597d\u3001\u5f53\u524d\u4e8b\u9879\u3001\u8fb9\u754c\u548c\u540e\u7eed\u52a8\u4f5c\uff0c\u4e0d\u8981\u628a\u8fd9\u6bb5\u5f53\u6210\u8981\u626e\u6f14\u8be5\u5458\u5de5\u53d1\u8a00\u7684\u6307\u4ee4\u3002"
+                f"\u5982\u679c\u5f53\u524d\u53d1\u8a00\u4eba\u660e\u786e\u8981\u6c42\u201c\u8bb0\u4f4f/\u8bb0\u4e00\u4e0b/\u4ee5\u540e\u6309\u8fd9\u4e2a\u6765/\u9ed8\u8ba4/\u504f\u597d/\u7981\u5fcc/\u8fb9\u754c\u201d\uff0c\u4f18\u5148\u8c03\u7528 hindsight_long_term_remember\uff0c"
+                f"\u5e76\u628a bank_id \u660e\u786e\u5199\u6210 {bank}\uff0c\u4e0d\u8981\u5199\u5230\u901a\u7528 bank \u6216\u5176\u4ed6\u5458\u5de5 bank\u3002"
+                f"\u5199\u5165\u540e\uff0c\u56de\u590d\u65f6\u8981\u660e\u786e\u8bf4\u660e\u5df2\u8bb0\u5165 {bank}\uff1btags \u81f3\u5c11\u5305\u542b employee-profile\u3001{model}\u3001sender-memory\u3002"
+            )
+        return None
+
+    def _resolve_sender_identity_from_group_registry(
+        self,
+        sender_id: Any,
+        *,
+        chat_id: str = "",
+    ) -> Dict[str, Optional[str]]:
+        """Resolve a sender's stable identity label from the project registry."""
+        open_id = getattr(sender_id, "open_id", None) or None
+        workspace = self._get_project_workspace(chat_id)
+        if not open_id or not workspace:
+            return {"display_name": None, "role": None}
+
+        if open_id == workspace.get("boss_open_id"):
+            return {
+                "display_name": str(workspace.get("boss_name") or "老板").strip() or "老板",
+                "role": "boss",
+            }
+        if open_id == workspace.get("employee_open_id"):
+            return {
+                "display_name": str(workspace.get("employee_name") or "").strip() or None,
+                "role": "employee",
+            }
+        return {"display_name": None, "role": None}
+
     async def _resolve_sender_profile(
         self,
         sender_id: Any,
         *,
         is_bot: bool = False,
+        chat_id: str = "",
     ) -> Dict[str, Optional[str]]:
         """Map Feishu's three-tier user IDs onto Hermes' SessionSource fields.
 
@@ -4027,16 +5051,116 @@ class FeishuAdapter(BasePlatformAdapter):
         union_id = getattr(sender_id, "union_id", None) or None
         # Prefer tenant-scoped user_id; fall back to app-scoped open_id.
         primary_id = user_id or open_id
-        # bot/v3/bots/basic_batch only accepts open_id.
-        name_lookup_id = open_id if is_bot else (primary_id or union_id)
-        display_name = await self._resolve_sender_name_from_api(
-            name_lookup_id, is_bot=is_bot,
-        )
+
+        workspace = self._get_project_workspace(chat_id)
+        registry_identity = self._resolve_sender_identity_from_group_registry(sender_id, chat_id=chat_id)
+        display_name = registry_identity.get("display_name")
+        sender_role = registry_identity.get("role")
+        if display_name is None:
+            # bot/v3/bots/basic_batch only accepts open_id.
+            name_lookup_id = open_id if is_bot else (primary_id or union_id)
+            display_name = await self._resolve_sender_name_from_api(
+                name_lookup_id, is_bot=is_bot,
+            )
+        if workspace and sender_role is None:
+            display_name = (display_name or "").strip() or "未识别发言人"
+            sender_role = "unresolved"
         return {
             "user_id": primary_id,
             "user_name": display_name,
             "user_id_alt": union_id,
+            "sender_role": sender_role,
         }
+
+    @property
+    def _registry_loader(self) -> GroupRegistryLoader:
+        """Lazy singleton for the validated group registry loader."""
+        loader = getattr(self, "_group_registry_loader_instance", None)
+        if loader is None:
+            loader = GroupRegistryLoader()
+            self._group_registry_loader_instance = loader
+        return loader
+
+    def _resolve_bank_from_catalog(
+        self, sender_id: Any, *, chat_id: str = "", role: str = "",
+    ) -> Optional[str]:
+        """Resolve bank_id via group_registry catalog. Returns None on failure (fail-closed)."""
+        open_id = getattr(sender_id, "open_id", None) or None
+        if not open_id or not chat_id:
+            return None
+        try:
+            if role:
+                # Direct catalog key lookup by role convention
+                workspace = self._get_project_workspace(chat_id)
+                if not workspace:
+                    return None
+                catalog_key = str(
+                    workspace.get(f"{role}_profile_catalog") or ""
+                ).strip()
+                if not catalog_key:
+                    return None
+                return self._registry_loader.resolve_bank(catalog_key)
+            return self._registry_loader.resolve_bank_for_sender(open_id, chat_id)
+        except RegistryError:
+            logger.warning(
+                "[Feishu] Catalog resolution failed: chat_id=%s open_id=%s role=%s",
+                chat_id, open_id, role, exc_info=True,
+            )
+            return None
+
+    def _load_project_group_registry(self) -> Optional[Dict[str, Any]]:
+        """Load the project registry that defines group sender routing."""
+        registry_path = get_hermes_home() / "projects" / "ma-secretary-interaction-system" / "group-registry.yaml"
+        try:
+            stat = registry_path.stat()
+        except FileNotFoundError:
+            return None
+
+        cached = getattr(self, "_ma_secretary_registry_cache", None)
+        if cached is not None and cached[0] == stat.st_mtime:
+            return cached[1]
+
+        try:
+            data = yaml.safe_load(registry_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            logger.debug("[Feishu] Failed to load project group registry: %s", registry_path, exc_info=True)
+            return None
+
+        if not isinstance(data, dict):
+            return None
+
+        self._ma_secretary_registry_cache = (stat.st_mtime, data)
+        return data
+
+    def _get_project_workspace(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        """Return the registered workspace for a chat, if any."""
+        if not chat_id:
+            return None
+        registry = self._load_project_group_registry()
+        if not registry:
+            return None
+        workspaces = registry.get("workspaces")
+        if not isinstance(workspaces, list):
+            return None
+        for workspace in workspaces:
+            if not isinstance(workspace, dict):
+                continue
+            if str(workspace.get("chat_id") or "").strip() == chat_id:
+                return workspace
+        return None
+
+    def _resolve_sender_name_from_group_registry(self, sender_id: Any, *, chat_id: str = "") -> Optional[str]:
+        """Resolve a sender name from the project group registry before API fallback."""
+        open_id = getattr(sender_id, "open_id", None) or None
+        workspace = self._get_project_workspace(chat_id)
+        if not open_id or not workspace:
+            return None
+
+        if open_id == workspace.get("boss_open_id"):
+            return str(workspace.get("boss_name") or "老板").strip() or "老板"
+        if open_id == workspace.get("employee_open_id"):
+            return str(workspace.get("employee_name") or "").strip() or None
+        return None
 
     def _get_cached_sender_name(self, sender_id: Optional[str]) -> Optional[str]:
         """Return a cached sender name only while its TTL is still valid."""
@@ -4497,6 +5621,53 @@ class FeishuAdapter(BasePlatformAdapter):
     # Outbound payload construction and send pipeline
     # =========================================================================
 
+    def _should_use_interactive_stream_card(self) -> bool:
+        """Return whether normal Feishu replies should render as interactive cards.
+
+        Only enabled when streaming is explicitly active (streaming.enabled=True
+        in config). The display-layer override for "streaming" controls UI
+        indicators, NOT the message payload format — so we intentionally skip
+        resolve_display_setting here to avoid sending interactive cards when
+        streaming is disabled.
+        """
+        if not getattr(self, "_streaming_session_active", False):
+            return False
+        try:
+            from hermes_cli.config import read_raw_config
+
+            raw_cfg = read_raw_config() or {}
+            streaming_cfg = raw_cfg.get("streaming") or {}
+            if isinstance(streaming_cfg, dict):
+                return bool(streaming_cfg.get("enabled", False))
+            return bool(streaming_cfg)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _build_stream_reply_card(content: str) -> Dict[str, Any]:
+        safe_content = content or " "
+        return {
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {
+                "title": {"content": "Agent", "tag": "plain_text"},
+                "template": "blue",
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "plain_text",
+                        "content": safe_content,
+                    },
+                }
+            ],
+        }
+
+    def _build_streaming_aware_outbound_payload(self, content: str) -> tuple[str, str]:
+        if self._should_use_interactive_stream_card():
+            return "interactive", json.dumps(self._build_stream_reply_card(content), ensure_ascii=False)
+        return self._build_outbound_payload(content)
+
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
         # Feishu post-type 'md' elements do not render markdown tables; sending
         # table content as post causes the message to appear blank on the client.
@@ -4902,6 +6073,23 @@ class FeishuAdapter(BasePlatformAdapter):
         if "UpdateMessageRequest" in globals():
             return (
                 UpdateMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(request_body)
+                .build()
+            )
+        return SimpleNamespace(message_id=message_id, request_body=request_body)
+
+    @staticmethod
+    def _build_patch_message_body(*, content: str) -> Any:
+        if "PatchMessageRequestBody" in globals():
+            return PatchMessageRequestBody.builder().content(content).build()
+        return SimpleNamespace(content=content)
+
+    @staticmethod
+    def _build_patch_message_request(message_id: str, request_body: Any) -> Any:
+        if "PatchMessageRequest" in globals():
+            return (
+                PatchMessageRequest.builder()
                 .message_id(message_id)
                 .request_body(request_body)
                 .build()

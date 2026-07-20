@@ -24,6 +24,13 @@ def _jwt_with_claims(claims: dict) -> str:
     return f"{_part({'alg': 'none', 'typ': 'JWT'})}.{_part(claims)}.sig"
 
 
+def _codex_jwt(email: str, account_id: str) -> str:
+    return _jwt_with_claims({
+        "https://api.openai.com/profile": {"email": email},
+        "https://api.openai.com/auth": {"chatgpt_account_id": account_id},
+    })
+
+
 def test_fill_first_selection_skips_recently_exhausted_entry(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(
@@ -67,6 +74,274 @@ def test_fill_first_selection_skips_recently_exhausted_entry(tmp_path, monkeypat
     assert entry is not None
     assert entry.id == "cred-2"
     assert pool.current().id == "cred-2"
+
+
+def test_codex_singleton_sync_does_not_overwrite_other_account_entry(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: None,
+    )
+    primary_token = _codex_jwt("guyu4338@gmail.com", "c3e53d25-e0a5-48f7-b3b5-5252db4099f0")
+    backup_token = _codex_jwt("hhyy20232023@gmail.com", "37ad4a1f-dc64-459e-8e26-ee60dc2ffffe")
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {"access_token": backup_token, "refresh_token": "rt-backup-singleton"},
+                    "auth_mode": "chatgpt",
+                },
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-primary",
+                        "label": "CODEX2-primary",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "device_code",
+                        "access_token": primary_token,
+                        "refresh_token": "rt-primary",
+                    },
+                    {
+                        "id": "cred-backup",
+                        "label": "CODEX1-backup",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "device_code",
+                        "access_token": backup_token,
+                        "refresh_token": "rt-backup",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    selected = pool.select()
+    assert selected is not None
+    assert selected.id == "cred-primary"
+    assert selected.access_token == primary_token
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = {item["id"]: item for item in auth_payload["credential_pool"]["openai-codex"]}
+    assert persisted["cred-primary"]["access_token"] == primary_token
+    assert persisted["cred-primary"]["refresh_token"] == "rt-primary"
+    assert persisted["cred-backup"]["access_token"] == backup_token
+
+
+def test_codex_multi_account_sync_keeps_dead_entry_quarantined():
+    from agent.credential_pool import (
+        STATUS_DEAD,
+        CredentialPool,
+        PooledCredential,
+    )
+
+    dead = PooledCredential.from_dict("openai-codex", {
+        "id": "dead-account",
+        "source": "device_code",
+        "auth_type": "oauth",
+        "access_token": _codex_jwt(
+            "dead@example.com",
+            "57a7a461-72ec-4a9f-ad24-b94aa5d08517",
+        ),
+        "refresh_token": "dead-refresh",
+        "last_status": STATUS_DEAD,
+    })
+    healthy = PooledCredential.from_dict("openai-codex", {
+        "id": "healthy-account",
+        "source": "device_code",
+        "auth_type": "oauth",
+        "access_token": _codex_jwt(
+            "healthy@example.com",
+            "d15a22e1-0f0a-4ca6-a282-c680a6e06f73",
+        ),
+        "refresh_token": "healthy-refresh",
+    })
+    pool = CredentialPool("openai-codex", [dead, healthy])
+
+    available = pool._available_entries()
+
+    assert [entry.id for entry in available] == ["healthy-account"]
+    assert pool.entries()[0].last_status == STATUS_DEAD
+
+
+def test_codex_manual_entry_clears_stale_status_without_singleton_overwrite(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: None,
+    )
+    manual_token = _codex_jwt("guyu4338@gmail.com", "c3e53d25-e0a5-48f7-b3b5-5252db4099f0")
+    singleton_token = _codex_jwt("hhyy20232023@gmail.com", "37ad4a1f-dc64-459e-8e26-ee60dc2ffffe")
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {"access_token": singleton_token, "refresh_token": "rt-singleton"},
+                    "auth_mode": "chatgpt",
+                },
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-manual",
+                        "label": "manual-primary",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": manual_token,
+                        "refresh_token": "rt-manual",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time() - 3600,
+                        "last_error_code": 429,
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    selected = pool.select()
+    assert selected is not None
+    assert selected.id == "cred-manual"
+    assert selected.access_token == manual_token
+    assert selected.last_status == "ok"
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = auth_payload["credential_pool"]["openai-codex"][0]
+    assert persisted["access_token"] == manual_token
+    assert persisted["refresh_token"] == "rt-manual"
+    assert persisted["last_status"] == "ok"
+
+
+def test_codex_upsert_entry_matches_by_id_when_source_shared():
+    from agent.credential_pool import PooledCredential, _upsert_entry
+
+    primary_token = _codex_jwt("guyu4338@gmail.com", "c3e53d25-e0a5-48f7-b3b5-5252db4099f0")
+    backup_token = _codex_jwt("hhyy20232023@gmail.com", "37ad4a1f-dc64-459e-8e26-ee60dc2ffffe")
+    entries = [
+        PooledCredential.from_dict("openai-codex", {
+            "id": "cred-primary", "label": "CODEX2-primary", "auth_type": "oauth",
+            "priority": 0, "source": "device_code", "access_token": primary_token,
+            "refresh_token": "rt-primary",
+        }),
+        PooledCredential.from_dict("openai-codex", {
+            "id": "cred-backup", "label": "CODEX1-backup", "auth_type": "oauth",
+            "priority": 1, "source": "device_code", "access_token": backup_token,
+            "refresh_token": "rt-backup",
+        }),
+    ]
+
+    changed = _upsert_entry(entries, "openai-codex", "device_code", {
+        "id": "cred-backup",
+        "source": "device_code",
+        "auth_type": "oauth",
+        "label": "CODEX1-backup",
+        "access_token": backup_token,
+        "refresh_token": "rt-backup-new",
+    })
+
+    assert changed is True
+    assert entries[0].refresh_token == "rt-primary"
+    assert entries[1].refresh_token == "rt-backup-new"
+
+
+def test_codex_upsert_entry_matches_by_account_id_when_source_shared():
+    from agent.credential_pool import PooledCredential, _upsert_entry
+
+    primary_token = _codex_jwt("guyu4338@gmail.com", "c3e53d25-e0a5-48f7-b3b5-5252db4099f0")
+    backup_token = _codex_jwt("hhyy20232023@gmail.com", "37ad4a1f-dc64-459e-8e26-ee60dc2ffffe")
+    backup_token_new = _codex_jwt("hhyy20232023@gmail.com", "37ad4a1f-dc64-459e-8e26-ee60dc2ffffe")
+    entries = [
+        PooledCredential.from_dict("openai-codex", {
+            "id": "cred-primary", "label": "CODEX2-primary", "auth_type": "oauth",
+            "priority": 0, "source": "device_code", "access_token": primary_token,
+            "refresh_token": "rt-primary",
+        }),
+        PooledCredential.from_dict("openai-codex", {
+            "id": "cred-backup", "label": "CODEX1-backup", "auth_type": "oauth",
+            "priority": 1, "source": "device_code", "access_token": backup_token,
+            "refresh_token": "rt-backup",
+        }),
+    ]
+
+    changed = _upsert_entry(entries, "openai-codex", "device_code", {
+        "source": "device_code",
+        "auth_type": "oauth",
+        "label": "hhyy20232023@gmail.com",
+        "access_token": backup_token_new,
+        "refresh_token": "rt-backup-newer",
+    })
+
+    assert changed is True
+    assert entries[0].refresh_token == "rt-primary"
+    assert entries[1].refresh_token == "rt-backup-newer"
+
+
+def test_codex_upsert_entry_single_candidate_falls_back_to_source_match():
+    from agent.credential_pool import PooledCredential, _upsert_entry
+
+    primary_token = _codex_jwt("guyu4338@gmail.com", "c3e53d25-e0a5-48f7-b3b5-5252db4099f0")
+    entries = [
+        PooledCredential.from_dict("openai-codex", {
+            "id": "cred-primary", "label": "CODEX2-primary", "auth_type": "oauth",
+            "priority": 0, "source": "device_code", "access_token": primary_token,
+            "refresh_token": "rt-primary",
+        }),
+    ]
+
+    changed = _upsert_entry(entries, "openai-codex", "device_code", {
+        "source": "device_code",
+        "auth_type": "oauth",
+        "access_token": primary_token,
+        "refresh_token": "rt-primary-new",
+    })
+
+    assert changed is True
+    assert len(entries) == 1
+    assert entries[0].refresh_token == "rt-primary-new"
+
+
+def test_codex_upsert_entry_appends_when_shared_source_identity_ambiguous():
+    from agent.credential_pool import PooledCredential, _upsert_entry
+
+    primary_token = _codex_jwt("guyu4338@gmail.com", "c3e53d25-e0a5-48f7-b3b5-5252db4099f0")
+    backup_token = _codex_jwt("hhyy20232023@gmail.com", "37ad4a1f-dc64-459e-8e26-ee60dc2ffffe")
+    entries = [
+        PooledCredential.from_dict("openai-codex", {
+            "id": "cred-primary", "label": "CODEX2-primary", "auth_type": "oauth",
+            "priority": 0, "source": "device_code", "access_token": primary_token,
+            "refresh_token": "rt-primary",
+        }),
+        PooledCredential.from_dict("openai-codex", {
+            "id": "cred-backup", "label": "CODEX1-backup", "auth_type": "oauth",
+            "priority": 1, "source": "device_code", "access_token": backup_token,
+            "refresh_token": "rt-backup",
+        }),
+    ]
+
+    changed = _upsert_entry(entries, "openai-codex", "device_code", {
+        "source": "device_code",
+        "auth_type": "oauth",
+        "label": "device_code",
+        "access_token": "not-a-jwt",
+        "refresh_token": "rt-ambiguous",
+    })
+
+    assert changed is True
+    assert len(entries) == 3
+    assert entries[0].refresh_token == "rt-primary"
+    assert entries[1].refresh_token == "rt-backup"
+    assert entries[2].refresh_token == "rt-ambiguous"
 
 
 def test_select_clears_expired_exhaustion(tmp_path, monkeypatch):
@@ -2688,6 +2963,108 @@ def test_sync_codex_entry_noop_when_tokens_match(tmp_path, monkeypatch):
     assert synced is entry
 
 
+def test_sync_codex_entry_noop_for_multi_account_pool_without_identity_claims(tmp_path, monkeypatch):
+    """Multi-account pools must never adopt the singleton token on blind trust."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {"access_token": "singleton-last-login", "refresh_token": "refresh-singleton"},
+                    "auth_mode": "chatgpt",
+                },
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-primary",
+                        "label": "CODEX2-primary",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "device_code",
+                        "access_token": "primary-token",
+                        "refresh_token": "refresh-primary",
+                    },
+                    {
+                        "id": "cred-backup",
+                        "label": "CODEX1-backup",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "device_code",
+                        "access_token": "backup-token",
+                        "refresh_token": "refresh-backup",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    entry = pool.select()
+    assert entry is not None
+    assert entry.id == "cred-primary"
+
+    synced = pool._sync_codex_entry_from_auth_store(entry)
+    assert synced is entry
+    assert synced.access_token == "primary-token"
+    assert synced.refresh_token == "refresh-primary"
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = {item["id"]: item for item in auth_payload["credential_pool"]["openai-codex"]}
+    assert persisted["cred-primary"]["access_token"] == "primary-token"
+    assert persisted["cred-backup"]["access_token"] == "backup-token"
+
+
+def test_load_pool_keeps_multi_account_codex_entries_stable_when_singleton_differs(tmp_path, monkeypatch):
+    """Pool load must not re-seed both Codex entries from the last singleton login."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {"access_token": "singleton-last-login", "refresh_token": "refresh-singleton"},
+                    "auth_mode": "chatgpt",
+                },
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-primary",
+                        "label": "CODEX2-primary",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "device_code",
+                        "access_token": "primary-token",
+                        "refresh_token": "refresh-primary",
+                    },
+                    {
+                        "id": "cred-backup",
+                        "label": "CODEX1-backup",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "device_code",
+                        "access_token": "backup-token",
+                        "refresh_token": "refresh-backup",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    entries = sorted(pool._entries, key=lambda item: item.priority)
+    assert [entry.id for entry in entries] == ["cred-primary", "cred-backup"]
+    assert [entry.access_token for entry in entries] == ["primary-token", "backup-token"]
+
+
 def test_codex_exhausted_entry_recovers_via_auth_store_sync(tmp_path, monkeypatch):
     """An exhausted Codex entry should recover when auth.json has newer tokens.
 
@@ -2971,7 +3348,18 @@ def test_codex_oauth_terminal_refresh_clears_auth_json_and_removes_pool_entries(
     assert selected is not None
     assert selected.source == "device_code"
 
-    # Add a manual API-key entry that must survive the quarantine.
+    # Add another device-code account and a manual API-key entry.  A
+    # terminal failure must remove only the selected singleton account.
+    pool.add_entry(PooledCredential.from_dict("openai-codex", {
+        "id": "backup-device",
+        "source": "device_code",
+        "auth_type": "oauth",
+        "access_token": _codex_jwt(
+            "backup@example.com",
+            "9bd29047-28e2-4c2b-90d7-6707809bb189",
+        ),
+        "refresh_token": "backup-refresh-token",
+    }))
     pool.add_entry(PooledCredential.from_dict("openai-codex", {
         "id": "manual-key",
         "source": "manual",
@@ -2994,8 +3382,11 @@ def test_codex_oauth_terminal_refresh_clears_auth_json_and_removes_pool_entries(
 
     assert pool.try_refresh_current() is None
 
-    # Only the manual entry survives.
-    assert [entry.id for entry in pool.entries()] == ["manual-key"]
+    # The failing singleton is gone; the other accounts survive.
+    assert [entry.id for entry in pool.entries()] == [
+        "backup-device",
+        "manual-key",
+    ]
 
     # Auth.json tokens must be cleared.
     auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
@@ -3006,8 +3397,11 @@ def test_codex_oauth_terminal_refresh_clears_auth_json_and_removes_pool_entries(
     assert codex_state["last_auth_error"]["code"] == "codex_refresh_failed"
     assert codex_state["last_auth_error"]["relogin_required"] is True
 
-    # Persisted pool must also have only the manual entry.
-    assert [entry["id"] for entry in auth_payload["credential_pool"]["openai-codex"]] == ["manual-key"]
+    # The persisted pool retains the healthy device and manual entries.
+    assert [
+        entry["id"]
+        for entry in auth_payload["credential_pool"]["openai-codex"]
+    ] == ["backup-device", "manual-key"]
 
     # A second try_refresh_current must not call refresh_codex_oauth_pure again.
     assert pool.try_refresh_current() is None

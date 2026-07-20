@@ -236,7 +236,26 @@ def label_from_token(token: str, fallback: str) -> str:
         value = claims.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
+    profile = claims.get("https://api.openai.com/profile")
+    if isinstance(profile, dict):
+        email = profile.get("email")
+        if isinstance(email, str) and email.strip():
+            return email.strip()
     return fallback
+
+
+def _codex_account_id_from_token(token: str) -> str:
+    """Return the stable ChatGPT account id carried by a Codex JWT."""
+    claims = _decode_jwt_claims(token)
+    auth_claim = claims.get("https://api.openai.com/auth")
+    if isinstance(auth_claim, dict):
+        account_id = auth_claim.get("chatgpt_account_id")
+        if isinstance(account_id, str) and account_id.strip():
+            return account_id.strip()
+    account_id = claims.get("chatgpt_account_id")
+    if isinstance(account_id, str) and account_id.strip():
+        return account_id.strip()
+    return ""
 
 
 def _next_priority(entries: List[PooledCredential]) -> int:
@@ -668,6 +687,21 @@ class CredentialPool:
         auth.json shadow to sync from.
         """
         if self.provider != "openai-codex" or entry.source != "device_code":
+            return entry
+        # Multi-account Codex pool: the singleton only reflects the most
+        # recent device-code login.  Syncing from it would overwrite one
+        # pool entry with another account's identity, causing serial-number
+        # drift.  Per-entry tokens are the source of truth in this case.
+        device_code_entries = [
+            candidate
+            for candidate in self._entries
+            if candidate.source == "device_code"
+        ]
+        if len(device_code_entries) > 1:
+            # The singleton cannot prove which account was re-authenticated.
+            # Keep per-entry status and tokens authoritative; in particular a
+            # DEAD credential must remain quarantined until an account-specific
+            # write replaces its token pair.
             return entry
         try:
             with _auth_store_lock():
@@ -1238,13 +1272,12 @@ class CredentialPool:
                         logger.debug(
                             "Failed to clear terminal Codex OAuth state: %s", clear_exc
                         )
-                    removed_ids = [
-                        item.id for item in self._entries
-                        if item.source == "device_code"
-                    ]
+                    # Remove only the terminally invalid singleton entry.
+                    # Other device-code accounts and manual API-key entries
+                    # remain usable in a multi-account pool.
+                    removed_ids = [entry.id]
                     self._entries = [
-                        item for item in self._entries
-                        if item.source != "device_code"
+                        item for item in self._entries if item.id != entry.id
                     ]
                     if self._current_id == entry.id:
                         self._current_id = None
@@ -1692,12 +1725,69 @@ class CredentialPool:
         return entry
 
 
-def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, payload: Dict[str, Any]) -> bool:
-    existing_idx = None
-    for idx, entry in enumerate(entries):
-        if entry.source == source:
-            existing_idx = idx
-            break
+def _upsert_entry(
+    entries: List[PooledCredential],
+    provider: str,
+    source: str,
+    payload: Dict[str, Any],
+) -> bool:
+    candidate_indexes = [
+        idx for idx, entry in enumerate(entries) if entry.source == source
+    ]
+    existing_idx: Optional[int] = None
+
+    payload_id = str(payload.get("id") or "").strip()
+    if payload_id:
+        existing_idx = next(
+            (
+                idx
+                for idx in candidate_indexes
+                if entries[idx].id == payload_id
+            ),
+            None,
+        )
+        # A caller-provided, previously unseen id represents a new identity.
+        if existing_idx is None and len(candidate_indexes) > 1:
+            candidate_indexes = []
+    elif len(candidate_indexes) == 1:
+        existing_idx = candidate_indexes[0]
+    elif (
+        provider == "openai-codex"
+        and source == "device_code"
+        and len(candidate_indexes) > 1
+    ):
+        payload_token = str(payload.get("access_token") or "")
+        payload_account_id = _codex_account_id_from_token(payload_token)
+        if payload_account_id:
+            account_matches = [
+                idx
+                for idx in candidate_indexes
+                if _codex_account_id_from_token(entries[idx].access_token)
+                == payload_account_id
+            ]
+            if len(account_matches) == 1:
+                existing_idx = account_matches[0]
+        if existing_idx is None and payload_token:
+            token_matches = [
+                idx
+                for idx in candidate_indexes
+                if entries[idx].access_token == payload_token
+            ]
+            if len(token_matches) == 1:
+                existing_idx = token_matches[0]
+        if existing_idx is None:
+            payload_label = str(payload.get("label") or "").strip()
+            if payload_label and payload_label != source:
+                label_matches = [
+                    idx
+                    for idx in candidate_indexes
+                    if entries[idx].label == payload_label
+                ]
+                if len(label_matches) == 1:
+                    existing_idx = label_matches[0]
+    elif candidate_indexes:
+        # Other providers retain their historical singleton-per-source rule.
+        existing_idx = candidate_indexes[0]
 
     if existing_idx is None:
         payload.setdefault("id", uuid.uuid4().hex[:6])
@@ -2041,6 +2131,13 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         # existing Codex CLI credentials get a one-time, explicit prompt
         # via `hermes auth openai-codex`.
         if isinstance(tokens, dict) and tokens.get("access_token"):
+            # Multi-account Codex pool must NOT be re-seeded from the
+            # singleton because the singleton only reflects the most
+            # recent device-code login and would overwrite one pool entry
+            # with another account's identity.
+            existing_device_code = [e for e in entries if e.source == "device_code"]
+            if len(existing_device_code) > 1:
+                return changed, active_sources
             active_sources.add("device_code")
             custom_label = str(state.get("label") or "").strip()
             changed |= _upsert_entry(

@@ -491,6 +491,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.group_outbox import GroupOutboxMixin
 from gateway.session import SessionSource, build_session_key
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
 
@@ -2250,7 +2251,7 @@ def _strip_media_directives(text: str) -> str:
     return _strip_media_tag_directives(text)
 
 
-class BasePlatformAdapter(ABC):
+class BasePlatformAdapter(GroupOutboxMixin, ABC):
     """
     Base class for platform adapters.
     
@@ -2346,6 +2347,12 @@ class BasePlatformAdapter(ABC):
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
         self._session_tasks: Dict[str, asyncio.Task] = {}
+        # ── Shared-group SQLite outbox: persistent FIFO for shared sessions ──
+        # Replaces the old dual-queue (memory Queue + overflow SQLite).
+        # Single source of truth: SQLite table with monotonic seq, state machine
+        # (queued→leased→acked), and crash-safe lease recovery.
+        # ── Shared-group outbox state (via GroupOutboxMixin) ──
+        self._init_group_outbox()
         # Legacy busy_text_mode env var; when unset the runner syncs the
         # resolved value (driven by busy_input_mode) onto the adapter after
         # construction (gateway/run.py). Default to "interrupt" so a stray
@@ -4647,9 +4654,28 @@ class BasePlatformAdapter(ABC):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            shared_group_session_chat_ids=self.config.extra.get("shared_group_session_chat_ids"),
         )
 
-        # On-entry self-heal: if the adapter still has an _active_sessions
+        # ── Durable-first: shared-group messages always hit outbox first ──
+        shared_ids = self.config.extra.get("shared_group_session_chat_ids") or []
+        source_chat = getattr(event.source, "chat_id", "") if event.source else ""
+        if source_chat in shared_ids:
+            enqueue_result = self._enqueue_group_event(source_chat, event)
+            if enqueue_result.get("status") != "failed":
+                # The owner-leased worker is the only consumer.  This keeps all
+                # adapters and restarts on one FIFO path and one canonical
+                # session key instead of spawning a second busy-session path.
+                self._start_group_worker(source_chat)
+                return
+            logger.error(
+                "[%s] Shared-group outbox unavailable for %s; "
+                "falling back to in-memory dispatch",
+                self.name,
+                source_chat,
+            )
+
+        # On-entry self-heal
         # entry for this key but the owner task has already exited (done or
         # cancelled), the lock is stale.  Clear it and fall through to
         # normal dispatch so the user isn't trapped behind a dead guard —
@@ -4852,13 +4878,22 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        processing_ok = False
+        # Outbox tracking
+        _outbox_seq = getattr(event, "_outbox_seq", None)
+        _outbox_chat_id = getattr(event, "_outbox_chat_id", None)
+        _outbox_token = getattr(event, "_outbox_token", "")
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
             if result is None:
                 return
             delivery_attempted = True
-            if getattr(result, "success", False):
+            succeeded = (
+                result if isinstance(result, bool)
+                else bool(getattr(result, "success", False))
+            )
+            if succeeded:
                 delivery_succeeded = True
 
         # Reuse the interrupt event set by handle_message() (which marks
@@ -5032,6 +5067,7 @@ class BasePlatformAdapter(ABC):
                             caption=telegram_tts_caption,
                             metadata=_final_thread_metadata,
                         )
+                        _record_delivery(tts_result)
                         _tts_caption_delivered = bool(
                             telegram_tts_caption and getattr(tts_result, "success", False)
                         )
@@ -5075,13 +5111,17 @@ class BasePlatformAdapter(ABC):
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
-                        await self.send_multiple_images(
+                        image_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=images,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(
+                            True if image_result is None else image_result
+                        )
                     except Exception as batch_err:
+                        _record_delivery(False)
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
 
@@ -5117,13 +5157,17 @@ class BasePlatformAdapter(ABC):
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        image_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(
+                            True if image_result is None else image_result
+                        )
                     except Exception as batch_err:
+                        _record_delivery(False)
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
                 for media_path, is_voice in _non_image_media:
@@ -5150,9 +5194,11 @@ class BasePlatformAdapter(ABC):
                                 metadata=_final_thread_metadata,
                             )
 
+                        _record_delivery(media_result)
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
                     except Exception as media_err:
+                        _record_delivery(False)
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
                 # Send auto-detected local non-image files as native attachments
@@ -5162,18 +5208,20 @@ class BasePlatformAdapter(ABC):
                     try:
                         ext = Path(file_path).suffix.lower()
                         if ext in _VIDEO_EXTS:
-                            await self.send_video(
+                            file_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
                         else:
-                            await self.send_document(
+                            file_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
+                        _record_delivery(file_result)
                     except Exception as file_err:
+                        _record_delivery(False)
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
 
                 # A3 (#29346): if a non-empty response produced nothing
@@ -5272,6 +5320,12 @@ class BasePlatformAdapter(ABC):
                     self.name, notify_err, exc_info=True,
                 )  # Last resort — don't let error reporting crash the handler
         finally:
+            # ── Outbox ack/nack ────────────────────────────────────────────
+            if _outbox_seq is not None and _outbox_chat_id is not None:
+                if delivery_succeeded or processing_ok:
+                    self._ack_group_event(_outbox_chat_id, _outbox_seq, lease_token=_outbox_token)
+                else:
+                    self._nack_group_event(_outbox_chat_id, _outbox_seq, lease_token=_outbox_token)
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not
             # leave the typing refresh task running indefinitely.
@@ -5367,6 +5421,25 @@ class BasePlatformAdapter(ABC):
                 # Leave _active_sessions[session_key] populated — the drain
                 # task's own lifecycle will clean it up.
             else:
+                # ── Shared-group outbox: dequeue next message if any ────────
+                shared_ids = self.config.extra.get("shared_group_session_chat_ids") or []
+                source_chat = getattr(event.source, "chat_id", "") if event.source else ""
+                if source_chat in shared_ids:
+                    next_event = self._dequeue_group_event(source_chat, session_key)
+                    if next_event is not None:
+                        _active = self._active_sessions.get(session_key)
+                        if _active is not None:
+                            _active.clear()
+                        drain_task = asyncio.create_task(
+                            self._process_message_background(next_event, session_key)
+                        )
+                        self._session_tasks[session_key] = drain_task
+                        try:
+                            self._background_tasks.add(drain_task)
+                            drain_task.add_done_callback(self._background_tasks.discard)
+                        except TypeError:
+                            pass
+                        return  # Drain task owns the session now
                 # Clean up session tracking.  Guard-match both deletes so a
                 # reset-like command that already swapped in its own
                 # command_guard (and cancelled us) can't be accidentally
@@ -5407,7 +5480,7 @@ class BasePlatformAdapter(ABC):
         self._release_session_guard(session_key, guard=interrupt_event)
         if session_key not in self._active_sessions:
             self._session_tasks.pop(session_key, None)
-    
+
     async def cancel_background_tasks(self) -> None:
         """Cancel any in-flight background message-processing tasks.
 
