@@ -1706,6 +1706,20 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _log_hermes_feishu_card_failure(exc: BaseException) -> None:
+    """Log real hook failures while treating an absent optional package as disabled."""
+    missing_name = getattr(exc, "name", "") if isinstance(exc, ModuleNotFoundError) else ""
+    if missing_name == "hermes_feishu_card" or missing_name.startswith(
+        "hermes_feishu_card."
+    ):
+        return
+    logger.warning(
+        "[hermes-feishu-card] hook failed: %s: %s",
+        exc.__class__.__name__,
+        exc,
+    )
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -10198,11 +10212,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _hfc_started_message_id = getattr(event, "message_id", None)
             _hfc_emit({**locals(), "message_id": _hfc_started_message_id})
         except Exception as _hfc_exc:
-            try:
-                import sys as _hfc_sys
-                logger.warning("[hermes-feishu-card] hook failed: %s: %s", _hfc_exc.__class__.__name__, _hfc_exc)
-            except Exception:
-                pass
+            _log_hermes_feishu_card_failure(_hfc_exc)
         # HERMES_FEISHU_CARD_PATCH_END
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
@@ -11546,10 +11556,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _hfc_should_suppress(_hfc_platform, _hfc_card_delivered, _hfc_attachments):
                     return None
             except Exception as _hfc_exc:
-                try:
-                    logger.warning("[hermes-feishu-card] hook failed: %s: %s", _hfc_exc.__class__.__name__, _hfc_exc)
-                except Exception:
-                    pass
+                _log_hermes_feishu_card_failure(_hfc_exc)
             # HERMES_FEISHU_CARD_COMPLETE_PATCH_END
             return response
             
@@ -16223,10 +16230,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     }, event_name="tool.updated"):
                         return
             except Exception as _hfc_exc:
-                try:
-                    logger.warning("[hermes-feishu-card] hook failed: %s: %s", _hfc_exc.__class__.__name__, _hfc_exc)
-                except Exception:
-                    pass
+                _log_hermes_feishu_card_failure(_hfc_exc)
             # HERMES_FEISHU_CARD_TOOL_PATCH_END
             if not progress_queue or not _run_still_current():
                 return
@@ -17045,11 +17049,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         }, event_name="answer.delta"):
                                             return
                                 except Exception as _hfc_exc:
-                                    try:
-                                        import sys as _hfc_sys
-                                        logger.warning("[hermes-feishu-card] hook failed: %s: %s", _hfc_exc.__class__.__name__, _hfc_exc)
-                                    except Exception:
-                                        pass
+                                    _log_hermes_feishu_card_failure(_hfc_exc)
                                 # HERMES_FEISHU_CARD_ANSWER_DELTA_PATCH_END
                                 if _run_still_current():
                                     _stream_consumer.on_delta(text)
@@ -17072,11 +17072,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         }, event_name="thinking.delta"):
                             return
                 except Exception as _hfc_exc:
-                    try:
-                        import sys as _hfc_sys
-                        logger.warning("[hermes-feishu-card] hook failed: %s: %s", _hfc_exc.__class__.__name__, _hfc_exc)
-                    except Exception:
-                        pass
+                    _log_hermes_feishu_card_failure(_hfc_exc)
                 # HERMES_FEISHU_CARD_THINKING_DELTA_PATCH_END
                 if not _run_still_current():
                     return
@@ -17416,11 +17412,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if _hfc_clarify_response is not None:
                             return _hfc_clarify_response
                 except Exception as _hfc_exc:
-                    try:
-                        import sys as _hfc_sys
-                        logger.warning("[hermes-feishu-card] hook failed: %s: %s", _hfc_exc.__class__.__name__, _hfc_exc)
-                    except Exception:
-                        pass
+                    _log_hermes_feishu_card_failure(_hfc_exc)
                 # HERMES_FEISHU_CARD_CLARIFY_PATCH_END
                 from tools import clarify_gateway as _clarify_mod
                 import uuid as _uuid
@@ -17583,11 +17575,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _hfc_resolve_gateway_approval(_approval_session_key, _hfc_approval_choice)
                             return
                 except Exception as _hfc_exc:
-                    try:
-                        import sys as _hfc_sys
-                        logger.warning("[hermes-feishu-card] hook failed: %s: %s", _hfc_exc.__class__.__name__, _hfc_exc)
-                    except Exception:
-                        pass
+                    _log_hermes_feishu_card_failure(_hfc_exc)
                 # HERMES_FEISHU_CARD_APPROVAL_PATCH_END
                 _status_adapter.pause_typing_for_chat(_status_chat_id)
 
@@ -18796,10 +18784,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             if _hfc_should_suppress(_hfc_platform, _hfc_card_delivered, _hfc_attachments):
                                 _already_streamed = True
                     except Exception as _hfc_exc:
-                        try:
-                            logger.warning("[hermes-feishu-card] hook failed: %s: %s", _hfc_exc.__class__.__name__, _hfc_exc)
-                        except Exception:
-                            pass
+                        _log_hermes_feishu_card_failure(_hfc_exc)
                     # HERMES_FEISHU_CARD_QUEUED_COMPLETE_PATCH_END
                     if first_response and not _already_streamed:
                         try:
