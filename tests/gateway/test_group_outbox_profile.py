@@ -49,8 +49,7 @@ async def test_group_worker_uses_canonical_session_key_and_guard():
     host._active_sessions = {}
     host._session_tasks = {}
     host._group_wakeup = asyncio.Event()
-    host._owner_token = None
-    host._owner_chat_id = None
+    host._owner_tokens = {}
 
     queued = [event]
     seen = []
@@ -94,3 +93,31 @@ async def test_group_worker_uses_canonical_session_key_and_guard():
         shared_group_session_chat_ids=[chat_id],
     )
     assert seen == [(event, expected_key, True)]
+
+
+def test_owner_lease_is_per_chat_and_survives_an_empty_outbox(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    first = _OutboxHost()
+    first.name = "first"
+    first._init_group_outbox()
+    first._ensure_outbox_db()
+
+    second = _OutboxHost()
+    second.name = "second"
+    second._init_group_outbox()
+    second._ensure_outbox_db()
+
+    assert first._try_acquire_owner_lease("chat-a") is True
+    assert first._try_acquire_owner_lease("chat-b") is True
+    assert set(first._owner_tokens) == {"chat-a", "chat-b"}
+
+    # No outbox row exists: ownership must still live in the dedicated table.
+    assert second._try_acquire_owner_lease("chat-a") is False
+
+    first._release_owner_lease("chat-a")
+    assert second._try_acquire_owner_lease("chat-a") is True
+
+    first._release_owner_lease("chat-b")
+    second._release_owner_lease("chat-a")
