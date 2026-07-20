@@ -692,29 +692,16 @@ class CredentialPool:
         # recent device-code login.  Syncing from it would overwrite one
         # pool entry with another account's identity, causing serial-number
         # drift.  Per-entry tokens are the source of truth in this case.
-        device_code_entries = [e for e in self._entries if e.source == "device_code"]
+        device_code_entries = [
+            candidate
+            for candidate in self._entries
+            if candidate.source == "device_code"
+        ]
         if len(device_code_entries) > 1:
-            # Still clear stale DEAD markers so the entry can self-recover
-            # via _refresh_entry later in _available_entries.  Do NOT clear
-            # exhausted_until (ChatGPT weekly quota) — that TTL is intentional.
-            if entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD} and entry.access_token:
-                exhausted_until = _exhausted_until(entry)
-                now = datetime.now(timezone.utc).timestamp()
-                # DEAD: clear immediately (no TTL makes sense for dead-in-pool)
-                # EXHAUSTED: only clear if the cooldown has actually passed
-                if entry.last_status == STATUS_DEAD and entry.access_token:
-                    updated = replace(
-                        entry,
-                        last_status=None,
-                        last_status_at=None,
-                        last_error_code=None,
-                        last_error_reason=None,
-                        last_error_message=None,
-                        last_error_reset_at=None,
-                    )
-                    self._replace_entry(entry, updated)
-                    self._persist()
-                    return updated
+            # The singleton cannot prove which account was re-authenticated.
+            # Keep per-entry status and tokens authoritative; in particular a
+            # DEAD credential must remain quarantined until an account-specific
+            # write replaces its token pair.
             return entry
         try:
             with _auth_store_lock():
