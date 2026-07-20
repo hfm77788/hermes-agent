@@ -280,6 +280,22 @@ class TestWeixinStatePersistence:
             "user-b": "fresh-token"
         }
 
+    def test_context_token_conditional_delete_preserves_newer_value(self, tmp_path):
+        token_path = tmp_path / "weixin" / "accounts" / "acct.context-tokens.json"
+        store = ContextTokenStore(str(tmp_path))
+        store.set("acct", "user-a", "stale-token")
+        store.set("acct", "user-a", "fresh-token")
+
+        assert store.delete_if_matches("acct", "user-a", "stale-token") is False
+        assert store.get("acct", "user-a") == "fresh-token"
+        assert json.loads(token_path.read_text(encoding="utf-8")) == {
+            "user-a": "fresh-token"
+        }
+
+        assert store.delete_if_matches("acct", "user-a", "fresh-token") is True
+        assert store.get("acct", "user-a") is None
+        assert json.loads(token_path.read_text(encoding="utf-8")) == {}
+
     def test_context_token_persist_preserves_existing_file_on_replace_failure(self, tmp_path, monkeypatch):
         token_path = tmp_path / "weixin" / "accounts" / "acct.context-tokens.json"
         token_path.parent.mkdir(parents=True, exist_ok=True)
@@ -487,7 +503,7 @@ class TestWeixinChunkDelivery:
             {"errcode": 0},
         ]
 
-        with patch.object(adapter._token_store, "delete") as delete_mock:
+        with patch.object(adapter._token_store, "delete_if_matches") as delete_mock:
             result = asyncio.run(adapter.send("wxid_test123", "recover"))
 
         assert result.success is True
@@ -496,8 +512,54 @@ class TestWeixinChunkDelivery:
         assert first_call.kwargs["context_token"] == "ctx-token"
         assert retry_call.kwargs["context_token"] is None
         assert first_call.kwargs["client_id"] == retry_call.kwargs["client_id"]
-        delete_mock.assert_called_once_with("test-account", "wxid_test123")
+        delete_mock.assert_called_once_with(
+            "test-account", "wxid_test123", "ctx-token"
+        )
         sleep_mock.assert_not_awaited()
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_tokenless_probe_preserves_newer_context_token(
+        self, send_message_mock, tmp_path
+    ):
+        adapter = self._connected_adapter()
+        adapter._send_chunk_retries = 1
+        adapter._send_chunk_retry_delay_seconds = 0
+        adapter._token_store = ContextTokenStore(str(tmp_path))
+        adapter._token_store.set("test-account", "wxid_test123", "ctx-token")
+        calls = 0
+
+        async def send_with_fresh_inbound_token(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {
+                    "ret": weixin.RATE_LIMIT_ERRCODE,
+                    "errcode": None,
+                    "errmsg": "rate limited",
+                }
+            adapter._token_store.set(
+                "test-account", "wxid_test123", "fresh-token"
+            )
+            return {"errcode": 0}
+
+        send_message_mock.side_effect = send_with_fresh_inbound_token
+
+        result = asyncio.run(adapter.send("wxid_test123", "recover"))
+
+        assert result.success is True
+        assert send_message_mock.await_count == 2
+        assert adapter._token_store.get(
+            "test-account", "wxid_test123"
+        ) == "fresh-token"
+        token_path = (
+            tmp_path
+            / "weixin"
+            / "accounts"
+            / "test-account.context-tokens.json"
+        )
+        assert json.loads(token_path.read_text(encoding="utf-8")) == {
+            "wxid_test123": "fresh-token"
+        }
 
     @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
     def test_multichunk_send_probes_stale_token_only_once(self, send_message_mock):
@@ -510,8 +572,12 @@ class TestWeixinChunkDelivery:
         adapter._token_store.get = lambda account_id, chat_id: tokens.get(
             (account_id, chat_id)
         )
-        adapter._token_store.delete = lambda account_id, chat_id: tokens.pop(
-            (account_id, chat_id), None
+        adapter._token_store.delete_if_matches = (
+            lambda account_id, chat_id, expected_token: (
+                tokens.pop((account_id, chat_id), None) is not None
+                if tokens.get((account_id, chat_id)) == expected_token
+                else False
+            )
         )
         send_message_mock.side_effect = [
             {
@@ -557,7 +623,7 @@ class TestWeixinChunkDelivery:
             },
         ]
 
-        with patch.object(adapter._token_store, "delete") as delete_mock:
+        with patch.object(adapter._token_store, "delete_if_matches") as delete_mock:
             result = asyncio.run(adapter.send("wxid_test123", "limited"))
 
         assert result.success is False

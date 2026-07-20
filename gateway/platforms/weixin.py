@@ -307,6 +307,17 @@ class ContextTokenStore:
         self._cache.pop(self._key(account_id, user_id), None)
         self._persist(account_id)
 
+    def delete_if_matches(
+        self, account_id: str, user_id: str, expected_token: str
+    ) -> bool:
+        """Remove a token only when it is still the value that failed."""
+        key = self._key(account_id, user_id)
+        if self._cache.get(key) != expected_token:
+            return False
+        self._cache.pop(key)
+        self._persist(account_id)
+        return True
+
     def _persist(self, account_id: str) -> None:
         prefix = f"{account_id}:"
         payload = {
@@ -1756,7 +1767,7 @@ class WeixinAdapter(BasePlatformAdapter):
         """Send a text chunk while holding the adapter-wide outbound text gate."""
         last_error: Optional[Exception] = None
         retried_without_token = False
-        rate_limit_tokenless_probe = False
+        probed_context_token: Optional[str] = None
         for attempt in range(self._send_chunk_retries + 1):
             if self._rate_limit_cooldown_remaining() > 0:
                 raise self._rate_limit_error()
@@ -1788,8 +1799,11 @@ class WeixinAdapter(BasePlatformAdapter):
                             and attempt < self._send_chunk_retries
                         ):
                             retried_without_token = True
+                            stale_context_token = context_token
                             context_token = None
-                            self._token_store.delete(self._account_id, chat_id)
+                            self._token_store.delete_if_matches(
+                                self._account_id, chat_id, stale_context_token
+                            )
                             logger.warning(
                                 "[%s] session expired for %s; retrying without context_token",
                                 self.name, _safe_id(chat_id),
@@ -1812,7 +1826,7 @@ class WeixinAdapter(BasePlatformAdapter):
                             and attempt < self._send_chunk_retries
                         ):
                             retried_without_token = True
-                            rate_limit_tokenless_probe = True
+                            probed_context_token = context_token
                             context_token = None
                             logger.warning(
                                 "[%s] iLink rate-limit code for %s; retrying once without context_token",
@@ -1844,12 +1858,14 @@ class WeixinAdapter(BasePlatformAdapter):
                         raise RuntimeError(
                             f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg}"
                         )
-                if rate_limit_tokenless_probe:
+                if probed_context_token:
                     # The tokenless probe succeeded, confirming that the stored
                     # token was stale rather than the account being throttled.
-                    # Remove it durably so a gateway restart cannot reintroduce
-                    # the same failure.
-                    self._token_store.delete(self._account_id, chat_id)
+                    # Remove that exact value durably, but preserve a newer token
+                    # received for the peer while the probe was in flight.
+                    self._token_store.delete_if_matches(
+                        self._account_id, chat_id, probed_context_token
+                    )
                 self._reset_rate_limit_circuit()
                 return
             except Exception as exc:
