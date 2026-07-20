@@ -1930,6 +1930,10 @@ class WeixinAdapter(BasePlatformAdapter):
                     context_token=context_token,
                     client_id=client_id,
                 )
+                # A successful tokenless probe may have removed a confirmed
+                # stale token. Refresh between chunks so one long reply does
+                # not repeat the same failed probe for every chunk.
+                context_token = self._token_store.get(self._account_id, chat_id)
                 last_message_id = client_id
                 if idx < len(chunks) - 1 and self._send_chunk_delay_seconds > 0:
                     await asyncio.sleep(self._send_chunk_delay_seconds)
