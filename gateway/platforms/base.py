@@ -4055,6 +4055,24 @@ class BasePlatformAdapter(GroupOutboxMixin, ABC):
         lowered = error.lower()
         return "timed out" in lowered or "readtimeout" in lowered or "writetimeout" in lowered
 
+    @staticmethod
+    def _is_delivery_backpressure_error(error: Optional[str]) -> bool:
+        """Return True when changing message formatting cannot help delivery."""
+        if not error:
+            return False
+        lowered = error.lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "rate limit",
+                "too many requests",
+                "cooldown active",
+                "floodwait",
+                "http 429",
+                "status 429",
+            )
+        )
+
     def _unwrap_ephemeral(self, response: Any) -> Tuple[Optional[str], int]:
         """Unwrap a handler response into (text, ttl_seconds).
 
@@ -4106,11 +4124,26 @@ class BasePlatformAdapter(GroupOutboxMixin, ABC):
             return result
 
         error_str = result.error or ""
-        is_network = result.retryable or self._is_retryable_error(error_str)
+        is_network = (
+            result.retryable
+            or result.retry_after is not None
+            or self._is_retryable_error(error_str)
+        )
 
         # Timeout errors are not safe to retry (message may have been
         # delivered) and not formatting errors — return the failure as-is.
         if not is_network and self._is_timeout_error(error_str):
+            return result
+
+        # Rate limits and explicit cooldowns are delivery backpressure, not
+        # formatting failures. Without a server-provided retry_after, return
+        # the original result so callers can respect the cooldown instead of
+        # immediately sending a second plain-text copy.
+        if (
+            result.retry_after is None
+            and not result.retryable
+            and self._is_delivery_backpressure_error(error_str)
+        ):
             return result
 
         if is_network:
@@ -4141,7 +4174,16 @@ class BasePlatformAdapter(GroupOutboxMixin, ABC):
                 error_str = result.error or ""
                 if result.retry_after is not None:
                     server_retry_after = result.retry_after
-                if not (result.retryable or self._is_retryable_error(error_str)):
+                elif (
+                    not result.retryable
+                    and self._is_delivery_backpressure_error(error_str)
+                ):
+                    return result
+                if not (
+                    result.retryable
+                    or result.retry_after is not None
+                    or self._is_retryable_error(error_str)
+                ):
                     break  # error switched to non-transient — fall through to plain-text fallback
             else:
                 # All retries exhausted (loop completed without break) — notify user
