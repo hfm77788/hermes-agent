@@ -4889,7 +4889,11 @@ class BasePlatformAdapter(GroupOutboxMixin, ABC):
             if result is None:
                 return
             delivery_attempted = True
-            if getattr(result, "success", False):
+            succeeded = (
+                result if isinstance(result, bool)
+                else bool(getattr(result, "success", False))
+            )
+            if succeeded:
                 delivery_succeeded = True
 
         # Reuse the interrupt event set by handle_message() (which marks
@@ -5063,6 +5067,7 @@ class BasePlatformAdapter(GroupOutboxMixin, ABC):
                             caption=telegram_tts_caption,
                             metadata=_final_thread_metadata,
                         )
+                        _record_delivery(tts_result)
                         _tts_caption_delivered = bool(
                             telegram_tts_caption and getattr(tts_result, "success", False)
                         )
@@ -5106,13 +5111,17 @@ class BasePlatformAdapter(GroupOutboxMixin, ABC):
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
-                        await self.send_multiple_images(
+                        image_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=images,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(
+                            True if image_result is None else image_result
+                        )
                     except Exception as batch_err:
+                        _record_delivery(False)
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
 
@@ -5148,13 +5157,17 @@ class BasePlatformAdapter(GroupOutboxMixin, ABC):
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        image_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(
+                            True if image_result is None else image_result
+                        )
                     except Exception as batch_err:
+                        _record_delivery(False)
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
                 for media_path, is_voice in _non_image_media:
@@ -5181,9 +5194,11 @@ class BasePlatformAdapter(GroupOutboxMixin, ABC):
                                 metadata=_final_thread_metadata,
                             )
 
+                        _record_delivery(media_result)
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
                     except Exception as media_err:
+                        _record_delivery(False)
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
                 # Send auto-detected local non-image files as native attachments
@@ -5193,18 +5208,20 @@ class BasePlatformAdapter(GroupOutboxMixin, ABC):
                     try:
                         ext = Path(file_path).suffix.lower()
                         if ext in _VIDEO_EXTS:
-                            await self.send_video(
+                            file_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
                         else:
-                            await self.send_document(
+                            file_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
+                        _record_delivery(file_result)
                     except Exception as file_err:
+                        _record_delivery(False)
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
 
                 # A3 (#29346): if a non-empty response produced nothing
