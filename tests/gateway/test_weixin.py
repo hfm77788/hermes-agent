@@ -482,18 +482,26 @@ class TestWeixinChunkDelivery:
                     error="Too Many Requests",
                     retryable=True,
                 ),
+                SendResult(
+                    success=False,
+                    error="Too Many Requests",
+                    retryable=True,
+                ),
                 SendResult(success=True, message_id="delivered"),
             ]
         )
 
         result = await adapter._send_with_retry(
-            "wxid_test123", "hello", max_retries=1, base_delay=0
+            "wxid_test123", "hello", max_retries=2, base_delay=0
         )
 
         assert result.success is True
-        assert adapter.send.await_count == 2
-        assert adapter.send.await_args_list[1].kwargs["content"] == "hello"
-        sleep_mock.assert_awaited_once()
+        assert adapter.send.await_count == 3
+        assert all(
+            call.kwargs["content"] == "hello"
+            for call in adapter.send.await_args_list
+        )
+        assert sleep_mock.await_count == 2
 
     def _connected_adapter(self) -> WeixinAdapter:
         adapter = _make_adapter()

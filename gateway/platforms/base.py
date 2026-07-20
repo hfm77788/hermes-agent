@@ -4167,7 +4167,10 @@ class BasePlatformAdapter(ABC):
                 error_str = result.error or ""
                 if result.retry_after is not None:
                     server_retry_after = result.retry_after
-                elif self._is_delivery_backpressure_error(error_str):
+                elif (
+                    not result.retryable
+                    and self._is_delivery_backpressure_error(error_str)
+                ):
                     return result
                 if not (
                     result.retryable
