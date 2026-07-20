@@ -1749,10 +1749,14 @@ class WeixinAdapter(BasePlatformAdapter):
         even when no user message has refreshed the session recently.
         """
         async with self._send_text_gate:
+            # A concurrent inbound message may refresh this peer's token while
+            # this send waits for the gate. Read it after acquiring the gate so
+            # queued sends never replay a token that an earlier send proved stale.
+            current_context_token = self._token_store.get(self._account_id, chat_id)
             await self._send_text_chunk_locked(
                 chat_id=chat_id,
                 chunk=chunk,
-                context_token=context_token,
+                context_token=current_context_token,
                 client_id=client_id,
             )
 

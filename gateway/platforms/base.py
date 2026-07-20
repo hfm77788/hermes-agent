@@ -4168,7 +4168,11 @@ class BasePlatformAdapter(ABC):
                     server_retry_after = result.retry_after
                 elif self._is_delivery_backpressure_error(error_str):
                     return result
-                if not (result.retryable or self._is_retryable_error(error_str)):
+                if not (
+                    result.retryable
+                    or result.retry_after is not None
+                    or self._is_retryable_error(error_str)
+                ):
                     break  # error switched to non-transient — fall through to plain-text fallback
             else:
                 # All retries exhausted (loop completed without break) — notify user
