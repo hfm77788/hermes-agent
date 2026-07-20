@@ -26,6 +26,8 @@ def test_group_buffer_uses_active_hermes_home(tmp_path, monkeypatch):
 workspaces:
   - chat_id: oc_profile_test
     context_buffer: true
+  - chat_id: oc_profile_test_two
+    context_buffer: true
 """.lstrip(),
         encoding="utf-8",
     )
@@ -38,4 +40,7 @@ workspaces:
     expected_db = project_dir / "group_buffer.db"
     assert adapter._group_buffer_db_path == expected_db
     assert expected_db.exists()
-    assert adapter._group_buffer_chat_ids == {"oc_profile_test"}
+    assert adapter._group_buffer_chat_ids == {
+        "oc_profile_test",
+        "oc_profile_test_two",
+    }
