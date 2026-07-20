@@ -236,7 +236,26 @@ def label_from_token(token: str, fallback: str) -> str:
         value = claims.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
+    profile = claims.get("https://api.openai.com/profile")
+    if isinstance(profile, dict):
+        email = profile.get("email")
+        if isinstance(email, str) and email.strip():
+            return email.strip()
     return fallback
+
+
+def _codex_account_id_from_token(token: str) -> str:
+    """Return the stable ChatGPT account id carried by a Codex JWT."""
+    claims = _decode_jwt_claims(token)
+    auth_claim = claims.get("https://api.openai.com/auth")
+    if isinstance(auth_claim, dict):
+        account_id = auth_claim.get("chatgpt_account_id")
+        if isinstance(account_id, str) and account_id.strip():
+            return account_id.strip()
+    account_id = claims.get("chatgpt_account_id")
+    if isinstance(account_id, str) and account_id.strip():
+        return account_id.strip()
+    return ""
 
 
 def _next_priority(entries: List[PooledCredential]) -> int:
@@ -1266,20 +1285,16 @@ class CredentialPool:
                         logger.debug(
                             "Failed to clear terminal Codex OAuth state: %s", clear_exc
                         )
-                    # Mark this specific entry as DEAD — do not remove
-                    # other entries from a multi-account pool.
-                    dead_entry = replace(
-                        entry,
-                        last_status=STATUS_DEAD,
-                        last_status_at=time.time(),
-                        last_error_code=getattr(exc, 'status_code', None) or 401,
-                        last_error_reason=getattr(exc, 'code', 'refresh_token_invalidated'),
-                        last_error_message=str(exc),
-                    )
-                    self._replace_entry(entry, dead_entry)
+                    # Remove only the terminally invalid singleton entry.
+                    # Other device-code accounts and manual API-key entries
+                    # remain usable in a multi-account pool.
+                    removed_ids = [entry.id]
+                    self._entries = [
+                        item for item in self._entries if item.id != entry.id
+                    ]
                     if self._current_id == entry.id:
                         self._current_id = None
-                    self._persist()
+                    self._persist(removed_ids=removed_ids)
                     return None
             # For nous: another process may have consumed the refresh token
             # between our proactive sync and the HTTP call.  Re-sync from
@@ -1723,12 +1738,69 @@ class CredentialPool:
         return entry
 
 
-def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, payload: Dict[str, Any]) -> bool:
-    existing_idx = None
-    for idx, entry in enumerate(entries):
-        if entry.source == source:
-            existing_idx = idx
-            break
+def _upsert_entry(
+    entries: List[PooledCredential],
+    provider: str,
+    source: str,
+    payload: Dict[str, Any],
+) -> bool:
+    candidate_indexes = [
+        idx for idx, entry in enumerate(entries) if entry.source == source
+    ]
+    existing_idx: Optional[int] = None
+
+    payload_id = str(payload.get("id") or "").strip()
+    if payload_id:
+        existing_idx = next(
+            (
+                idx
+                for idx in candidate_indexes
+                if entries[idx].id == payload_id
+            ),
+            None,
+        )
+        # A caller-provided, previously unseen id represents a new identity.
+        if existing_idx is None and len(candidate_indexes) > 1:
+            candidate_indexes = []
+    elif len(candidate_indexes) == 1:
+        existing_idx = candidate_indexes[0]
+    elif (
+        provider == "openai-codex"
+        and source == "device_code"
+        and len(candidate_indexes) > 1
+    ):
+        payload_token = str(payload.get("access_token") or "")
+        payload_account_id = _codex_account_id_from_token(payload_token)
+        if payload_account_id:
+            account_matches = [
+                idx
+                for idx in candidate_indexes
+                if _codex_account_id_from_token(entries[idx].access_token)
+                == payload_account_id
+            ]
+            if len(account_matches) == 1:
+                existing_idx = account_matches[0]
+        if existing_idx is None and payload_token:
+            token_matches = [
+                idx
+                for idx in candidate_indexes
+                if entries[idx].access_token == payload_token
+            ]
+            if len(token_matches) == 1:
+                existing_idx = token_matches[0]
+        if existing_idx is None:
+            payload_label = str(payload.get("label") or "").strip()
+            if payload_label and payload_label != source:
+                label_matches = [
+                    idx
+                    for idx in candidate_indexes
+                    if entries[idx].label == payload_label
+                ]
+                if len(label_matches) == 1:
+                    existing_idx = label_matches[0]
+    elif candidate_indexes:
+        # Other providers retain their historical singleton-per-source rule.
+        existing_idx = candidate_indexes[0]
 
     if existing_idx is None:
         payload.setdefault("id", uuid.uuid4().hex[:6])
