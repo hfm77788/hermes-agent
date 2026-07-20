@@ -55,7 +55,7 @@ async def test_group_worker_uses_canonical_session_key_and_guard():
     seen = []
     processed = asyncio.Event()
     host._try_acquire_owner_lease = lambda _chat_id: True
-    host._renew_owner_lease = lambda _chat_id: None
+    host._renew_owner_lease = lambda _chat_id: True
     host._release_owner_lease = lambda _chat_id: None
     host._recover_expired_leases = lambda _chat_id: None
     host._dequeue_group_event = (
