@@ -1786,11 +1786,32 @@ class WeixinAdapter(BasePlatformAdapter):
                                 self.name, _safe_id(chat_id),
                             )
                             continue
-                        # Rate limit (-2) — backoff and retry
+                        # Rate limit (-2) is ambiguous in iLink: a stale
+                        # context_token can produce the same response as a
+                        # genuine throttle. Retry once without the token before
+                        # opening the rate-limit circuit. Reusing client_id keeps
+                        # this bounded fallback idempotent if the first attempt
+                        # was accepted despite the error response.
                         is_rate_limited = (
                             ret == RATE_LIMIT_ERRCODE
                             or errcode == RATE_LIMIT_ERRCODE
                         )
+                        if (
+                            is_rate_limited
+                            and context_token
+                            and not retried_without_token
+                        ):
+                            retried_without_token = True
+                            context_token = None
+                            self._token_store._cache.pop(
+                                self._token_store._key(self._account_id, chat_id), None
+                            )
+                            logger.warning(
+                                "[%s] ret=-2 for %s; retrying once without context_token",
+                                self.name,
+                                _safe_id(chat_id),
+                            )
+                            continue
                         if is_rate_limited:
                             errmsg = resp.get("errmsg") or resp.get("msg") or "rate limited"
                             # Record the error so we raise a descriptive
