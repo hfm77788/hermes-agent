@@ -134,6 +134,42 @@ def test_codex_singleton_sync_does_not_overwrite_other_account_entry(tmp_path, m
     assert persisted["cred-backup"]["access_token"] == backup_token
 
 
+def test_codex_multi_account_sync_keeps_dead_entry_quarantined():
+    from agent.credential_pool import (
+        STATUS_DEAD,
+        CredentialPool,
+        PooledCredential,
+    )
+
+    dead = PooledCredential.from_dict("openai-codex", {
+        "id": "dead-account",
+        "source": "device_code",
+        "auth_type": "oauth",
+        "access_token": _codex_jwt(
+            "dead@example.com",
+            "57a7a461-72ec-4a9f-ad24-b94aa5d08517",
+        ),
+        "refresh_token": "dead-refresh",
+        "last_status": STATUS_DEAD,
+    })
+    healthy = PooledCredential.from_dict("openai-codex", {
+        "id": "healthy-account",
+        "source": "device_code",
+        "auth_type": "oauth",
+        "access_token": _codex_jwt(
+            "healthy@example.com",
+            "d15a22e1-0f0a-4ca6-a282-c680a6e06f73",
+        ),
+        "refresh_token": "healthy-refresh",
+    })
+    pool = CredentialPool("openai-codex", [dead, healthy])
+
+    available = pool._available_entries()
+
+    assert [entry.id for entry in available] == ["healthy-account"]
+    assert pool.entries()[0].last_status == STATUS_DEAD
+
+
 def test_codex_manual_entry_clears_stale_status_without_singleton_overwrite(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setattr(
