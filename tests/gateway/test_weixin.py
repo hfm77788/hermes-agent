@@ -377,6 +377,49 @@ class TestWeixinSendMessageIntegration:
 
 
 class TestWeixinChunkDelivery:
+    @pytest.mark.asyncio
+    async def test_rate_limit_cooldown_skips_plain_text_fallback(self):
+        adapter = _make_adapter()
+        failure = SendResult(
+            success=False,
+            error="iLink sendmessage rate limited; cooldown active for 30.0s",
+        )
+        adapter.send = AsyncMock(return_value=failure)
+
+        result = await adapter._send_with_retry("wxid_test123", "**formatted**")
+
+        assert result is failure
+        adapter.send.assert_awaited_once_with(
+            chat_id="wxid_test123",
+            content="**formatted**",
+            reply_to=None,
+            metadata=None,
+        )
+
+    @pytest.mark.asyncio
+    @patch("gateway.platforms.base.asyncio.sleep", new_callable=AsyncMock)
+    async def test_rate_limit_with_retry_after_waits_instead_of_fallback(
+        self, sleep_mock
+    ):
+        adapter = _make_adapter()
+        adapter.send = AsyncMock(
+            side_effect=[
+                SendResult(
+                    success=False,
+                    error="rate limited",
+                    retryable=True,
+                    retry_after=0,
+                ),
+                SendResult(success=True, message_id="delivered"),
+            ]
+        )
+
+        result = await adapter._send_with_retry("wxid_test123", "hello")
+
+        assert result.success is True
+        assert adapter.send.await_count == 2
+        sleep_mock.assert_awaited_once()
+
     def _connected_adapter(self) -> WeixinAdapter:
         adapter = _make_adapter()
         adapter._session = object()
