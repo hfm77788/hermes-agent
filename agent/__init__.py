@@ -18,9 +18,17 @@ def _install_credential_pool_provider_matcher() -> None:
     The current runtime callers import this helper from ``agent.credential_pool``.
     Keep the compatibility local to the ``agent`` package and install it only
     when the canonical module does not already provide an implementation.
+
+    Minimal wheel consumers such as ``from agent import i18n`` intentionally
+    install without the full runtime dependency set. In that environment the
+    credential-pool import is skipped, preserving the package's existing
+    lightweight-import contract.
     """
 
-    from . import credential_pool
+    try:
+        from . import credential_pool
+    except ImportError:
+        return
 
     if callable(getattr(credential_pool, "credential_pool_matches_provider", None)):
         return
