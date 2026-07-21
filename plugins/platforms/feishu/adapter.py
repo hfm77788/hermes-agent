@@ -107,6 +107,7 @@ try:
         GetChatRequest,
         GetMessageRequest,
         GetMessageResourceRequest,
+        ListMessageRequest,
         P2ImMessageMessageReadV1,
         ReplyMessageRequest,
         ReplyMessageRequestBody,
@@ -1927,6 +1928,92 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Buffer reconcile failed", exc_info=True)
             return False
 
+    async def _fetch_group_messages_from_api(
+        self, chat_id: str, page_size: int = 50,
+    ) -> list[dict]:
+        """Fetch recent messages from Feishu server for buffer reconciliation.
+
+        Returns a list of dicts compatible with _reconcile_group_buffer().
+        """
+        try:
+            request = ListMessageRequest.builder() \
+                .container_id_type("chat") \
+                .container_id(chat_id) \
+                .page_size(page_size) \
+                .sort_type("ByCreateTimeDesc") \
+                .build()
+            response = await self._run_blocking(
+                self._client.im.v1.message.list, request,
+            )
+            if not response or not getattr(response, "success", False):
+                logger.debug(
+                    "[Feishu] ListMessage failed: chat_id=%s code=%s",
+                    chat_id, getattr(response, "code", "?"),
+                )
+                return []
+            items = getattr(response, "data", None)
+            items = getattr(items, "items", None) if items else None
+            if not items:
+                return []
+            result = []
+            for item in items:
+                sender = getattr(item, "sender", None)
+                sender_id = getattr(sender, "id", "") if sender else ""
+                body = getattr(item, "body", None)
+                content = getattr(body, "content", "") if body else ""
+                result.append({
+                    "message_id": str(getattr(item, "message_id", "") or ""),
+                    "sender_open_id": str(sender_id or ""),
+                    "reply_to": str(getattr(item, "root_id", "") or ""),
+                    "create_time": int(getattr(item, "create_time", "0") or "0"),
+                    "msg_type": str(getattr(item, "msg_type", "text") or "text"),
+                    "content": str(content or "")[:500],
+                })
+            return result
+        except Exception:
+            logger.debug("[Feishu] Fetch group messages failed", exc_info=True)
+            return []
+
+    async def _maybe_reconcile_group_buffer(self, chat_id: str) -> None:
+        """Trigger server-side reconciliation if buffer continuity is degraded.
+
+        Called after recording an inbound message. Only fires when
+        continuity_state is 'unknown' or 'gap_detected' and the last
+        reconciliation was more than 5 minutes ago (rate-limit).
+        """
+        if chat_id not in getattr(self, "_group_buffer_chat_ids", set()):
+            return
+        if not self._group_buffer_db_path:
+            return
+        import sqlite3
+        try:
+            conn = sqlite3.connect(str(self._group_buffer_db_path))
+            row = conn.execute(
+                "SELECT continuity_state, last_reconciled_at FROM buffer_watermark"
+                " WHERE chat_id=?",
+                (chat_id,),
+            ).fetchone()
+            conn.close()
+            if not row:
+                return
+            state = str(row[0] or "unknown")
+            last_recon = float(row[1] or 0)
+            if state not in ("unknown", "gap_detected"):
+                return
+            if time.time() - last_recon < 300:  # 5-min cooldown
+                return
+        except Exception:
+            return
+        # Fetch from server and reconcile
+        server_msgs = await self._fetch_group_messages_from_api(chat_id)
+        if server_msgs:
+            ok = self._reconcile_group_buffer(chat_id, server_msgs)
+            if ok:
+                logger.info(
+                    "[Feishu] Buffer auto-reconciled: chat_id=%s msgs=%d",
+                    chat_id, len(server_msgs),
+                )
+
     @staticmethod
     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:
         # Parse per-group rules from config
@@ -3049,6 +3136,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 create_time=create_time_ms, message_type=msg_type,
                 content=raw_content,
             )
+            # Auto-reconcile if buffer continuity is degraded
+            await self._maybe_reconcile_group_buffer(chat_id)
 
         reason = self._admit(sender, message)
         if reason is not None:
@@ -5757,9 +5846,6 @@ class FeishuAdapter(BasePlatformAdapter):
         # MAX_MESSAGE_LENGTH, the per-chunk regex would otherwise
         # mis-classify a plain-prose chunk as ``text``. See #26841.
         if prefer_post or _MARKDOWN_HINT_RE.search(content):
-            return "post", _build_markdown_post_payload(content)
-        text_payload = {"text": content}
-        return "text", json.dumps(text_payload, ensure_ascii=False)
             return "post", _build_markdown_post_payload(content)
         text_payload = {"text": content}
         return "text", json.dumps(text_payload, ensure_ascii=False)
