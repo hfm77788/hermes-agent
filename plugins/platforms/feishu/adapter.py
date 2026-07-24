@@ -470,6 +470,7 @@ RejectReason = Literal[
     "bots_disabled",
     "bot_not_mentioned",
     "group_policy_rejected",
+    "human_to_human",
 ]
 
 
@@ -5536,6 +5537,12 @@ class FeishuAdapter(BasePlatformAdapter):
             return "group_policy_rejected"
         if require_mention and not self._mentions_self(message):
             return "group_policy_rejected"
+        # ── require_mention=false 群：人类间对话抑制 ──
+        # 有 @ 但没 @ bot → 人类间对话，静默（消息已在缓冲录入）
+        if not require_mention and is_group:
+            mentions = getattr(message, "mentions", None) or []
+            if mentions and not self._mentions_self(message):
+                return "human_to_human"
         return None
 
     def _require_mention_for(self, chat_id: str) -> bool:
