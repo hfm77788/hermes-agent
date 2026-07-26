@@ -5548,6 +5548,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 # the mention target is NOT the bot, so admit the message.
                 if not (self._bot_open_id or self._bot_user_id or self._bot_name):
                     return None
+                # Fail-open: when any mention lacks a same-type comparable
+                # field with the bot we cannot prove it targets someone else.
+                if not self._mentions_are_comparable(mentions):
+                    return None
                 return "human_to_human"
         return None
 
@@ -5642,6 +5646,25 @@ class FeishuAdapter(BasePlatformAdapter):
                 return True
 
         return False
+
+    def _mentions_are_comparable(self, mentions: List[Any]) -> bool:
+        """Return True only if every mention shares at least one same-type
+        field (open_id, user_id, or name) where both the mention and the
+        bot carry non-empty values.  When any mention is completely
+        incomparable the caller must fail-open (admit) because we cannot
+        prove the mention targets someone other than the bot."""
+        for mention in mentions:
+            mention_id = getattr(mention, "id", None)
+            m_open = (getattr(mention_id, "open_id", None) or "").strip()
+            m_user = (getattr(mention_id, "user_id", None) or "").strip()
+            m_name = (getattr(mention, "name", None) or "").strip()
+
+            if (m_open and self._bot_open_id) or \
+               (m_user and self._bot_user_id) or \
+               (m_name and self._bot_name):
+                continue
+            return False
+        return True
 
     def _post_mentions_bot(self, mentions: List[FeishuMentionRef]) -> bool:
         return any(m.is_self for m in mentions)

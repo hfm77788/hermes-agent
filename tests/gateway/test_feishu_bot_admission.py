@@ -849,3 +849,97 @@ def test_human_to_human_still_fires_for_human_with_known_identity():
     sender = make_sender(sender_type="user", open_id="ou_human")
     message = make_message(chat_type="group", mentions=[_mention_not_bot()])
     assert adapter._admit(sender, message) == "human_to_human"
+
+
+# --- human_to_human comparability fail-open ---------------------------------
+
+
+def test_human_to_human_admits_user_id_only_bot_vs_open_id_only_mention():
+    """Bot known only by user_id; mention carries only open_id → no
+    same-type field pair → incomparable → admit."""
+    adapter = make_adapter_skeleton(
+        bot_open_id="", bot_user_id="u_bot",
+        require_mention=False, group_policy="open",
+    )
+    mention = SimpleNamespace(
+        key="@_user_1",
+        id=SimpleNamespace(open_id="ou_other", user_id="", union_id=""),
+        name="",
+    )
+    sender = make_sender(sender_type="user", open_id="ou_human")
+    message = make_message(chat_type="group", mentions=[mention])
+    assert adapter._admit(sender, message) is None
+
+
+def test_human_to_human_admits_open_id_only_bot_vs_user_id_only_mention():
+    """Bot known only by open_id; mention carries only user_id → no
+    same-type field pair → incomparable → admit."""
+    adapter = make_adapter_skeleton(
+        bot_open_id="ou_bot",
+        require_mention=False, group_policy="open",
+    )
+    mention = SimpleNamespace(
+        key="@_user_1",
+        id=SimpleNamespace(open_id="", user_id="u_other", union_id=""),
+        name="",
+    )
+    sender = make_sender(sender_type="user", open_id="ou_human")
+    message = make_message(chat_type="group", mentions=[mention])
+    assert adapter._admit(sender, message) is None
+
+
+def test_human_to_human_admits_name_only_bot_vs_no_name_mention():
+    """Bot known only by name; mention has empty name → no same-type
+    field pair → incomparable → admit."""
+    adapter = make_adapter_skeleton(
+        bot_open_id="", bot_user_id="",
+        require_mention=False, group_policy="open",
+    )
+    adapter._bot_name = "Hermes"
+    mention = SimpleNamespace(
+        key="@_user_1",
+        id=SimpleNamespace(open_id="", user_id="", union_id=""),
+        name="",
+    )
+    sender = make_sender(sender_type="user", open_id="ou_human")
+    message = make_message(chat_type="group", mentions=[mention])
+    assert adapter._admit(sender, message) is None
+
+
+def test_human_to_human_admits_mixed_comparable_and_incomparable():
+    """One mention comparable (open_id), one not (user_id-only while bot
+    has no user_id) → any incomparable → fail-open → admit."""
+    adapter = make_adapter_skeleton(
+        bot_open_id="ou_bot",
+        require_mention=False, group_policy="open",
+    )
+    comparable = SimpleNamespace(
+        key="@_user_1",
+        id=SimpleNamespace(open_id="ou_other", user_id="", union_id=""),
+        name="",
+    )
+    incomparable = SimpleNamespace(
+        key="@_user_2",
+        id=SimpleNamespace(open_id="", user_id="u_x", union_id=""),
+        name="",
+    )
+    sender = make_sender(sender_type="user", open_id="ou_human")
+    message = make_message(chat_type="group", mentions=[comparable, incomparable])
+    assert adapter._admit(sender, message) is None
+
+
+def test_human_to_human_suppressed_when_all_comparable_and_no_match():
+    """Every mention shares open_id with bot (comparable) and none matches
+    → suppression fires."""
+    adapter = make_adapter_skeleton(
+        bot_open_id="ou_bot",
+        require_mention=False, group_policy="open",
+    )
+    mention = SimpleNamespace(
+        key="@_user_1",
+        id=SimpleNamespace(open_id="ou_other", user_id="", union_id=""),
+        name="Other Person",
+    )
+    sender = make_sender(sender_type="user", open_id="ou_human")
+    message = make_message(chat_type="group", mentions=[mention])
+    assert adapter._admit(sender, message) == "human_to_human"
