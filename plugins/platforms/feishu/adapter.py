@@ -5539,9 +5539,15 @@ class FeishuAdapter(BasePlatformAdapter):
             return "group_policy_rejected"
         # ── require_mention=false 群：人类间对话抑制 ──
         # 有 @ 但没 @ bot → 人类间对话，静默（消息已在缓冲录入）
-        if not require_mention and is_group:
+        # Only suppress human-to-human: peer bots are governed by allow_bots
+        # above; applying this filter to them would false-reject under "all".
+        if not require_mention and is_group and not is_bot:
             mentions = getattr(message, "mentions", None) or []
             if mentions and not self._mentions_self(message):
+                # Fail-open: when no bot identity is known we cannot prove
+                # the mention target is NOT the bot, so admit the message.
+                if not (self._bot_open_id or self._bot_user_id or self._bot_name):
+                    return None
                 return "human_to_human"
         return None
 

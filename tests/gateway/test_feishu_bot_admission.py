@@ -802,3 +802,50 @@ def test_handle_message_event_data_forwards_sender_when_admitted():
     assert captured.get("sender_id") is sender.sender_id
     assert captured.get("is_bot") is True
     assert captured.get("message_id") == "om_bot_ok"
+
+
+# --- human_to_human suppression regression ----------------------------------
+
+
+def _mention_not_bot(open_id: str = "ou_other_human") -> SimpleNamespace:
+    """A Feishu mention payload element that does NOT match the bot."""
+    return SimpleNamespace(
+        key="@_user_1",
+        id=SimpleNamespace(open_id=open_id, user_id="", union_id=""),
+        name="Someone Else",
+    )
+
+
+def test_human_to_human_skips_bot_sender_in_require_mention_false_group():
+    """Peer bots under allow_bots=all must not be suppressed as human_to_human."""
+    adapter = make_adapter_skeleton(
+        bot_open_id="ou_self", allow_bots="all",
+        require_mention=False, group_policy="open",
+    )
+    sender = make_sender(sender_type="bot", open_id="ou_peer_bot")
+    message = make_message(chat_type="group", mentions=[_mention_not_bot()])
+    assert adapter._admit(sender, message) is None
+
+
+def test_human_to_human_fails_open_when_bot_identity_unknown():
+    """When no bot identity is known, admit instead of false-rejecting."""
+    adapter = make_adapter_skeleton(
+        bot_open_id="", bot_user_id="",
+        require_mention=False, group_policy="open",
+    )
+    adapter._bot_name = ""
+    sender = make_sender(sender_type="user", open_id="ou_human")
+    message = make_message(chat_type="group", mentions=[_mention_not_bot()])
+    assert adapter._admit(sender, message) is None
+
+
+def test_human_to_human_still_fires_for_human_with_known_identity():
+    """Existing behavior: human @-mentioning someone else in a
+    require_mention=false group is suppressed when bot identity is known."""
+    adapter = make_adapter_skeleton(
+        bot_open_id="ou_self",
+        require_mention=False, group_policy="open",
+    )
+    sender = make_sender(sender_type="user", open_id="ou_human")
+    message = make_message(chat_type="group", mentions=[_mention_not_bot()])
+    assert adapter._admit(sender, message) == "human_to_human"
