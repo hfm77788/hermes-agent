@@ -194,3 +194,8 @@ native/fts5_cjk/*.so
 # interrupted; consumed by launch-time recovery. Never commit it (was tracked
 # by accident via 3a69e34702, removed in the #72002 salvage).
 .lazy-refresh-incomplete
+
+# phase 5 本地状态隔离 (2026-08-04)
+state.db
+.playwright-mcp/
+_dream/
