@@ -332,6 +332,17 @@ class ContextTokenStore:
         self._cache[self._key(account_id, user_id)] = token
         self._persist(account_id)
 
+    def delete_if_matches(
+        self, account_id: str, user_id: str, expected_token: str
+    ) -> bool:
+        """Remove a token only when it is still the value that failed."""
+        key = self._key(account_id, user_id)
+        if self._cache.get(key) != expected_token:
+            return False
+        self._cache.pop(key)
+        self._persist(account_id)
+        return True
+
     def _persist(self, account_id: str) -> None:
         prefix = f"{account_id}:"
         payload = {
@@ -1792,6 +1803,8 @@ class WeixinAdapter(BasePlatformAdapter):
         """Send a text chunk while holding the adapter-wide outbound text gate."""
         last_error: Optional[Exception] = None
         retried_without_token = False
+        probed_context_token: Optional[str] = None
+        tokenless_probe_rate_limited = False
         for attempt in range(self._send_chunk_retries + 1):
             if self._rate_limit_cooldown_remaining() > 0:
                 raise self._rate_limit_error()
@@ -1827,12 +1840,34 @@ class WeixinAdapter(BasePlatformAdapter):
                                 self.name, _safe_id(chat_id),
                             )
                             continue
-                        # Rate limit (-2) — backoff and retry
+                        # Rate limit (-2) is ambiguous in iLink: a stale
+                        # context_token can produce the same response as a
+                        # genuine throttle. Retry once without the token before
+                        # opening the rate-limit circuit. Reusing client_id keeps
+                        # this bounded fallback idempotent if the first attempt
+                        # was accepted despite the error response.
                         is_rate_limited = (
                             ret == RATE_LIMIT_ERRCODE
                             or errcode == RATE_LIMIT_ERRCODE
                         )
+                        if (
+                            is_rate_limited
+                            and context_token
+                            and not retried_without_token
+                            and attempt < self._send_chunk_retries
+                        ):
+                            retried_without_token = True
+                            probed_context_token = context_token
+                            context_token = None
+                            logger.warning(
+                                "[%s] iLink rate-limit code for %s; retrying once without context_token",
+                                self.name,
+                                _safe_id(chat_id),
+                            )
+                            continue
                         if is_rate_limited:
+                            if probed_context_token and context_token is None:
+                                tokenless_probe_rate_limited = True
                             errmsg = resp.get("errmsg") or resp.get("msg") or "rate limited"
                             # Record the error so we raise a descriptive
                             # RuntimeError (instead of AssertionError) if the
@@ -1856,6 +1891,14 @@ class WeixinAdapter(BasePlatformAdapter):
                         raise RuntimeError(
                             f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg}"
                         )
+                if probed_context_token and not tokenless_probe_rate_limited:
+                    # The tokenless probe succeeded, confirming that the stored
+                    # token was stale rather than the account being throttled.
+                    # Remove that exact value durably, but preserve a newer token
+                    # received for the peer while the probe was in flight.
+                    self._token_store.delete_if_matches(
+                        self._account_id, chat_id, probed_context_token
+                    )
                 self._reset_rate_limit_circuit()
                 return
             except Exception as exc:
