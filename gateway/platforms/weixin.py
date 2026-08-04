@@ -1657,7 +1657,8 @@ class WeixinAdapter(BasePlatformAdapter):
             )
             return cache_document_from_bytes(data, filename), mime
         except Exception as exc:
-            logger.warning("[%s] file download failed: %s", self.name, exc)
+            import traceback as _tb
+            logger.warning("[%s] file download failed: %s: %s\n%s", self.name, type(exc).__name__, exc, _tb.format_exc())
             return None, mime
 
     async def _download_voice(self, item: Dict[str, Any]) -> Optional[str]:

@@ -452,6 +452,7 @@ RejectReason = Literal[
     "bots_disabled",
     "bot_not_mentioned",
     "group_policy_rejected",
+    "human_to_human",
 ]
 
 
@@ -1512,6 +1513,557 @@ class FeishuAdapter(BasePlatformAdapter):
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
         self._load_seen_message_ids()
+
+        # ── Group context buffer (ma-secretary registered groups only) ──────
+        self._group_buffer_db_path: Optional[Path] = None
+        self._group_buffer_max_messages: int = 100
+        self._group_buffer_max_age_seconds: int = 72 * 3600
+        self._group_buffer_chat_ids: set[str] = set()
+        self._group_buffer_watermarks: Dict[str, int] = {}  # chat_id → watermark
+        self._group_buffer_gaps: Dict[str, bool] = {}  # chat_id → has_gap
+        # ── v2 write metrics (sanitized — no chat content or identity fields) ──
+        self._v2_metrics: Dict[str, int] = {
+            "bypass_count": 0,
+            "write_attempts": 0,
+            "write_successes": 0,
+            "write_failures": 0,
+            "recall_attempts": 0,
+            "recall_mismatches": 0,
+            "upsert_count": 0,
+            "correction_count": 0,
+        }
+        self._v2_last_error_category: Optional[str] = None
+        self._init_group_context_buffer()
+
+    def _load_project_group_registry(self) -> Optional[dict]:
+        """Load the project group registry YAML (ma-secretary-interaction-system)."""
+        registry_path = Path.home() / ".hermes" / "projects" / "ma-secretary-interaction-system" / "group-registry.yaml"
+        if not registry_path.exists():
+            return None
+        try:
+            import yaml
+            with open(registry_path, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f)
+        except Exception:
+            return None
+
+    def _init_group_context_buffer(self) -> None:
+        """Initialize the SQLite ring buffer for registered project groups."""
+        registry = self._load_project_group_registry()
+        if not registry:
+            return
+        workspaces = registry.get("workspaces")
+        if not isinstance(workspaces, list):
+            return
+        for workspace in workspaces:
+            if not isinstance(workspace, dict):
+                continue
+            if workspace.get("context_buffer") is not True:
+                continue
+            chat_id = str(workspace.get("chat_id") or "").strip()
+            if not chat_id:
+                continue
+            self._group_buffer_chat_ids.add(chat_id)
+            project_dir = Path.home() / ".hermes" / "projects" / "ma-secretary-interaction-system"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            db_path = project_dir / "group_buffer.db"
+            self._group_buffer_db_path = db_path
+            import sqlite3
+            conn = sqlite3.connect(str(db_path))
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS group_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    sender_open_id TEXT,
+                    reply_to_message_id TEXT,
+                    create_time INTEGER NOT NULL,
+                    message_type TEXT NOT NULL DEFAULT 'text',
+                    content TEXT,
+                    recorded_at REAL NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_group_msg_id
+                ON group_messages(chat_id, message_id)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_group_chat_time
+                ON group_messages(chat_id, create_time DESC)
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS buffer_watermark (
+                    chat_id TEXT PRIMARY KEY,
+                    last_message_id TEXT,
+                    last_create_time INTEGER,
+                    has_gap INTEGER NOT NULL DEFAULT 0,
+                    continuity_state TEXT NOT NULL DEFAULT 'unknown',
+                    disconnect_epoch REAL NOT NULL DEFAULT 0.0,
+                    last_reconciled_at REAL NOT NULL DEFAULT 0.0,
+                    updated_at REAL NOT NULL
+                )
+            """)
+            # ── Migrate existing rows: add missing columns ─────────────────
+            try:
+                conn.execute(
+                    "ALTER TABLE buffer_watermark ADD COLUMN continuity_state TEXT NOT NULL DEFAULT 'unknown'"
+                )
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute(
+                    "ALTER TABLE buffer_watermark ADD COLUMN disconnect_epoch REAL NOT NULL DEFAULT 0.0"
+                )
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute(
+                    "ALTER TABLE buffer_watermark ADD COLUMN last_reconciled_at REAL NOT NULL DEFAULT 0.0"
+                )
+            except sqlite3.OperationalError:
+                pass
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.commit()
+            conn.close()
+            os.chmod(str(db_path), 0o600)
+            logger.info(
+                "[Feishu] Group context buffer initialized: chat_id=%s db=%s",
+                chat_id, db_path,
+            )
+            break  # Single DB for all registered groups
+
+    def _record_to_group_buffer(
+        self, chat_id: str, message_id: str, sender_open_id: str,
+        reply_to_message_id: str, create_time: int, message_type: str, content: str,
+    ) -> None:
+        """Record a message into the group context buffer (ring buffer)."""
+        if chat_id not in getattr(self, "_group_buffer_chat_ids", set()):
+            return
+        if not self._group_buffer_db_path:
+            return
+        import sqlite3
+        try:
+            conn = sqlite3.connect(str(self._group_buffer_db_path))
+            now = time.time()
+            # Insert
+            conn.execute(
+                """INSERT OR IGNORE INTO group_messages
+                   (chat_id, message_id, sender_open_id, reply_to_message_id,
+                    create_time, message_type, content, recorded_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (chat_id, message_id, sender_open_id, reply_to_message_id,
+                 create_time, message_type, content, now),
+            )
+            conn.commit()
+            # Update watermark with continuity tracking
+            prev = conn.execute(
+                "SELECT last_create_time, continuity_state FROM buffer_watermark"
+                " WHERE chat_id=?",
+                (chat_id,),
+            ).fetchone()
+            prev_ct = prev[0] if prev else None
+            prev_continuity = str(prev[1] or "unknown") if prev and len(prev) > 1 else "unknown"
+
+            # Detect out-of-order: message create_time older than last seen
+            if prev_ct and create_time < prev_ct:
+                conn.execute(
+                    "UPDATE buffer_watermark SET has_gap=1, continuity_state='gap_detected',"
+                    " updated_at=? WHERE chat_id=?",
+                    (now, chat_id),
+                )
+            else:
+                # Upsert: preserve existing continuity_state if it was already degraded
+                conn.execute(
+                    """INSERT INTO buffer_watermark
+                       (chat_id, last_message_id, last_create_time, has_gap,
+                        continuity_state, disconnect_epoch, last_reconciled_at, updated_at)
+                       VALUES (?, ?, ?, 0, 'continuous', 0.0, 0.0, ?)
+                       ON CONFLICT(chat_id) DO UPDATE SET
+                        last_message_id=excluded.last_message_id,
+                        last_create_time=excluded.last_create_time,
+                        has_gap=0,
+                        continuity_state=CASE
+                            WHEN buffer_watermark.continuity_state IN ('unknown','gap_detected')
+                            THEN buffer_watermark.continuity_state
+                            ELSE 'continuous'
+                        END,
+                        updated_at=excluded.updated_at""",
+                    (chat_id, message_id, create_time, now),
+                )
+            conn.commit()
+            # Enforce cap: delete oldest if over limit
+            count = conn.execute(
+                "SELECT COUNT(*) FROM group_messages WHERE chat_id=?", (chat_id,),
+            ).fetchone()[0]
+            if count > self._group_buffer_max_messages:
+                excess = count - self._group_buffer_max_messages
+                conn.execute(
+                    """DELETE FROM group_messages WHERE id IN (
+                        SELECT id FROM group_messages WHERE chat_id=?
+                        ORDER BY create_time ASC LIMIT ?
+                    )""",
+                    (chat_id, excess),
+                )
+                conn.commit()
+            # Enforce age: delete oldest beyond 72 hours
+            cutoff = now - self._group_buffer_max_age_seconds
+            conn.execute(
+                "DELETE FROM group_messages WHERE chat_id=? AND recorded_at < ?",
+                (chat_id, cutoff),
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            logger.debug("[Feishu] Group buffer write failed", exc_info=True)
+
+    def _get_group_context_packet(
+        self, chat_id: str, *, exclude_message_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Build a structured group_context_packet from the buffer.
+
+        Args:
+            chat_id: The group chat to build context for.
+            exclude_message_id: If provided, the current trigger message_id is
+                excluded from the packet so the model sees it exactly once (L0).
+        """
+        if chat_id not in getattr(self, "_group_buffer_chat_ids", set()):
+            return None
+        if not self._group_buffer_db_path:
+            return None
+        import sqlite3
+        try:
+            conn = sqlite3.connect(str(self._group_buffer_db_path))
+            wm = conn.execute(
+                "SELECT has_gap, last_message_id, last_create_time,"
+                " continuity_state, last_reconciled_at, disconnect_epoch"
+                " FROM buffer_watermark WHERE chat_id=?",
+                (chat_id,),
+            ).fetchone()
+            has_gap = bool(wm[0]) if wm else True
+            continuity_state = str(wm[3] or "unknown") if wm and len(wm) > 3 else "unknown"
+            rows = conn.execute(
+                """SELECT message_id, sender_open_id, reply_to_message_id,
+                          create_time, message_type, content
+                   FROM group_messages WHERE chat_id=?
+                   ORDER BY create_time DESC LIMIT ?""",
+                (chat_id, self._group_buffer_max_messages),
+            ).fetchall()
+            conn.close()
+
+            # ── Identity mapping from group-registry ──────────────────────
+            workspace = None
+            bos_id = None
+            emp_id = None
+            try:
+                workspace = self._get_project_workspace(chat_id)
+                if workspace:
+                    bos_id = str(workspace.get("boss_open_id") or "").strip()
+                    emp_id = str(workspace.get("employee_open_id") or "").strip()
+            except Exception:
+                pass
+
+            def _identity_label(sender_open_id: str) -> str:
+                if bos_id and sender_open_id == bos_id:
+                    return "speaker_role=boss speaker_label=老板"
+                if emp_id and sender_open_id == emp_id:
+                    return "speaker_role=employee speaker_label=小年糕"
+                return "speaker_role=unknown speaker_label=未知成员"
+
+            # ── Build packet ──────────────────────────────────────────────
+            filtered_rows = [
+                row for row in rows
+                if exclude_message_id is None or row[0] != exclude_message_id
+            ]
+            if not filtered_rows:
+                return None
+
+            lines = [
+                "[group_context_packet]",
+                f"chat_id={chat_id}",
+                f"source=buffer",
+                f"continuity={continuity_state}",
+                f"message_count={len(filtered_rows)}",
+                "---",
+            ]
+            for row in reversed(filtered_rows):
+                msg_id, snd, reply, ct, mtype, content = row
+                ts = datetime.fromtimestamp(ct / 1000.0).strftime("%H:%M:%S") if ct else "?"
+                reply_mark = f" (reply_to={reply})" if reply else ""
+                content_short = (content or "")[:200]
+                identity = _identity_label(snd or "")
+                lines.append(
+                    f"[{ts}] {identity} sender_open_id={snd or '?'}{reply_mark}: {content_short}"
+                )
+            return "\n".join(lines)
+        except Exception:
+            logger.debug("[Feishu] Group buffer read failed", exc_info=True)
+            return None
+
+    async def _maybe_persist_sender_memory_request(
+        self,
+        sender_id: str,
+        *,
+        chat_id: str,
+        user_text: str,
+        message_id: str,
+    ) -> Optional[str]:
+        """Persist a sender memory request if applicable. Stub: returns None (no-op)."""
+        return None
+
+    def _resolve_sender_profile_prompt(self, sender_id: str, *, chat_id: str) -> Optional[str]:
+        """Resolve sender profile prompt. Stub: returns None (no-op)."""
+        return None
+
+    async def _resolve_sender_profile_context(
+        self, sender_id: str, *, chat_id: str, user_text: str
+    ) -> Optional[str]:
+        """Resolve sender profile context. Stub: returns None (no-op)."""
+        return None
+
+    def _enrich_channel_prompt_with_registry(
+        self,
+        chat_id: str,
+        sender_open_id: str,
+        base_prompt: str | None,
+    ) -> str | None:
+        """Overlay group-registry context onto the per-channel prompt.
+
+        Loads ~/.hermes/projects/ma-secretary-interaction-system/group_registry.py
+        via importlib (no sys.path pollution).  Module is cached on the adapter
+        instance after first successful load.  Every failure path returns
+        *base_prompt* unchanged so the message pipeline is never blocked.
+        """
+        try:
+            mod = getattr(self, "_group_registry_mod", None)
+            if mod is None:
+                import importlib.util, pathlib  # noqa: E401
+                _reg_path = pathlib.Path.home() / ".hermes" / "projects" / "ma-secretary-interaction-system" / "group_registry.py"
+                if not _reg_path.exists():
+                    return base_prompt
+                spec = importlib.util.spec_from_file_location("group_registry", str(_reg_path))
+                if spec is None or spec.loader is None:
+                    return base_prompt
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)  # type: ignore[union-attr]
+                self._group_registry_mod = mod  # type: ignore[attr-defined]
+            registry = mod.GroupRegistry.default()
+            ws = registry.get_workspace(chat_id)
+            if ws is None or not ws.is_active:
+                return base_prompt
+            role = registry.resolve_sender(ws, sender_open_id)
+            sender_name = registry.resolve_sender_name(ws, sender_open_id)
+            reg_prompt = registry.build_channel_prompt(ws, role, sender_name)
+            if base_prompt:
+                return f"{base_prompt}\n\n{reg_prompt}"
+            return reg_prompt
+        except Exception:
+            logger.debug("[Feishu] group-registry enrichment failed for chat=%s", chat_id, exc_info=True)
+            return base_prompt
+
+    def _mark_buffer_disconnect(self, chat_ids: Optional[set[str]] = None) -> None:
+        """Mark registered group buffers as disconnected (continuity=unknown).
+
+        Called on WebSocket reconnect / gateway startup to signal that the
+        buffer may have missed messages during the gap.
+        """
+        if not self._group_buffer_db_path:
+            return
+        targets = chat_ids or getattr(self, "_group_buffer_chat_ids", set())
+        if not targets:
+            return
+        import sqlite3
+        now = time.time()
+        try:
+            conn = sqlite3.connect(str(self._group_buffer_db_path))
+            for cid in targets:
+                conn.execute(
+                    "UPDATE buffer_watermark SET continuity_state='unknown',"
+                    " disconnect_epoch=?, updated_at=?"
+                    " WHERE chat_id=?",
+                    (now, now, cid),
+                )
+            conn.commit()
+            conn.close()
+            logger.info(
+                "[Feishu] Marked buffer disconnect for %d chat_ids", len(targets),
+            )
+        except Exception:
+            logger.debug("[Feishu] Buffer disconnect mark failed", exc_info=True)
+
+    def _recover_outbox_on_startup(self) -> None:
+        """Startup recovery: recover expired leases and drain queued outbox items."""
+        import sqlite3
+        shared_ids = self.config.extra.get("shared_group_session_chat_ids") or []
+        if not shared_ids:
+            return
+        try:
+            db_path = self._ensure_outbox_db()
+            conn = sqlite3.connect(str(db_path))
+            conn.execute("PRAGMA busy_timeout=5000")
+            now = time.time()
+            # Recover expired leases
+            for chat_id in shared_ids:
+                conn.execute(
+                    "UPDATE outbox SET state='queued', leased_at=NULL, lease_expires=NULL, lease_token=NULL,"
+                    " retry_count=retry_count+1 WHERE state='leased' AND lease_expires < ? AND chat_id=?",
+                    (now, chat_id),
+                )
+            conn.commit()
+            # Check for queued items and start workers
+            for chat_id in shared_ids:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM outbox WHERE chat_id=? AND state='queued'", (chat_id,)
+                ).fetchone()
+                if row and row[0] > 0:
+                    self._start_group_worker(chat_id)
+            conn.close()
+            logger.info("[Feishu] Outbox startup recovery completed for %d shared groups", len(shared_ids))
+        except Exception:
+            logger.debug("[Feishu] Outbox startup recovery failed", exc_info=True)
+
+    def _reconcile_group_buffer(
+        self, chat_id: str, feishu_messages: list[dict],
+    ) -> bool:
+        """Reconcile buffer continuity by merging server-side messages.
+
+        Args:
+            chat_id: The group chat to reconcile.
+            feishu_messages: Messages from Feishu server (list of dicts with
+                message_id, sender_open_id, reply_to, create_time, msg_type, content).
+
+        Returns:
+            True if reconciliation succeeded and continuity is restored.
+        """
+        if not self._group_buffer_db_path:
+            return False
+        import sqlite3
+        now = time.time()
+        try:
+            conn = sqlite3.connect(str(self._group_buffer_db_path))
+            merged = 0
+            for msg in feishu_messages:
+                msg_id = str(msg.get("message_id") or "")
+                if not msg_id:
+                    continue
+                conn.execute(
+                    """INSERT OR IGNORE INTO group_messages
+                       (chat_id, message_id, sender_open_id, reply_to_message_id,
+                        create_time, message_type, content, recorded_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        chat_id, msg_id,
+                        str(msg.get("sender_open_id") or ""),
+                        str(msg.get("reply_to") or ""),
+                        int(msg.get("create_time") or 0),
+                        str(msg.get("msg_type") or "text"),
+                        str(msg.get("content") or "")[:500],
+                        now,
+                    ),
+                )
+                if conn.execute("SELECT changes()").fetchone()[0]:
+                    merged += 1
+            # Mark reconciled
+            conn.execute(
+                "UPDATE buffer_watermark SET continuity_state='continuous',"
+                " last_reconciled_at=?, updated_at=? WHERE chat_id=?",
+                (now, now, chat_id),
+            )
+            conn.commit()
+            conn.close()
+            logger.info(
+                "[Feishu] Buffer reconciled: chat_id=%s merged=%d",
+                chat_id, merged,
+            )
+            return True
+        except Exception:
+            logger.debug("[Feishu] Buffer reconcile failed", exc_info=True)
+            return False
+
+    async def _fetch_group_messages_from_api(
+        self, chat_id: str, page_size: int = 50,
+    ) -> list[dict]:
+        """Fetch recent messages from Feishu server for buffer reconciliation.
+
+        Returns a list of dicts compatible with _reconcile_group_buffer().
+        """
+        try:
+            request = ListMessageRequest.builder() \
+                .container_id_type("chat") \
+                .container_id(chat_id) \
+                .page_size(page_size) \
+                .sort_type("ByCreateTimeDesc") \
+                .build()
+            response = await self._run_blocking(
+                self._client.im.v1.message.list, request,
+            )
+            if not response or not getattr(response, "success", False):
+                logger.debug(
+                    "[Feishu] ListMessage failed: chat_id=%s code=%s",
+                    chat_id, getattr(response, "code", "?"),
+                )
+                return []
+            items = getattr(response, "data", None)
+            items = getattr(items, "items", None) if items else None
+            if not items:
+                return []
+            result = []
+            for item in items:
+                sender = getattr(item, "sender", None)
+                sender_id = getattr(sender, "id", "") if sender else ""
+                body = getattr(item, "body", None)
+                content = getattr(body, "content", "") if body else ""
+                result.append({
+                    "message_id": str(getattr(item, "message_id", "") or ""),
+                    "sender_open_id": str(sender_id or ""),
+                    "reply_to": str(getattr(item, "root_id", "") or ""),
+                    "create_time": int(getattr(item, "create_time", "0") or "0"),
+                    "msg_type": str(getattr(item, "msg_type", "text") or "text"),
+                    "content": str(content or "")[:500],
+                })
+            return result
+        except Exception:
+            logger.debug("[Feishu] Fetch group messages failed", exc_info=True)
+            return []
+
+    async def _maybe_reconcile_group_buffer(self, chat_id: str) -> None:
+        """Trigger server-side reconciliation if buffer continuity is degraded.
+
+        Called after recording an inbound message. Only fires when
+        continuity_state is 'unknown' or 'gap_detected' and the last
+        reconciliation was more than 5 minutes ago (rate-limit).
+        """
+        if chat_id not in getattr(self, "_group_buffer_chat_ids", set()):
+            return
+        if not self._group_buffer_db_path:
+            return
+        import sqlite3
+        try:
+            conn = sqlite3.connect(str(self._group_buffer_db_path))
+            row = conn.execute(
+                "SELECT continuity_state, last_reconciled_at FROM buffer_watermark"
+                " WHERE chat_id=?",
+                (chat_id,),
+            ).fetchone()
+            conn.close()
+            if not row:
+                return
+            state = str(row[0] or "unknown")
+            last_recon = float(row[1] or 0)
+            if state not in ("unknown", "gap_detected"):
+                return
+            if time.time() - last_recon < 300:  # 5-min cooldown
+                return
+        except Exception:
+            return
+        # Fetch from server and reconcile
+        server_msgs = await self._fetch_group_messages_from_api(chat_id)
+        if server_msgs:
+            ok = self._reconcile_group_buffer(chat_id, server_msgs)
+            if ok:
+                logger.info(
+                    "[Feishu] Buffer auto-reconciled: chat_id=%s msgs=%d",
+                    chat_id, len(server_msgs),
+                )
 
     @staticmethod
     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:
@@ -2993,7 +3545,11 @@ class FeishuAdapter(BasePlatformAdapter):
             source=source,
             raw_message=data,
             message_id=message_id,
-            channel_prompt=self._resolve_channel_prompt(chat_id),
+            channel_prompt=self._enrich_channel_prompt_with_registry(
+                chat_id,
+                getattr(user_id_obj, "open_id", None) or "",
+                self._resolve_channel_prompt(chat_id),
+            ),
             timestamp=datetime.now(),
         )
         logger.info("[Feishu] Routing reaction %s:%s on bot message %s as synthetic event", action, emoji_type, message_id)
@@ -3056,7 +3612,11 @@ class FeishuAdapter(BasePlatformAdapter):
             source=source,
             raw_message=data,
             message_id=token or str(uuid.uuid4()),
-            channel_prompt=self._resolve_channel_prompt(chat_id),
+            channel_prompt=self._enrich_channel_prompt_with_registry(
+                chat_id,
+                open_id or "",
+                self._resolve_channel_prompt(chat_id),
+            ),
             timestamp=datetime.now(),
         )
         logger.info("[Feishu] Routing card action %r from %s in %s as synthetic command", action_tag, open_id, chat_id)
@@ -3338,6 +3898,29 @@ class FeishuAdapter(BasePlatformAdapter):
             user_id_alt=sender_profile["user_id_alt"],
             is_bot=is_bot,
         )
+        sender_memory_note = await self._maybe_persist_sender_memory_request(
+            sender_id,
+            chat_id=chat_id,
+            user_text=text,
+            message_id=message_id,
+        )
+        sender_prompt = self._resolve_sender_profile_prompt(sender_id, chat_id=chat_id)
+        sender_context = await self._resolve_sender_profile_context(sender_id, chat_id=chat_id, user_text=text)
+        channel_prompt = self._enrich_channel_prompt_with_registry(
+            chat_id,
+            sender_primary,
+            self._resolve_channel_prompt(chat_id, thread_id or None),
+        )
+
+        # ── Inject group context packet for registered groups ──────────────
+        group_packet = self._get_group_context_packet(chat_id, exclude_message_id=message_id)
+        if group_packet:
+            channel_prompt = f"{group_packet}\n\n{channel_prompt}" if channel_prompt else group_packet
+
+        extra_prompt_parts = [part for part in (sender_prompt, sender_context, sender_memory_note) if part]
+        if extra_prompt_parts:
+            appended = "\n\n".join(extra_prompt_parts)
+            channel_prompt = f"{channel_prompt}\n\n{appended}" if channel_prompt else appended
         normalized = MessageEvent(
             text=text,
             message_type=inbound_type,
@@ -4341,6 +4924,12 @@ class FeishuAdapter(BasePlatformAdapter):
             return "group_policy_rejected"
         if require_mention and not self._mentions_self(message):
             return "group_policy_rejected"
+        # ── require_mention=false 群：人类间对话抑制 ──
+        # 有 @ 但没 @ bot → 人类间对话，静默（消息已在缓冲录入）
+        if not require_mention and is_group:
+            mentions = getattr(message, "mentions", None) or []
+            if mentions and not self._mentions_self(message):
+                return "human_to_human"
         return None
 
     def _require_mention_for(self, chat_id: str) -> bool:
