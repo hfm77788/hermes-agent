@@ -191,6 +191,12 @@ _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
+# Catch leaked tool-call bracket payloads before they reach the user.
+# Backported from innovation-dept fork (commit audit 2026-08-04).
+_TOOL_CALL_BRACKET_RE = re.compile(
+    r"\[TOOL_CALL\]\s*(.*?)\s*\[/TOOL_CALL\]",
+    re.DOTALL | re.IGNORECASE,
+)
 # ---------------------------------------------------------------------------
 # Media type sets and upload constants
 # ---------------------------------------------------------------------------
@@ -2992,7 +2998,14 @@ class FeishuAdapter(BasePlatformAdapter):
 
     def format_message(self, content: str) -> str:
         """Feishu text messages are plain text by default."""
-        return content.strip()
+        text = content.strip()
+        if not text:
+            return text
+        match = _TOOL_CALL_BRACKET_RE.search(text)
+        if match:
+            payload = match.group(1).strip() or "unknown command"
+            return f"⚠️ Unresolved tool call: {payload}"
+        return text
 
     # =========================================================================
     # Inbound event handlers
