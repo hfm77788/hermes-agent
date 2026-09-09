@@ -392,6 +392,26 @@ RECALL_SCHEMA = {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "What to search for."},
+            "types": {
+                "type": "array", "items": {"type": "string"},
+                "description": "Optional fact types to include: world, experience, observation.",
+            },
+            "prefer_observations": {
+                "type": "boolean",
+                "description": "Drop raw facts already consolidated into returned observations (dedupe, observation wins).",
+            },
+            "tag_groups": {
+                "type": "array",
+                "description": "Boolean tag filter tree, e.g. [{\"tags\":[\"boss\"],\"tags_match\":\"any\"}].",
+            },
+            "min_scores": {
+                "type": "object",
+                "description": "Per-stage score floors, e.g. {\"semantic\":0.4,\"keyword\":0.2,\"rerank\":0.3}.",
+            },
+            "temporal_window": {
+                "type": "object",
+                "description": "Explicit date window {\"start\":\"ISO\",\"end\":\"ISO\"} for the temporal arm.",
+            },
         },
         "required": ["query"],
     },
@@ -407,8 +427,43 @@ REFLECT_SCHEMA = {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "The question to reflect on."},
+            "response_schema": {
+                "type": "object",
+                "description": "Optional JSON Schema; when given, the answer is returned as validated structured_output JSON.",
+            },
+            "fact_types": {
+                "type": "array", "items": {"type": "string"},
+                "description": "Restrict synthesis to these fact types (e.g. [\"world\"]).",
+            },
+            "exclude_mental_models": {
+                "type": "boolean",
+                "description": "Skip mental-model refresh during this reflect call.",
+            },
         },
         "required": ["query"],
+    },
+}
+
+FORGET_SCHEMA = {
+    "name": "hindsight_forget",
+    "description": (
+        "Soft-retire or delete memories by id: world/experience facts are "
+        "invalidated (excluded from recall), observations are dropped and "
+        "re-consolidated. Use after confirming wrong/outdated entries."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_ids": {
+                "type": "array", "items": {"type": "string"},
+                "description": "Memory ids to forget (from hindsight_recall traces or memories/list).",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Why these are being retired (stored as invalidation_reason for audit).",
+            },
+        },
+        "required": ["memory_ids", "reason"],
     },
 }
 
@@ -1549,6 +1604,44 @@ class HindsightMemoryProvider(MemoryProvider):
             self._client = client
             return self._run_sync(operation(client))
 
+    def _native_api(self, method: str, path: str, body: dict | None = None,
+                    timeout: float = 180.0):
+        """Raw REST call against the Hindsight server (stdlib urllib).
+
+        Bypasses hindsight-client SDK gaps/bugs: ``prefer_observations`` and
+        ``min_scores``/``temporal_window`` recall params and the curation
+        endpoints (PATCH memories/{id}, DELETE observations) are absent or
+        broken in the pinned SDK. Returns (status, parsed_json_or_text).
+        """
+        import urllib.error
+        import urllib.request
+        base = (self._api_url or "").rstrip("/")
+        if not base:
+            raise RuntimeError("Hindsight API URL not configured")
+        import urllib.parse
+        req = urllib.request.Request(
+            base + urllib.parse.quote(path, safe="/"),
+            data=json.dumps(body).encode() if body is not None else None,
+            method=method,
+            headers={"Content-Type": "application/json"},
+        )
+        if self._api_key:
+            req.add_header("Authorization", f"Bearer {self._api_key}")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+                payload = resp.read()
+            try:
+                return resp.status, (json.loads(payload) if payload else {})
+            except json.JSONDecodeError:
+                return resp.status, {"raw": payload.decode("utf-8", errors="replace")[:500]}
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")[:300]
+            except Exception:
+                pass
+            return exc.code, {"detail": detail or str(exc)[:200]}
+
     def _probe_url(self) -> str:
         """Return the URL to probe /version on.
 
@@ -2199,7 +2292,7 @@ class HindsightMemoryProvider(MemoryProvider):
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         if self._memory_mode == "context":
             return []
-        return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
+        return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA, FORGET_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if tool_name == "hindsight_retain":
@@ -2219,11 +2312,33 @@ class HindsightMemoryProvider(MemoryProvider):
                 item.pop("retain_async", None)
                 logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s",
                              self._bank_id, len(content), context)
-                self._run_hindsight_operation(
-                    lambda client: client.aretain_batch(bank_id=self._bank_id, items=[item])
-                )
-                logger.debug("Tool hindsight_retain: success")
-                return json.dumps({"result": "Memory stored successfully."})
+                # 2026-09-07 fix: this hindsight API version ignores the
+                # retain_async parameter (server logs "Unknown parameters
+                # ignored: [retain_async]"), so the POST blocks on the
+                # server-side extraction LLM call (observed 140-185s) and the
+                # tool call hit the 120s caller timeout, stalling whole turns.
+                # Route the write through the same single writer-thread queue
+                # sync_turn() uses: dispatch returns immediately; errors land
+                # in logs and the atexit drain keeps data durable.
+                bank_id = self._bank_id
+                retain_async_flag = self._retain_async
+
+                def _do_tool_retain() -> None:
+                    resp = self._run_hindsight_operation(
+                        lambda client: client.aretain_batch(
+                            bank_id=bank_id,
+                            items=[item],
+                            retain_async=retain_async_flag,
+                        )
+                    )
+                    if retain_async_flag:
+                        self._track_retain_ops(resp, bank_id)
+
+                self._ensure_writer()
+                self._register_atexit()
+                self._retain_queue.put(_do_tool_retain)
+                logger.debug("Tool hindsight_retain: queued for writer thread")
+                return json.dumps({"result": "Memory queued for storage (writer thread drains in background)."})
             except Exception as e:
                 logger.warning("hindsight_retain failed: %s", e, exc_info=True)
                 return tool_error(f"Failed to store memory: {e}")
@@ -2233,14 +2348,41 @@ class HindsightMemoryProvider(MemoryProvider):
             if not query:
                 return tool_error("Missing required parameter: query")
             try:
+                adv = {k: args[k] for k in
+                       ("prefer_observations", "tag_groups", "min_scores", "temporal_window")
+                       if args.get(k) is not None}
+                if adv:
+                    body: dict = {
+                        "query": query, "budget": self._budget,
+                        "max_tokens": self._recall_max_tokens,
+                    }
+                    types = args.get("types") or self._recall_types
+                    if types:
+                        body["types"] = list(types)
+                    if self._recall_tags:
+                        body["tags"] = list(self._recall_tags)
+                        body["tags_match"] = self._recall_tags_match
+                    body.update(adv)
+                    st, resp_json = self._native_api(
+                        "POST",
+                        f"/v1/default/banks/{self._bank_id}/memories/recall",
+                        body,
+                    )
+                    if st != 200:
+                        return tool_error(f"Failed to search memory: HTTP {st} {str(resp_json)[:200]}")
+                    results = resp_json.get("results") if isinstance(resp_json, dict) else None
+                    if not results:
+                        return json.dumps({"result": "No relevant memories found."})
+                    lines = [f"{i}. {str(res.get('text', '') if isinstance(res, dict) else res)}"
+                             for i, res in enumerate(results, 1)]
+                    return json.dumps({"result": "\n".join(lines)})
                 recall_kwargs: dict = {
                     "bank_id": self._bank_id, "query": query, "budget": self._budget,
                     "max_tokens": self._recall_max_tokens,
                 }
-                if self._recall_tags:
-                    recall_kwargs["tags"] = self._recall_tags
-                    recall_kwargs["tags_match"] = self._recall_tags_match
-                if self._recall_types:
+                if args.get("types"):
+                    recall_kwargs["types"] = list(args["types"])
+                elif self._recall_types:
                     recall_kwargs["types"] = self._recall_types
                 logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
                              self._bank_id, len(query), self._budget)
@@ -2260,6 +2402,24 @@ class HindsightMemoryProvider(MemoryProvider):
             if not query:
                 return tool_error("Missing required parameter: query")
             try:
+                adv = {k: args[k] for k in
+                       ("response_schema", "fact_types", "exclude_mental_models")
+                       if args.get(k) is not None}
+                if adv:
+                    body = {"query": query, "budget": self._budget}
+                    body.update(adv)
+                    st, resp_json = self._native_api(
+                        "POST",
+                        f"/v1/default/banks/{self._bank_id}/reflect",
+                        body, timeout=300.0,
+                    )
+                    if st != 200:
+                        return tool_error(f"Failed to reflect: HTTP {st} {str(resp_json)[:200]}")
+                    if isinstance(resp_json, dict) and resp_json.get("structured_output") is not None:
+                        return json.dumps({"result": json.dumps(
+                            resp_json["structured_output"], ensure_ascii=False)})
+                    text = resp_json.get("text") if isinstance(resp_json, dict) else ""
+                    return json.dumps({"result": text or "No relevant memories found."})
                 logger.debug("Tool hindsight_reflect: bank=%s, query_len=%d, budget=%s",
                              self._bank_id, len(query), self._budget)
                 resp = self._run_hindsight_operation(
@@ -2272,6 +2432,41 @@ class HindsightMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.warning("hindsight_reflect failed: %s", e, exc_info=True)
                 return tool_error(f"Failed to reflect: {e}")
+
+        elif tool_name == "hindsight_forget":
+            ids = args.get("memory_ids") or []
+            reason = args.get("reason", "")
+            if not ids or not isinstance(ids, list):
+                return tool_error("Missing required parameter: memory_ids (array of ids)")
+            if not reason:
+                return tool_error("Missing required parameter: reason (audit trail)")
+            try:
+                outcomes = []
+                for mid in ids:
+                    st, unit = self._native_api(
+                        "GET", f"/v1/default/banks/{self._bank_id}/memories/{mid}")
+                    ftype = (unit or {}).get("type") or (unit or {}).get("fact_type") if isinstance(unit, dict) else None
+                    if st == 404:
+                        outcomes.append(f"{mid[:8]}: not found")
+                        continue
+                    if ftype == "observation":
+                        st2, r2 = self._native_api(
+                            "DELETE",
+                            f"/v1/default/banks/{self._bank_id}/memories/{mid}/observations")
+                        outcomes.append(f"{mid[:8]}: observation drop -> {st2}")
+                    else:
+                        st2, r2 = self._native_api(
+                            "PATCH",
+                            f"/v1/default/banks/{self._bank_id}/memories/{mid}",
+                            {"state": "invalidated", "reason": reason})
+                        if st2 in (200, 202, 204):
+                            outcomes.append(f"{mid[:8]}: {ftype or 'fact'} invalidated")
+                        else:
+                            outcomes.append(f"{mid[:8]}: FAILED {st2} {str(r2)[:120]}")
+                return json.dumps({"result": "; ".join(outcomes)})
+            except Exception as e:
+                logger.warning("hindsight_forget failed: %s", e, exc_info=True)
+                return tool_error(f"Failed to forget: {e}")
 
         return tool_error(f"Unknown tool: {tool_name}")
 

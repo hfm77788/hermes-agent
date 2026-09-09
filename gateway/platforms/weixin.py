@@ -694,6 +694,42 @@ async def _download_and_decrypt_media(
     return raw
 
 
+async def _download_with_retry(
+    session: "aiohttp.ClientSession",
+    *,
+    cdn_base_url: str,
+    encrypted_query_param: Optional[str],
+    aes_key_b64: Optional[str],
+    full_url: Optional[str],
+    timeout_seconds: float,
+) -> bytes:
+    """Download and decrypt media with up to three attempts."""
+    # Validate outside the retry loop: SSRF rejections must fail immediately.
+    if not encrypted_query_param and full_url:
+        _assert_weixin_cdn_url(full_url)
+
+    # Back off for 2s and 5s before the second and third attempts.
+    retry_delays = (2.0, 5.0)
+    for attempt in range(1, 4):
+        try:
+            return await _download_and_decrypt_media(
+                session,
+                cdn_base_url=cdn_base_url,
+                encrypted_query_param=encrypted_query_param,
+                aes_key_b64=aes_key_b64,
+                full_url=full_url,
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Weixin media download attempt %d/3 failed: %s: %s",
+                attempt, type(exc).__name__, exc,
+            )
+            if attempt == 3:
+                raise
+            await asyncio.sleep(retry_delays[attempt - 1])
+
+
 def _mime_from_filename(filename: str) -> str:
     return mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
@@ -1518,11 +1554,15 @@ class WeixinAdapter(BasePlatformAdapter):
         media_types: List[str] = []
 
         for item in item_list:
-            await self._collect_media(item, media_paths, media_types)
+            error_note = await self._collect_media(item, media_paths, media_types)
+            if error_note:
+                text = f"{text}\n{error_note}" if text else error_note
             ref_message = item.get("ref_msg") or {}
             ref_item = ref_message.get("message_item")
             if isinstance(ref_item, dict):
-                await self._collect_media(ref_item, media_paths, media_types)
+                error_note = await self._collect_media(ref_item, media_paths, media_types)
+                if error_note:
+                    text = f"{text}\n{error_note}" if text else error_note
 
         if not text and not media_paths:
             return
@@ -1647,33 +1687,50 @@ class WeixinAdapter(BasePlatformAdapter):
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
 
-    async def _collect_media(self, item: Dict[str, Any], media_paths: List[str], media_types: List[str]) -> None:
+    async def _collect_media(self, item: Dict[str, Any], media_paths: List[str], media_types: List[str]) -> Optional[str]:
+        """Collect downloaded paths and return a visible note on failure."""
         item_type = item.get("type")
+        failed_name = ""
         if item_type == ITEM_IMAGE:
             path = await self._download_image(item)
             if path:
                 media_paths.append(path)
                 media_types.append("image/jpeg")
+            else:
+                failed_name = "图片"
         elif item_type == ITEM_VIDEO:
             path = await self._download_video(item)
             if path:
                 media_paths.append(path)
                 media_types.append("video/mp4")
+            else:
+                failed_name = "视频"
         elif item_type == ITEM_FILE:
             path, mime = await self._download_file(item)
             if path:
                 media_paths.append(path)
                 media_types.append(mime)
+            else:
+                failed_name = str((item.get("file_item") or {}).get("file_name") or "document.bin")
         elif item_type == ITEM_VOICE:
             voice_path = await self._download_voice(item)
             if voice_path:
                 media_paths.append(voice_path)
                 media_types.append("audio/silk")
+            else:
+                failed_name = "语音"
+        if failed_name:
+            # Validation and cache failures may occur without any retries.
+            return (
+                f"[系统提示：用户发送的文件 {failed_name} 下载失败，"
+                "请告知用户重发或改用飞书/邮件渠道]"
+            )
+        return None
 
     async def _download_image(self, item: Dict[str, Any]) -> Optional[str]:
         media = _media_reference(item, "image_item")
         try:
-            data = await _download_and_decrypt_media(
+            data = await _download_with_retry(
                 self._poll_session,
                 cdn_base_url=self._cdn_base_url,
                 encrypted_query_param=media.get("encrypt_query_param"),
@@ -1681,7 +1738,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 and base64.b64encode(bytes.fromhex(str((item.get("image_item") or {}).get("aeskey")))).decode("ascii")
                 or media.get("aes_key"),
                 full_url=media.get("full_url"),
-                timeout_seconds=30.0,
+                timeout_seconds=60.0,
             )
             return cache_image_from_bytes(data, ".jpg")
         except Exception as exc:
@@ -1691,7 +1748,7 @@ class WeixinAdapter(BasePlatformAdapter):
     async def _download_video(self, item: Dict[str, Any]) -> Optional[str]:
         media = _media_reference(item, "video_item")
         try:
-            data = await _download_and_decrypt_media(
+            data = await _download_with_retry(
                 self._poll_session,
                 cdn_base_url=self._cdn_base_url,
                 encrypted_query_param=media.get("encrypt_query_param"),
@@ -1710,13 +1767,13 @@ class WeixinAdapter(BasePlatformAdapter):
         filename = str(file_item.get("file_name") or "document.bin")
         mime = _mime_from_filename(filename)
         try:
-            data = await _download_and_decrypt_media(
+            data = await _download_with_retry(
                 self._poll_session,
                 cdn_base_url=self._cdn_base_url,
                 encrypted_query_param=media.get("encrypt_query_param"),
                 aes_key_b64=media.get("aes_key"),
                 full_url=media.get("full_url"),
-                timeout_seconds=60.0,
+                timeout_seconds=120.0,
             )
             return cache_document_from_bytes(data, filename), mime
         except Exception as exc:
@@ -1735,13 +1792,13 @@ class WeixinAdapter(BasePlatformAdapter):
         # pipeline can re-transcribe with the user's configured
         # mlx-whisper / whisper.cpp / faster-whisper backend.
         try:
-            data = await _download_and_decrypt_media(
+            data = await _download_with_retry(
                 self._poll_session,
                 cdn_base_url=self._cdn_base_url,
                 encrypted_query_param=media.get("encrypt_query_param"),
                 aes_key_b64=media.get("aes_key"),
                 full_url=media.get("full_url"),
-                timeout_seconds=60.0,
+                timeout_seconds=120.0,
             )
             return cache_audio_from_bytes(data, ".silk")
         except Exception as exc:

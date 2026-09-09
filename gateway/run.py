@@ -11241,36 +11241,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
         if is_steer_mode:
             message = (
-                f"⏩ Steered into current run{status_detail}. "
-                f"Your message arrives after the next tool call."
+                f"⏩ 已并入当前任务{status_detail}，"
+                f"你的消息会在下一个工具调用后生效。"
             )
         elif is_redirect_mode:
             message = (
-                f"↪ Redirected current run{status_detail}. "
-                f"I'll adjust using your correction."
+                f"↪ 已收到你的纠正，正在并入当前任务{status_detail}，"
+                f"马上按新指示调整。"
             )
         elif is_queue_mode and demoted_for_subagents:
             # #30170 — explain the demotion so the user knows their
             # follow-up didn't accidentally kill the subagent and
             # discovers `/stop` as the explicit escape hatch.
             message = (
-                f"⏳ Subagent working{status_detail} — your message is queued for "
-                f"when it finishes (use /stop to cancel everything)."
+                f"⏳ 子任务运行中{status_detail}——你的消息已排队，"
+                f"结束后自动处理（发 /stop 可取消全部）。"
             )
         elif is_queue_mode and demoted_for_compression:
             message = (
-                f"⏳ Compressing context{status_detail} — your message is queued for "
-                f"when it finishes (use /stop to cancel everything)."
+                f"⏳ 正在压缩上下文{status_detail}——你的消息已排队，"
+                f"完成后自动处理。"
             )
         elif is_queue_mode:
             message = (
-                f"⏳ Queued for the next turn{status_detail}. "
-                f"I'll respond once the current task finishes."
+                f"⏳ 消息已排队{status_detail}，"
+                f"当前任务完成后我会回复。"
             )
         else:
             message = (
-                f"⚡ Interrupting current task{status_detail}. "
-                f"I'll respond to your message shortly."
+                f"⚡ 正在中断当前任务{status_detail}，"
+                f"马上处理你的消息。"
             )
 
         # First-touch onboarding: the very first time a user sends a message

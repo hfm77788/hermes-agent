@@ -37,6 +37,13 @@ def _strip_edge_silence_punctuation(text: str) -> str:
     """
     start = 0
     end = len(text)
+    # Edge markdown backticks are pure styling noise (models wrap the marker
+    # as code: `` `SILENT` ``) — strip them so intentional silence still
+    # matches; square brackets stay structural below.
+    while start < end and text[start] == "`":
+        start += 1
+    while end > start and text[end - 1] == "`":
+        end -= 1
     while start < end and text[start] not in "[]" and unicodedata.category(text[start]).startswith("P"):
         start += 1
     while end > start and text[end - 1] not in "[]" and unicodedata.category(text[end - 1]).startswith("P"):

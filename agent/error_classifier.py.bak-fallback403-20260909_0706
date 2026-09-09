@@ -137,13 +137,6 @@ _BILLING_PATTERNS = [
     "out of funds",
     "run out of funds",
     "balance_depleted",
-    # 算家云/中转站积分耗尽：HTTP 403 + code=insufficient_user_quota，
-    # 正文「预扣费额度失败, 用户剩余额度: 积分X」。不在此表时被当成 auth，
-    # 2026-09-09 播客 cron 因此整链未走通直接死（实测 errors.log 03:17）。
-    "insufficient_user_quota",
-    "预扣费额度失败",
-    # 百炼 token-plan 积分耗尽的 403 表述
-    "no credits available",
     "model_not_supported_on_free_tier",
     "not available on the free tier",
 ]
