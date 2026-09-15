@@ -292,17 +292,37 @@ class DingTalkAdapter(BasePlatformAdapter):
     def _message_matches_mention_patterns(self, text: str) -> bool:
         return bool(text and self._mention_patterns) and any(p.search(text) for p in self._mention_patterns)
 
+    def _mentions_others_excluding_bot(self, message: "ChatbotMessage") -> bool:
+        """True when the message @-addresses someone but NOT the bot (private-chat style routing).
+
+        ``chatbot_user_id`` is the bot's own DingTalk id in this conversation; when the sender @-ed
+        the bot the SDK already flips ``is_in_at_list``. Remaining non-empty ``at_users`` therefore
+        target other members — the bot should stay silent there (rule: members @-ing each other is
+        not addressed to us)."""
+        if getattr(message, "is_in_at_list", False):
+            return False
+        at_users = list(getattr(message, "at_users", None) or [])
+        if not at_users:
+            return False
+        bot_id = getattr(message, "chatbot_user_id", None)
+        if bot_id and any(getattr(u, "dingtalk_id", None) == bot_id for u in at_users):
+            return False
+        return True
+
     def _should_process_message(self, message: "ChatbotMessage", text: str, is_group: bool, chat_id: str) -> bool:
         """Group trigger rules (DMs always pass; ``allowed_users`` is enforced earlier): ``allowed_chats`` is a hard
-        gate, then any of free_response_chats / require_mention off / @mentioned (SDK ``is_in_at_list``) / wake-word."""
+        gate, then any of free_response_chats / require_mention off / @mentioned (SDK ``is_in_at_list``) / wake-word.
+        Free-response chats answer messages with NO @ by default (rule 1), but stay silent when the @ targets
+        another member and not the bot (rule 2); a wake-word still always wins."""
         if not is_group:
             return True
         allowed = self._dingtalk_allowed_chats()
         if allowed and chat_id and chat_id not in allowed:
             return False
+        if chat_id and chat_id in self._csv_setting("free_response_chats", "DINGTALK_FREE_RESPONSE_CHATS"):
+            return not self._mentions_others_excluding_bot(message) or self._message_matches_mention_patterns(text)
         return (
-            bool(chat_id and chat_id in self._csv_setting("free_response_chats", "DINGTALK_FREE_RESPONSE_CHATS"))
-            or not self._dingtalk_require_mention()
+            not self._dingtalk_require_mention()
             or bool(getattr(message, "is_in_at_list", False))
             or self._message_matches_mention_patterns(text)
         )
