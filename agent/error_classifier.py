@@ -99,6 +99,16 @@ _BILLING_PATTERNS = (
     "hard billing limit",
 )
 
+# Patterns that indicate billing exhaustion (not transient rate limit).
+# local(superset): upstream keeps this as a tuple above; these extras cover
+# 算家云/中转站 403 insufficient_user_quota（2026-09-09 播客 cron 死链教训）与
+# 百炼 token-plan 403 表述。合并进上游元组而不是替换它。
+_BILLING_PATTERNS = _BILLING_PATTERNS + (
+    "insufficient_user_quota",
+    "预扣费额度失败",
+    "no credits available",
+)
+
 # Not proof of exhaustion: Anthropic returns the same "out of extra usage" body
 # for a content-filter rejection (#82154). Verdict stays ``billing`` but is
 # marked unverified so surfaces hedge and the pool uses a short cooldown.

@@ -615,19 +615,20 @@ class GatewayBusySessionMixin:
             except Exception:
                 pass
         status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
+        # local(zh): 状态提示中文化（原上游英文见 git 历史；升级后重放，勿删）
         if is_steer_mode:
-            head, tail = "⏩ Steered into current run", ". Your message arrives after the next tool call."
+            head, tail = "⏩ 已并入当前任务", "，你的消息会在下一个工具调用后生效。"
         elif is_redirect_mode:
-            head, tail = "↪ Redirected current run", ". I'll adjust using your correction."
+            head, tail = "↪ 已收到你的纠正，正在并入当前任务", "，马上按新指示调整。"
         elif is_queue_mode and demoted_for_subagents:
             # Explain the demotion: the follow-up didn't kill the subagent; /stop is the escape hatch.
-            head, tail = "⏳ Subagent working", self._BUSY_DEMOTED_TAIL
+            head, tail = "⏳ 子任务运行中", "——你的消息已排队，结束后自动处理（发 /stop 可取消全部）。"
         elif is_queue_mode and demoted_for_compression:
-            head, tail = "⏳ Compressing context", self._BUSY_DEMOTED_TAIL
+            head, tail = "⏳ 正在压缩上下文", "——你的消息已排队，完成后自动处理。"
         elif is_queue_mode:
-            head, tail = "⏳ Queued for the next turn", ". I'll respond once the current task finishes."
+            head, tail = "⏳ 消息已排队", "，当前任务完成后我会回复。"
         else:
-            head, tail = "⚡ Interrupting current task", ". I'll respond to your message shortly."
+            head, tail = "⚡ 正在中断当前任务", "，马上处理你的消息。"
         message = f"{head}{status_detail}{tail}"
 
         # One-time onboarding hint about the queue/interrupt knob (flag persisted to config.yaml).

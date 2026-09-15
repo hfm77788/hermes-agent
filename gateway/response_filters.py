@@ -24,7 +24,8 @@ def _canonical_silence_candidate(text: str) -> str:
 
 def _is_edge_punctuation(ch: str) -> bool:
     # Square brackets stay structural so malformed ``[SILENT`` cannot become ``SILENT``.
-    return ch not in "[]" and unicodedata.category(ch).startswith("P")
+    # local: backtick is pure styling noise (models wrap the marker as code: `` `SILENT` ``)
+    return ch == "`" or (ch not in "[]" and unicodedata.category(ch).startswith("P"))
 
 
 def _strip_edge_silence_punctuation(text: str) -> str:

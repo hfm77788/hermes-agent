@@ -203,7 +203,21 @@ class ContextTokenStore:
             payload = {key[len(prefix):]: value for key, value in self._cache.items() if key.startswith(prefix)}
             await asyncio.to_thread(self._persist, account_id, payload)
 
+    async def delete_if_matches(self, account_id: str, user_id: str, expected_token: str) -> bool:
+        """local(fork backport dda081aa): Remove a token only when it is still the value that
+        failed, so a token refreshed for the peer mid-probe is never clobbered."""
+        key = self._key(account_id, user_id)
+        if self._cache.get(key) != expected_token:
+            return False
+        self._cache.pop(key)
+        prefix = f"{account_id}:"
+        payload = {k[len(prefix):]: v for k, v in self._cache.items() if k.startswith(prefix)}
+        async with self._persist_lock:
+            await asyncio.to_thread(self._persist, account_id, payload)
+        return True
+
     def _persist(self, account_id: str, payload: Dict[str, str]) -> None:
+
         try:
             atomic_json_write(self._root / f"{account_id}.context-tokens.json", payload)
         except Exception as exc:
@@ -368,6 +382,42 @@ async def _download_and_decrypt_media(
     return _aes128_ecb_decrypt(raw, _parse_aes_key(aes_key_b64)) if aes_key_b64 else raw
 
 
+async def _download_with_retry(
+    session: "aiohttp.ClientSession",
+    *,
+    cdn_base_url: str,
+    encrypted_query_param: Optional[str],
+    aes_key_b64: Optional[str],
+    full_url: Optional[str],
+    timeout_seconds: float,
+) -> bytes:
+    """local(fork patch v20260909): Download and decrypt media with up to three attempts."""
+    # Validate outside the retry loop: SSRF rejections must fail immediately.
+    if not encrypted_query_param and full_url:
+        _assert_weixin_cdn_url(full_url)
+
+    # Back off for 2s and 5s before the second and third attempts.
+    retry_delays = (2.0, 5.0)
+    for attempt in range(1, 4):
+        try:
+            return await _download_and_decrypt_media(
+                session,
+                cdn_base_url=cdn_base_url,
+                encrypted_query_param=encrypted_query_param,
+                aes_key_b64=aes_key_b64,
+                full_url=full_url,
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Weixin media download attempt %d/3 failed: %s: %s",
+                attempt, type(exc).__name__, exc,
+            )
+            if attempt == 3:
+                raise
+            await asyncio.sleep(retry_delays[attempt - 1])
+
+
 def _walk_markdown_lines(content: str):
     """Yield ``(rstripped line, is_fence, in_code_block)`` per line; ``in_code_block`` is the state *before* a fence toggles it."""
     in_code_block = False
@@ -377,6 +427,7 @@ def _walk_markdown_lines(content: str):
         yield line, is_fence, in_code_block
         if is_fence:
             in_code_block = not in_code_block
+
 
 
 def _normalize_markdown_blocks(content: str) -> str:
@@ -658,11 +709,13 @@ _video_item, _voice_item = partial(_media_item, ITEM_VIDEO), partial(_media_item
 
 # Inbound media dispatch: item type -> (item key, download timeout, cache fn, mime or None (= guess from
 # file_name), log label). Cache fns are lambdas so monkeypatching the module names takes effect at call time.
+# local(fork patch v20260909): timeouts raised (image 30->60, file 60->120, voice 60->120)
+# to survive flaky WeChat CDN; each download now gets 3 attempts via _download_with_retry.
 _INBOUND_MEDIA: Dict[int, Tuple[str, float, Callable[[bytes, str], Awaitable[str]], Optional[str], str]] = {
-    ITEM_IMAGE: ("image_item", 30.0, lambda data, _name: cache_image_from_bytes_async(data, ".jpg"), "image/jpeg", "image"),
-    ITEM_VIDEO: ("video_item", 120.0, lambda data, _name: cache_document_from_bytes_async(data, "video.mp4"), "video/mp4", "video"),
-    ITEM_FILE: ("file_item", 60.0, lambda data, name: cache_document_from_bytes_async(data, name), None, "file"),
-    ITEM_VOICE: ("voice_item", 60.0, lambda data, _name: cache_audio_from_bytes_async(data, ".silk"), "audio/silk", "voice"),
+    ITEM_IMAGE: ("image_item", 60.0, lambda data, _name: cache_image_from_bytes_async(data, ".jpg"), "image/jpeg", "图片"),
+    ITEM_VIDEO: ("video_item", 120.0, lambda data, _name: cache_document_from_bytes_async(data, "video.mp4"), "video/mp4", "视频"),
+    ITEM_FILE: ("file_item", 120.0, lambda data, name: cache_document_from_bytes_async(data, name), None, "文件"),
+    ITEM_VOICE: ("voice_item", 120.0, lambda data, _name: cache_audio_from_bytes_async(data, ".silk"), "audio/silk", "语音"),
 }
 
 # Outbound local-file dispatch by extension: (extensions, sender method, path kwarg); default = send_document.
@@ -884,10 +937,17 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         if self._poll_session and self._token and not self._typing_cache.get(sender_id):
             asyncio.create_task(self._fetch_typing_ticket(self._poll_session, sender_id, context_token or None, "getConfig failed"))
         media_paths, media_types = [], []  # type: List[str], List[str]
+        media_errors: List[str] = []
         for item in item_list:
             ref_item = (item.get("ref_msg") or {}).get("message_item")
             for candidate in (item, ref_item) if isinstance(ref_item, dict) else (item,):
-                await self._collect_media(candidate, media_paths, media_types)
+                # local(fork patch v20260909): surface failed downloads to the model.
+                error_note = await self._collect_media(candidate, media_paths, media_types)
+                if error_note:
+                    media_errors.append(error_note)
+        if media_errors:
+            text = f"{text}\n" + "\n".join(media_errors) if text else "\n".join(media_errors)
+
         if not text and not media_paths:
             return
         source = self.build_source(chat_id=effective_chat_id, chat_type=chat_type, user_id=sender_id, user_name=sender_id)
@@ -906,12 +966,23 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             event.source, group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False), profile=event.source.profile)
 
-    async def _collect_media(self, item: Dict[str, Any], media_paths: List[str], media_types: List[str]) -> None:
+    async def _collect_media(self, item: Dict[str, Any], media_paths: List[str], media_types: List[str]) -> Optional[str]:
+        """local(fork patch v20260909): Collect downloaded paths and return a visible note on failure."""
         spec = _INBOUND_MEDIA.get(item.get("type"))
-        path, mime = await self._download_media(item, spec) if spec else (None, "")
+        if not spec:
+            return None
+        path, mime = await self._download_media(item, spec)
         if path:
             media_paths.append(path)
             media_types.append(mime)
+            return None
+        failed_name = str((item.get(str(spec[0])) or {}).get("file_name") or spec[4])
+        # Validation and cache failures may occur without any retries.
+        return (
+            f"[系统提示：用户发送的文件 {failed_name} 下载失败，"
+            "请告知用户重发或改用飞书/邮件渠道]"
+        )
+
 
     async def _download_media(self, item: Dict[str, Any], spec: Tuple[Any, ...]) -> Tuple[Optional[str], str]:
         """Download + decrypt one inbound media item -> (cached path or None, mime). Voice is always downloaded
@@ -930,17 +1001,19 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             # Russian message comes back as English phonemes) — we must always download the raw audio so
             # ``gateway/run.py``'s central STT pipeline can re-transcribe with the user's configured
             # mlx-whisper / whisper.cpp / faster-whisper backend.
-            data = await _download_and_decrypt_media(
+            data = await _download_with_retry(
                 self._poll_session, cdn_base_url=self._cdn_base_url, encrypted_query_param=media.get("encrypt_query_param"),
                 aes_key_b64=aes_key_b64, full_url=media.get("full_url"), timeout_seconds=timeout_seconds)
             return await cache_fn(data, filename), mime
         except Exception as exc:
             logger.warning("[%s] %s download failed: %s", self.name, label, exc)
+
             return None, mime
 
     async def _fetch_typing_ticket(self, session: Any, user_id: str, context_token: Optional[str], failure_label: str) -> Optional[str]:
         try:
             response = await _get_config(session, base_url=self._base_url, token=self._token, user_id=user_id, context_token=context_token)
+
             typing_ticket = str(response.get("typing_ticket") or "")
             if typing_ticket:
                 self._typing_cache.set(user_id, typing_ticket)
@@ -971,6 +1044,8 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         async with self._send_text_gate:
             last_error: Optional[Exception] = None
             retried_without_token = False
+            probed_context_token: Optional[str] = None
+            tokenless_probe_rate_limited = False
             for attempt in range(self._send_chunk_retries + 1):
                 if self._rate_limit_cooldown_remaining() > 0:
                     raise RuntimeError(f"iLink sendmessage rate limited; cooldown active for {self._rate_limit_cooldown_remaining():.1f}s")
@@ -986,20 +1061,38 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                             logger.warning("[%s] session expired for %s; retrying without context_token", self.name, _safe_id(chat_id))
                             continue
                         errmsg = resp.get("errmsg") or resp.get("msg")
-                        if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
-                            raise RuntimeError(f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg or 'unknown error'}")
-                        # Keep a descriptive error for when the loop exhausts while still limited.
-                        last_error = RuntimeError(f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg or 'rate limited'}")
-                        if self._record_rate_limit_event():
-                            last_error = RuntimeError(
-                                f"iLink sendmessage rate limited; cooldown active for {self._rate_limit_cooldown_remaining():.1f}s")
-                            break
-                        if attempt >= self._send_chunk_retries:
-                            break
-                        wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
-                        logger.warning("[%s] rate limited for %s; backing off %.1fs before retry", self.name, _safe_id(chat_id), wait)
-                        await asyncio.sleep(wait)
-                        continue
+                        is_rate_limited = (ret == RATE_LIMIT_ERRCODE or errcode == RATE_LIMIT_ERRCODE)
+                        # local(fork backport dda081aa): Rate limit (-2) is ambiguous in iLink — a
+                        # stale context_token produces the same response as a genuine throttle.
+                        # Probe once tokenless before opening the rate-limit circuit; reusing
+                        # client_id keeps the fallback idempotent if the first attempt landed.
+                        if is_rate_limited and context_token and not retried_without_token and attempt < self._send_chunk_retries:
+                            retried_without_token = True
+                            probed_context_token = context_token
+                            context_token = None
+                            logger.warning("[%s] iLink rate-limit code for %s; retrying once without context_token", self.name, _safe_id(chat_id))
+                            continue
+                        if is_rate_limited:
+                            if probed_context_token and context_token is None:
+                                tokenless_probe_rate_limited = True
+                            # Keep a descriptive error for when the loop exhausts while still limited.
+                            last_error = RuntimeError(f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg or 'rate limited'}")
+                            if self._record_rate_limit_event():
+                                last_error = RuntimeError(
+                                    f"iLink sendmessage rate limited; cooldown active for {self._rate_limit_cooldown_remaining():.1f}s")
+                                break
+                            if attempt >= self._send_chunk_retries:
+                                break
+                            wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
+                            logger.warning("[%s] rate limited for %s; backing off %.1fs before retry", self.name, _safe_id(chat_id), wait)
+                            await asyncio.sleep(wait)
+                            continue
+                        raise RuntimeError(f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg or 'unknown error'}")
+                    if probed_context_token and not tokenless_probe_rate_limited:
+                        # The tokenless probe succeeded: the stored token was stale, not the
+                        # account throttled. Remove that exact value durably, preserving any
+                        # newer token received for the peer while the probe was in flight.
+                        await self._token_store.delete_if_matches(self._account_id, chat_id, probed_context_token)
                     self._rate_limit_events.clear()
                     self._rate_limit_circuit_until = 0.0
                     return
@@ -1014,6 +1107,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                         await asyncio.sleep(wait)
             assert last_error is not None
             raise last_error
+
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         if not self._send_session or not self._token:
