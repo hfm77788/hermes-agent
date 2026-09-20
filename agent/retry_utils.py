@@ -8,7 +8,7 @@ import random
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Optional
 
@@ -75,6 +75,11 @@ _RESETS_IN_RE = re.compile(
     r"(?:(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)\b)?", re.IGNORECASE,
 )
 _RETRY_AFTER_SECONDS_RE = re.compile(r"retry\s+(?:after\s+)?(\d+(?:\.\d+)?)\s*(?:sec|secs|seconds|s\b)", re.IGNORECASE)
+_ABSOLUTE_RESET_UTC_RE = re.compile(
+    r"\breset(?:s)?\s+at\s+(?:(\d{4})-)?(\d{1,2})-(\d{1,2})[ T]"
+    r"(\d{1,2}):(\d{2})(?::(\d{2}))?\s*UTC\b",
+    re.IGNORECASE,
+)
 
 
 def _quota_reset_seconds(m: "re.Match[str]") -> float:
@@ -98,7 +103,38 @@ RETRY_DELAY_PATTERNS = (
 )
 
 
-def reset_delay_from_message(message: str) -> Optional[float]:
+def _absolute_reset_delay_from_message(
+    message: str, *, now: Optional[datetime] = None,
+) -> Optional[float]:
+    match = _ABSOLUTE_RESET_UTC_RE.search(message or "")
+    if not match:
+        return None
+    reference = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    else:
+        reference = reference.astimezone(timezone.utc)
+    explicit_year = match.group(1)
+    year = int(explicit_year) if explicit_year else reference.year
+    try:
+        candidate = datetime(
+            year, int(match.group(2)), int(match.group(3)),
+            int(match.group(4)), int(match.group(5)), int(match.group(6) or 0),
+            tzinfo=timezone.utc,
+        )
+    except ValueError:
+        return None
+    if not explicit_year and candidate < reference - timedelta(days=180):
+        try:
+            candidate = candidate.replace(year=year + 1)
+        except ValueError:
+            return None
+    return max(0.0, (candidate - reference).total_seconds())
+
+
+def reset_delay_from_message(
+    message: str, *, now: Optional[datetime] = None,
+) -> Optional[float]:
     """Seconds-until-reset parsed from free-text provider error messages, or None."""
     if not message:
         return None
@@ -106,7 +142,47 @@ def reset_delay_from_message(message: str) -> Optional[float]:
         m = pattern.search(message)
         if m and (seconds := to_seconds(m)) is not None:
             return seconds
-    return None
+    return _absolute_reset_delay_from_message(message, now=now)
+
+
+def reset_at_delay_seconds(value: Any, *, now_epoch: Optional[float] = None) -> Optional[float]:
+    """Convert a structured reset-at value to seconds from the current wall clock."""
+    if value is None or isinstance(value, bool):
+        return None
+    now_epoch = time.time() if now_epoch is None else float(now_epoch)
+    numeric = None
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            numeric = float(text)
+        except ValueError:
+            iso = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+            try:
+                when = datetime.fromisoformat(iso)
+            except ValueError:
+                when = None
+            if when is None:
+                try:
+                    when = parsedate_to_datetime(text)
+                except (TypeError, ValueError):
+                    when = None
+            if when is not None:
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+                return max(0.0, when.timestamp() - now_epoch)
+            reference = datetime.fromtimestamp(now_epoch, timezone.utc)
+            return _absolute_reset_delay_from_message("reset at " + text, now=reference)
+    if numeric is None or numeric < 0:
+        return None
+    if numeric > 1_000_000_000_000:
+        numeric /= 1000.0
+    if numeric <= 31 * 24 * 3600:
+        return numeric
+    return max(0.0, numeric - now_epoch)
 
 
 def jittered_backoff(attempt: int, *, base_delay: float = 5.0, max_delay: float = 120.0, jitter_ratio: float = 0.5) -> float:
