@@ -6,7 +6,9 @@ Requires ``pip install "dingtalk-stream>=0.20" httpx``. config.yaml ``platforms.
 import asyncio
 import json
 import logging
+import os
 import re
+import time
 import traceback
 import uuid
 from datetime import datetime, timezone
@@ -69,7 +71,12 @@ _EMOTION_BG = "im_bg_1"
 _EMOTION_SDK = {recall: (f"Robot{v}EmotionRequestTextEmotion", f"Robot{v}EmotionRequest", f"Robot{v}EmotionHeaders", f"robot_{v.lower()}_emotion_with_options_async")
                 for recall, v in ((True, "Recall"), (False, "Reply"))}
 _NUMBERED_RE = re.compile(r"^\d+\.\s")
-_NO_LOCAL_UPLOAD = "DingTalk session webhook replies do not support local %s. Only markdown/text replies are supported without OpenAPI %s."
+# OpenAPI outbound media: oapi media upload (classic endpoint, token-interop verified both ways) +
+# robot message-send msgKeys. sampleFile=文件卡片, sampleImageMsg=内联图片 (live-verified 2026-09-17).
+_OAPI_MEDIA_UPLOAD = "https://oapi.dingtalk.com/media/upload"
+_V1_TOKEN_URL = "https://api.dingtalk.com/v1.0/oauth2/accessToken"
+_MEDIA_MAX_BYTES = 20 * 1024 * 1024  # oapi media upload hard cap
+_IMAGE_EXTS = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 
 
 def _csv_set(raw: Any) -> Set[str]:
@@ -146,6 +153,11 @@ class DingTalkAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.DINGTALK)
         extra = config.extra or {}
         self._client_id, self._client_secret = _credentials(extra)
+        # Outbound OpenAPI (robot message send + media upload) fallback recipients, used when the
+        # live per-chat context is gone (gateway restart / cron standalone). staffId for DM sends.
+        self._dm_user_id: str = str(_extra_or_secret(extra, "dm_user_id", "DINGTALK_DM_USER_ID", "") or "").strip()
+        self._dm_chat_ids: Set[str] = self._csv_setting("dm_chat_ids", "DINGTALK_DM_CHAT_IDS")
+        self._token_cache: Optional[tuple[str, float]] = None  # (access_token, monotonic expiry)
         # Group-chat gating; mention state is the SDK's structured ``is_in_at_list``, not text parsing.
         self._mention_patterns: List[re.Pattern] = self._compile_mention_patterns()
         self._allowed_users: Set[str] = {item.lower() for item in self._csv_setting("allowed_users", "DINGTALK_ALLOWED_USERS")}
@@ -423,6 +435,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             logger.warning("[%s] AI Card send failed, falling back to webhook", self.name)
         logger.debug("[%s] Sending via webhook", self.name)
         payload = {"msgtype": "markdown", "markdown": {"title": "Hermes", "text": self._normalize_markdown(content[: self.MAX_MESSAGE_LENGTH])}}
+        webhook_error: Optional[str] = None
         try:
             resp = await self._http_client.post(session_webhook, json=payload, timeout=15.0)
             if resp.status_code < 300:
@@ -430,12 +443,22 @@ class DingTalkAdapter(BasePlatformAdapter):
                     self._fire_done_reaction(chat_id)
                 return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
             logger.warning("[%s] Send failed HTTP %d: %s", self.name, resp.status_code, resp.text[:200])
-            return SendResult(success=False, error=f"HTTP {resp.status_code}: {resp.text[:200]}")
+            webhook_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
         except httpx.TimeoutException:
-            return SendResult(success=False, error="Timeout sending message to DingTalk")
+            webhook_error = "Timeout sending message to DingTalk"
         except Exception as e:
             logger.error("[%s] Send error: %s", self.name, e)
-            return SendResult(success=False, error=str(e))
+            webhook_error = str(e)
+        # Session-webhook failure (expired token, revoked grant): retry over the robot OpenAPI.
+        # Only with live context — a context-less chat_id must not be guessed into orgGroupSend.
+        if current_message is not None:
+            fallback = await self._robot_send("sampleMarkdown", {"title": "Hermes", "text": payload["markdown"]["text"]}, chat_id)
+            if fallback.success:
+                logger.info("[%s] webhook send failed (%s); delivered via robot OpenAPI", self.name, webhook_error[:120])
+                if is_final_reply:
+                    self._fire_done_reaction(chat_id)
+                return fallback
+        return SendResult(success=False, error=webhook_error)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """DingTalk does not support typing indicators."""
@@ -446,12 +469,97 @@ class DingTalkAdapter(BasePlatformAdapter):
         return await self.send(chat_id=chat_id, content=f"{caption}\n\n{image_block}" if caption else image_block, reply_to=reply_to, metadata=metadata)
 
     async def send_image_file(self, chat_id: str, image_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None, metadata=None, **kwargs) -> SendResult:
-        """Webhook replies cannot upload local images."""
-        return SendResult(success=False, error=_NO_LOCAL_UPLOAD % ("image uploads", "media upload"))
+        """Send a local image natively (inline) via OpenAPI: oapi media upload → robot ``sampleImageMsg``."""
+        return await self._send_media_file(chat_id, image_path, kind="image", caption=caption, reply_to=reply_to, metadata=metadata)
 
     async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None, reply_to=None, metadata=None, **kwargs) -> SendResult:
-        """Webhook replies cannot upload local files."""
-        return SendResult(success=False, error=_NO_LOCAL_UPLOAD % ("file attachments", "message send"))
+        """Send a local file as a native file card via OpenAPI: oapi media upload → robot ``sampleFile``."""
+        return await self._send_media_file(chat_id, file_path, kind="file", caption=caption, reply_to=reply_to, metadata=metadata, file_name=file_name)
+
+    async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None, metadata=None, **kwargs) -> SendResult:
+        """DingTalk robot media messages have no inline video type — deliver as a file card."""
+        return await self._send_media_file(chat_id, video_path, kind="file", caption=caption, reply_to=reply_to, metadata=metadata)
+
+    async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None, metadata=None, **kwargs) -> SendResult:
+        """Audio has no robot voice message either; send the file as a card (TTS/auto-TTS delivery)."""
+        return await self._send_media_file(chat_id, audio_path, kind="file", caption=caption, reply_to=reply_to, metadata=metadata)
+
+    async def _send_media_file(self, chat_id: str, file_path: str, *, kind: str, caption: Optional[str] = None,
+                               reply_to: Optional[str] = None, metadata=None, file_name: Optional[str] = None) -> SendResult:
+        if not self._http_client:
+            return SendResult(success=False, error="HTTP client not initialized")
+        display_name = file_name or os.path.basename(file_path)
+        media_id, err = await self._upload_media(file_path, kind, display_name)
+        if err:
+            logger.warning("[%s] %s upload failed for %s: %s", self.name, kind, display_name, err)
+            return SendResult(success=False, error=err)
+        if kind == "image":
+            result = await self._robot_send("sampleImageMsg", {"photoURL": media_id or ""}, chat_id)
+        else:
+            ext = os.path.splitext(display_name)[1].lstrip(".").lower() or "file"
+            result = await self._robot_send("sampleFile", {"mediaId": media_id or "", "fileName": display_name, "fileType": ext}, chat_id)
+        # DingTalk media messages carry no caption; a caller-provided one goes as a follow-up text.
+        if result.success and caption:
+            await self._quiet(self.send(chat_id=chat_id, content=caption, metadata=metadata), "[%s] media caption send failed: %s")
+        return result
+
+    def _resolve_send_target(self, chat_id: str) -> tuple[str, Optional[str], Optional[str]]:
+        """``(kind, conversation_id, staff_id)``: 'group' → orgGroupSend; 'dm' → batchSendOTO (staffId).
+
+        The live per-chat inbound context wins (a DM's ``cid…`` conversation_id is NOT a valid
+        orgGroupSend target — live-verified ``resource.not.found``); after a restart the config
+        fallback (``DINGTALK_DM_CHAT_IDS`` + ``DINGTALK_DM_USER_ID``) routes the home-channel DM."""
+        msg = self._message_contexts.get(chat_id)
+        if msg is not None:
+            if str(getattr(msg, "conversation_type", "1") or "1") == "2":
+                return "group", getattr(msg, "conversation_id", None) or chat_id, None
+            return "dm", None, (getattr(msg, "sender_staff_id", "") or None)  # staffId missing → dm-without-recipient error, not a bogus group send
+        if chat_id in self._dm_chat_ids:
+            return "dm", None, self._dm_user_id or None
+        return "group", chat_id, None
+
+    async def _upload_media(self, file_path: str, kind: str, file_name: str) -> tuple[Optional[str], Optional[str]]:
+        """Upload a local file to oapi media storage → ``(media_id, error)``; ``kind`` is 'image' or 'file'."""
+        token = await self._ensure_access_token()
+        if not token:
+            return None, "DingTalk access token unavailable (check DINGTALK_CLIENT_ID/SECRET)"
+        try:
+            if os.path.getsize(file_path) > _MEDIA_MAX_BYTES:
+                return None, f"file exceeds DingTalk media size limit ({_MEDIA_MAX_BYTES // (1024 * 1024)}MB)"
+            with open(file_path, "rb") as fh:
+                content = fh.read()
+            resp = await self._http_client.post(_OAPI_MEDIA_UPLOAD, params={"access_token": token, "type": kind},
+                                                files={"media": (file_name, content, "application/octet-stream")}, timeout=60.0)
+            data = resp.json()
+        except Exception as e:
+            return None, f"media upload failed: {e}"
+        if data.get("errcode") != 0 or not data.get("media_id"):
+            return None, f"media upload failed: errcode={data.get('errcode')} errmsg={str(data.get('errmsg'))[:120]}"
+        return data["media_id"], None
+
+    async def _robot_send(self, msg_key: str, msg_param: Dict[str, str], chat_id: str) -> SendResult:
+        """Deliver one robot message (media or text) via the v1.0 OpenAPI, DM vs group routed by
+        ``_resolve_send_target``. ``msgParam`` is JSON-encoded per the DingTalk wire format."""
+        token = await self._ensure_access_token()
+        if not token or not self._http_client:
+            return SendResult(success=False, error="DingTalk access token unavailable")
+        kind, conversation_id, staff_id = self._resolve_send_target(chat_id)
+        if kind == "dm" and not staff_id:
+            return SendResult(success=False, error="DingTalk DM media send needs a staffId — reply within session or set DINGTALK_DM_USER_ID (+ DINGTALK_DM_CHAT_IDS for cron).")
+        param = json.dumps(msg_param, ensure_ascii=False)
+        if kind == "dm":
+            url, body = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend", {"robotCode": self._robot_code, "userIds": [staff_id], "msgKey": msg_key, "msgParam": param}
+        else:
+            url, body = "https://api.dingtalk.com/v1.0/robot/groupMessages/send", {"robotCode": self._robot_code, "openConversationId": conversation_id, "msgKey": msg_key, "msgParam": param}
+        try:
+            resp = await self._http_client.post(url, headers={"x-acs-dingtalk-access-token": token}, json=body, timeout=30.0)
+        except Exception as e:
+            return SendResult(success=False, error=f"robot send failed: {e}", retryable=True)
+        if resp.status_code >= 300:
+            error = f"robot send HTTP {resp.status_code}: {resp.text[:200]}"
+            logger.warning("[%s] %s (kind=%s msg_key=%s)", self.name, error, kind, msg_key)
+            return SendResult(success=False, error=error)
+        return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return basic info about a DingTalk conversation."""
@@ -539,6 +647,31 @@ class DingTalkAdapter(BasePlatformAdapter):
             return await asyncio.to_thread(self._stream_client.get_access_token)
         except Exception as e:
             logger.error("[%s] Failed to get access token: %s", self.name, e)
+            return None
+
+    async def _ensure_access_token(self) -> Optional[str]:
+        """Token for outbound OpenAPI calls: the stream client's cached getter first, else a direct
+        v1.0 oauth2 fetch (standalone/cron has no stream client). Live-verified: this token is
+        accepted by both api.dingtalk.com v1.0 and oapi.dingtalk.com endpoints."""
+        if self._stream_client:
+            if token := await self._get_access_token():
+                return token
+        now = time.monotonic()
+        if self._token_cache and self._token_cache[1] > now + 60:
+            return self._token_cache[0]
+        if not self._client_id or not self._client_secret or not self._http_client:
+            return None
+        try:
+            resp = await self._http_client.post(_V1_TOKEN_URL, json={"appKey": self._client_id, "appSecret": self._client_secret}, timeout=15.0)
+            data = resp.json() if resp.status_code < 300 else {}
+            token = data.get("accessToken") or ""
+            if not token:
+                logger.warning("[%s] oauth2 accessToken failed HTTP %d: %s", self.name, resp.status_code, str(data.get("message", ""))[:120])
+                return None
+            self._token_cache = (token, now + int(data.get("expireIn") or 7200) - 60)
+            return token
+        except Exception as e:
+            logger.error("[%s] oauth2 accessToken error: %s", self.name, e)
             return None
 
     async def _send_emotion(self, open_msg_id: str, open_conversation_id: str, emoji_name: str, *, recall: bool = False) -> None:
@@ -641,32 +774,82 @@ class _IncomingHandler(dingtalk_stream.ChatbotHandler if DINGTALK_STREAM_AVAILAB
             logger.exception("[%s] Error processing incoming message", self._adapter.name)
 
 
-async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False):
-    """Out-of-process delivery (standalone_sender_fn) via the static robot webhook (DINGTALK_WEBHOOK_URL / extra
-    ``webhook_url``) — per-session webhooks aren't available to cron jobs."""
+async def _webhook_text_send(httpx_mod, webhook_url: str, message: str) -> SendResult:
+    """POST a text message to the static robot webhook (legacy cron path). The webhook URL carries
+    the robot's access_token, so failures are redacted the same way send_message_tool._error does."""
     try:
-        import httpx
-    except ImportError:
-        return send_error("httpx not installed")
-    # Scoped: the webhook URL carries the robot's access_token and IS the delivery target — a raw
-    # environ read would post a secondary profile's cron output to the default profile's robot.
-    webhook_url = (getattr(pconfig, "extra", {}) or {}).get("webhook_url") or _get_scoped_secret("DINGTALK_WEBHOOK_URL", "")
-    if not webhook_url:
-        return send_error("DingTalk not configured. Set DINGTALK_WEBHOOK_URL env var or webhook_url in dingtalk platform extra config.")
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx_mod.AsyncClient(timeout=30.0) as client:
             resp = await client.post(webhook_url, json={"msgtype": "text", "text": {"content": message}})
             resp.raise_for_status()
             data = resp.json()
         if data.get("errcode", 0) != 0:
-            return send_error(f"DingTalk API error: {data.get('errmsg', 'unknown')}")
-        return {"success": True, "platform": "dingtalk", "chat_id": chat_id}
+            return SendResult(success=False, error=f"DingTalk API error: {data.get('errmsg', 'unknown')}")
+        return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
     except Exception as e:
-        try:  # send_message_tool._error redacts access_token from webhook URLs (lazy import avoids a circular)
+        try:  # lazy import avoids a circular; strips access_token=… from any URL-bearing error text
             from tools.send_message_tool import _error as _redact_error
-            return _redact_error(f"DingTalk send failed: {e}")
+            msg = str(_redact_error(f"DingTalk send failed: {e}").get("error", e))
         except Exception:
-            return send_error(f"DingTalk send failed: {e}")
+            msg = f"DingTalk send failed: {e}"
+        return SendResult(success=False, error=msg)
+
+
+async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False):
+    """Out-of-process delivery (standalone_sender_fn): webhook text when DINGTALK_WEBHOOK_URL is set,
+    otherwise/for media via a transient adapter on the robot OpenAPI (upload + sampleFile/sampleImageMsg).
+    Media routing needs the config fallbacks (DINGTALK_DM_CHAT_IDS + DINGTALK_DM_USER_ID) since no
+    inbound context exists in a cron process."""
+    webhook_url = (getattr(pconfig, "extra", {}) or {}).get("webhook_url") or _get_scoped_secret("DINGTALK_WEBHOOK_URL", "")
+    if webhook_url and not media_files:
+        # Legacy static-webhook text path (unchanged behavior shape).
+        try:
+            import httpx as _httpx
+        except ImportError:
+            return send_error("httpx not installed")
+        result = await _webhook_text_send(_httpx, webhook_url, message)
+        return {"success": True, "platform": "dingtalk", "chat_id": chat_id, "message_id": result.message_id} if result.success else send_error(result.error or "DingTalk send failed")
+    if not ensure_dingtalk_deps():
+        return send_error("DingTalk dependencies not installed. Run: pip install 'dingtalk-stream>=0.20' httpx")
+    try:
+        import httpx as _httpx
+    except ImportError:
+        return send_error("httpx not installed")
+    adapter = DingTalkAdapter(pconfig)
+    adapter._http_client = _httpx.AsyncClient(timeout=30.0)
+    try:
+        last_result = None
+        if message.strip():
+            kind, _conv, staff = adapter._resolve_send_target(chat_id)
+            if kind == "dm" and not staff and webhook_url:
+                # Legacy DM text over the static robot webhook; media below still needs OpenAPI routing.
+                last_result = await _webhook_text_send(_httpx, webhook_url, message)
+            elif kind == "group":  # a webhook-less group send is a real OpenAPI call
+                last_result = await adapter._robot_send("sampleMarkdown", {"title": "Hermes", "text": adapter._normalize_markdown(message[: adapter.MAX_MESSAGE_LENGTH])}, chat_id)
+            elif staff:
+                last_result = await adapter._robot_send("sampleText", {"content": message[: adapter.MAX_MESSAGE_LENGTH]}, chat_id)
+            elif webhook_url:
+                last_result = await _webhook_text_send(_httpx, webhook_url, message)
+            else:
+                return send_error("DingTalk standalone send needs a group chat_id, or DINGTALK_DM_USER_ID for DMs (and DINGTALK_DM_CHAT_IDS to route this chat).")
+            if isinstance(last_result, dict):  # webhook helper returns error-dict on failure
+                return last_result
+            if not last_result.success:
+                return send_error(f"DingTalk send failed: {last_result.error}")
+        for media_path, _is_voice in media_files or []:
+            if not os.path.exists(media_path):
+                return send_error(f"Media file not found: {media_path}")
+            ext = os.path.splitext(media_path)[1].lower()
+            sender = adapter.send_image_file if (ext in _IMAGE_EXTS and not force_document) else adapter.send_document
+            last_result = await sender(chat_id, media_path)
+            if not last_result.success:
+                return send_error(f"DingTalk media send failed: {last_result.error}")
+        if last_result is None:
+            return send_error("No deliverable text or media remained after processing MEDIA tags")
+        return {"success": True, "platform": "dingtalk", "chat_id": chat_id, "message_id": last_result.message_id}
+    except Exception as e:
+        return send_error(f"DingTalk send failed: {e}")
+    finally:
+        await adapter._quiet(adapter._http_client.aclose(), "[%s] standalone http client close failed: %s")
 
 
 def interactive_setup() -> None:
@@ -720,6 +903,7 @@ _YAML_BRIDGE = (  # (yaml key, env var, kind) for apply_yaml_bridge
     ("require_mention", "DINGTALK_REQUIRE_MENTION", "lower"), ("mention_patterns", "DINGTALK_MENTION_PATTERNS", "json"),
     ("free_response_chats", "DINGTALK_FREE_RESPONSE_CHATS", "csv"), ("allowed_chats", "DINGTALK_ALLOWED_CHATS", "csv"),
     ("allowed_users", "DINGTALK_ALLOWED_USERS", "csv"),
+    ("dm_user_id", "DINGTALK_DM_USER_ID", "str"), ("dm_chat_ids", "DINGTALK_DM_CHAT_IDS", "csv"),
 )
 
 

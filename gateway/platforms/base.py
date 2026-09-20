@@ -1493,6 +1493,40 @@ def _append_text(existing: Optional[str], new: Optional[str]) -> str:
     return f"{existing}\n{new}" if existing else new
 
 
+# Invariant (feishu-wd card 1, ce-20260917): when two inbound events merge into one
+# batched/queued event, the survivor must keep EVERY contributing source message_id.
+# Downstream reconciliation (gateway/feishu_reconcile.py, watchdog card 2) records
+# ``inbound_seen`` per message_id; without this list the merged-away ids are lost and
+# reconciliation misfires (spec dedup_and_correlation.merge_input, ruling 0-08).
+# Stored additively in ``metadata['source_message_ids']`` — a free-form, ``.get()``-read
+# field — so no existing field semantics, merge order, or dispatched text changes.
+SOURCE_MESSAGE_IDS_KEY = "source_message_ids"
+
+
+def record_merged_source_message_ids(existing: "MessageEvent", incoming: "MessageEvent") -> None:
+    """Append ``incoming``'s message_id (and, on first merge, ``existing``'s) to the
+    survivor's ``metadata['source_message_ids']``. No-ops on missing ids; never reorders
+    or duplicates entries."""
+    def _id_of(msg: "MessageEvent") -> str:
+        return str(getattr(msg, "message_id", "") or "").strip()
+
+    incoming_id = _id_of(incoming)
+    if not incoming_id and _id_of(existing) == "":
+        return
+    metadata = getattr(existing, "metadata", None)
+    if not isinstance(metadata, dict):
+        return  # non-standard event shape: correlation unavailable, never crash dispatch
+    ids = metadata.get(SOURCE_MESSAGE_IDS_KEY)
+    if ids is None:
+        ids = []
+        metadata[SOURCE_MESSAGE_IDS_KEY] = ids
+        seed = _id_of(existing)
+        if seed and seed not in ids:
+            ids.append(seed)
+    if incoming_id and incoming_id not in ids:
+        ids.append(incoming_id)
+
+
 @dataclass
 class _ExtractedResponse:
     """Deliverable parts of a handler response (see ``_extract_response_content``)."""
@@ -2313,6 +2347,7 @@ class BasePlatformAdapter(ABC):
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+            record_merged_source_message_ids(existing, event)
         existing._last_chunk_len = len(event.text or "")  # type: ignore[attr-defined]
         prior_task = self._pending_text_batch_tasks.get(key)
         if prior_task and not prior_task.done():
