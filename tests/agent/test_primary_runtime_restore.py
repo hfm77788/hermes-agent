@@ -792,6 +792,34 @@ class TestRateLimitCooldown:
         assert second_cooldown == first_cooldown
 
 
+    def test_provider_reset_extends_circuit_and_blocks_primary_probe(self):
+        from agent.error_classifier import FailoverReason
+        agent = _make_agent(
+            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+        )
+        before = time.monotonic()
+        mock_client = _mock_resolve()
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
+            agent._try_activate_fallback(
+                reason=FailoverReason.rate_limit, reset_at=time.time() + 3600,
+            )
+        assert agent._rate_limited_until > before + 3500
+        assert agent._restore_primary_runtime() is False
+
+    def test_primary_recovery_allowed_after_circuit_expiry(self):
+        from agent.error_classifier import FailoverReason
+        agent = _make_agent(
+            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+        )
+        mock_client = _mock_resolve()
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
+            agent._try_activate_fallback(
+                reason=FailoverReason.rate_limit, reset_at=time.time() + 3600,
+            )
+            agent._rate_limited_until = time.monotonic() - 1
+            assert agent._restore_primary_runtime() is True
+
+
 # =============================================================================
 # request_overrides travels through the switch_model snapshot (#75091 seam)
 # =============================================================================
