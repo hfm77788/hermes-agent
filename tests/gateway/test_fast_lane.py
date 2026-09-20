@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -36,6 +37,16 @@ def test_long_self_contained_turn_is_accepted():
         decision=_run(event)
     assert decision.use_fast_lane is True
     assert call.await_count == 1
+    kwargs = call.await_args.kwargs
+    system_prompt = kwargs["messages"][0]["content"]
+    payload = json.loads(kwargs["messages"][1]["content"])
+    assert payload == {"message_to_classify": "List all active reminders."}
+    assert "EARLIER CHAT MESSAGES" in system_prompt
+    assert "authenticated account" in system_prompt
+    assert "current account/profile/tool environment" in system_prompt
+    assert kwargs["max_tokens"] == 40
+    assert kwargs["timeout"] == 4.0
+    assert kwargs["reasoning_config"] == {"enabled": False}
 
 
 def test_context_dependent_turn_is_rejected():
@@ -184,3 +195,28 @@ def test_fast_lane_persistence_uses_durable_history_and_appends_only_current_tur
     assert durable == _history()
     assert [row["role"] for row in writes] == ["user", "assistant"]
     assert all(row.get("role") != "session_meta" for row in writes)
+
+def test_classifier_string_high_confidence_is_normalized():
+    response={"choices":[{"message":{"content":'{"self_contained":true,"confidence":"high","reason":"self_contained"}'}}]}
+    event=MessageEvent(text="List all active reminders.", message_type=MessageType.TEXT, source=_source())
+    with patch("agent.auxiliary_client.async_call_llm", new=AsyncMock(return_value=response)):
+        decision=_run(event)
+    assert decision.use_fast_lane is True
+    assert decision.confidence == 1.0
+
+
+def test_classifier_string_high_ambiguous_still_fails_closed():
+    response={"choices":[{"message":{"content":'{"self_contained":false,"confidence":"high","reason":"ambiguous"}'}}]}
+    event=MessageEvent(text="Do the thing.", message_type=MessageType.TEXT, source=_source())
+    with patch("agent.auxiliary_client.async_call_llm", new=AsyncMock(return_value=response)):
+        decision=_run(event)
+    assert decision.use_fast_lane is False
+    assert decision.reason == "classifier_context_dependent"
+
+def test_verbose_reason_does_not_override_high_confidence_true_classification():
+    response={"choices":[{"message":{"content":'{"self_contained":true,"confidence":1.0,"reason":"This standalone request does not rely on earlier chat."}'}}]}
+    event=MessageEvent(text="List all active reminders.", message_type=MessageType.TEXT, source=_source())
+    with patch("agent.auxiliary_client.async_call_llm", new=AsyncMock(return_value=response)):
+        decision=_run(event)
+    assert decision.use_fast_lane is True
+    assert decision.reason == "self_contained"
