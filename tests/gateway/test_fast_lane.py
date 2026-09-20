@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -36,6 +37,13 @@ def test_long_self_contained_turn_is_accepted():
         decision=_run(event)
     assert decision.use_fast_lane is True
     assert call.await_count == 1
+    kwargs = call.await_args.kwargs
+    system_prompt = kwargs["messages"][0]["content"]
+    payload = json.loads(kwargs["messages"][1]["content"])
+    assert payload == {"message_to_classify": "List all active reminders."}
+    assert "EARLIER CHAT MESSAGES" in system_prompt
+    assert "authenticated account" in system_prompt
+    assert "current account/profile/tool environment" in system_prompt
 
 
 def test_context_dependent_turn_is_rejected():
