@@ -86,6 +86,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult,
     SUPPORTED_DOCUMENT_TYPES, cache_document_from_bytes_async, cache_image_from_url,
     cache_audio_from_bytes_async, cache_image_from_bytes_async,
+    record_merged_source_message_ids,
 )
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.status import acquire_scoped_lock, release_scoped_lock
@@ -3441,6 +3442,9 @@ class FeishuAdapter(BasePlatformAdapter):
         existing.text = next_text
         existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
         existing.timestamp = event.timestamp
+        # Collect merged source ids BEFORE the survivor's id advances (watchdog card 1
+        # invariant; see gateway.platforms.base.record_merged_source_message_ids).
+        record_merged_source_message_ids(existing, event)
         if event.message_id:
             existing.message_id = event.message_id
             existing.source.message_id = event.message_id
