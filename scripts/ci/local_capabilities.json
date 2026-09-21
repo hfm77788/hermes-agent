@@ -1,0 +1,97 @@
+{
+  "schema": "hermes.local_capability_preservation.v1",
+  "purpose": "Fail closed when an upstream sync or any other change removes or disconnects fork-local production capabilities.",
+  "capabilities": [
+    {
+      "id": "gateway_fast_lane",
+      "introduced_by": ["#45", "#47"],
+      "required_files": [
+        "gateway/fast_lane.py",
+        "gateway/run_turn.py",
+        "tests/gateway/test_fast_lane.py"
+      ],
+      "python_symbols": {
+        "gateway/fast_lane.py": [
+          "FastLaneDecision",
+          "decide_fast_lane"
+        ]
+      },
+      "text_markers": {
+        "gateway/fast_lane.py": [
+          "gateway_fast_lane decision=",
+          "\"min_confidence\"",
+          "message_to_classify"
+        ],
+        "gateway/run_turn.py": [
+          "from gateway.fast_lane import decide_fast_lane",
+          "await decide_fast_lane(",
+          "self._evict_cached_agent(session_key)",
+          "agent_history = []"
+        ]
+      },
+      "pytest_targets": [
+        "tests/gateway/test_fast_lane.py"
+      ],
+      "post_deploy_smokes": [
+        "fast_lane_long_session_self_contained",
+        "fast_lane_context_dependent_fallback"
+      ]
+    },
+    {
+      "id": "provider_quota_circuit",
+      "introduced_by": ["#45"],
+      "required_files": [
+        "agent/fallback_cooldown.py",
+        "agent/retry_utils.py",
+        "agent/chat_completion_helpers.py",
+        "agent/agent_runtime_helpers.py",
+        "tests/agent/test_primary_runtime_restore.py",
+        "tests/agent/test_retry_delay_parsers_shared.py"
+      ],
+      "python_symbols": {
+        "agent/fallback_cooldown.py": [
+          "_arm_rate_limit_cooldown"
+        ],
+        "agent/retry_utils.py": [
+          "_absolute_reset_delay_from_message",
+          "reset_delay_from_message",
+          "reset_at_delay_seconds"
+        ],
+        "agent/chat_completion_helpers.py": [
+          "try_activate_fallback"
+        ],
+        "agent/agent_runtime_helpers.py": [
+          "restore_primary_runtime"
+        ]
+      },
+      "text_markers": {
+        "agent/fallback_cooldown.py": [
+          "reset_at_delay_seconds",
+          "_rate_limited_until",
+          "Rate-limit circuit open:"
+        ],
+        "agent/chat_completion_helpers.py": [
+          "_arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)",
+          "(error_context or {}).get(\"reset_at\")"
+        ],
+        "agent/agent_runtime_helpers.py": [
+          "_rate_limited_until",
+          "primary still in rate-limit cooldown"
+        ],
+        "agent/retry_utils.py": [
+          "_ABSOLUTE_RESET_UTC_RE",
+          "32 * 24 * 3600"
+        ]
+      },
+      "pytest_targets": [
+        "tests/agent/test_primary_runtime_restore.py",
+        "tests/agent/test_retry_delay_parsers_shared.py"
+      ],
+      "post_deploy_smokes": [
+        "quota_absolute_reset_parser",
+        "provider_cooldown_circuit",
+        "restore_primary_runtime_gate"
+      ]
+    }
+  ]
+}
