@@ -4156,9 +4156,13 @@ def _run_quiet_single_query(cli, effective_query):
 
     print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
 
-    # Exit code 0/1 for automation wrappers. Kanban workers that failed purely on
-    # rate-limit/billing exit with the EX_TEMPFAIL sentinel so the dispatcher releases
-    # the task without counting a failure (a quota window must not trip the breaker).
+    # Native automation receives an explicit terminal envelope so an exit-0 summary
+    # caused by max-iteration exhaustion cannot be mistaken for completed work.
+    from hermes_cli.native_automation_progress import emit_native_terminal, native_progress_enabled
+    emit_native_terminal(result, agent=cli.agent)
+
+    # Exit code 0/1 for normal automation wrappers. Native machine mode reserves 2
+    # for a partial result; this is opt-in and therefore cannot change ordinary -Q.
     _exit_code = 0
     if isinstance(result, dict) and result.get("failed"):
         _exit_code = 1
@@ -4168,6 +4172,13 @@ def _run_quiet_single_query(cli, effective_query):
                 _exit_code = _RL_CODE
             except Exception:
                 _exit_code = 1
+    if (
+        _exit_code == 0
+        and native_progress_enabled()
+        and isinstance(result, dict)
+        and result.get("partial")
+    ):
+        _exit_code = 2
     sys.exit(_exit_code)
 
 
@@ -4433,6 +4444,10 @@ def _configure_quiet_agent(agent) -> None:
     agent.tool_start_callback = None
     agent.tool_complete_callback = None
     agent.tool_progress_mode = "off"
+    # Native automation keeps stdout strict while receiving a separate, bounded
+    # stderr progress channel. The helper is a no-op unless HERMES_NATIVE_PROGRESS=1.
+    from hermes_cli.native_automation_progress import install_quiet_native_progress
+    install_quiet_native_progress(agent)
 
 
 def _run_single_query_mode(cli, query, image, quiet, oneshot):
