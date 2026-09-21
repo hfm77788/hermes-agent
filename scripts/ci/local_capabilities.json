@@ -68,7 +68,8 @@
         "agent/fallback_cooldown.py": [
           "reset_at_delay_seconds",
           "_rate_limited_until",
-          "Rate-limit circuit open:"
+          "Rate-limit circuit open:",
+          "32 * 24 * 3600"
         ],
         "agent/chat_completion_helpers.py": [
           "_arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)",
@@ -80,7 +81,7 @@
         ],
         "agent/retry_utils.py": [
           "_ABSOLUTE_RESET_UTC_RE",
-          "32 * 24 * 3600"
+          "31 * 24 * 3600"
         ]
       },
       "pytest_targets": [
