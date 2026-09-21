@@ -4,7 +4,10 @@
   "capabilities": [
     {
       "id": "gateway_fast_lane",
-      "introduced_by": ["#45", "#47"],
+      "introduced_by": [
+        "#45",
+        "#47"
+      ],
       "required_files": [
         "gateway/fast_lane.py",
         "gateway/run_turn.py",
@@ -39,7 +42,9 @@
     },
     {
       "id": "provider_quota_circuit",
-      "introduced_by": ["#45"],
+      "introduced_by": [
+        "#45"
+      ],
       "required_files": [
         "agent/fallback_cooldown.py",
         "agent/retry_utils.py",
@@ -72,8 +77,8 @@
           "32 * 24 * 3600"
         ],
         "agent/chat_completion_helpers.py": [
-          "_arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)",
-          "(error_context or {}).get(\"reset_at\")"
+          "def try_activate_fallback(",
+          "_arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)"
         ],
         "agent/agent_runtime_helpers.py": [
           "_rate_limited_until",
