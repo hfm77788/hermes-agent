@@ -77,7 +77,6 @@
           "32 * 24 * 3600"
         ],
         "agent/chat_completion_helpers.py": [
-          "def try_activate_fallback(",
           "_arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)"
         ],
         "agent/agent_runtime_helpers.py": [
@@ -87,6 +86,10 @@
         "agent/retry_utils.py": [
           "_ABSOLUTE_RESET_UTC_RE",
           "31 * 24 * 3600"
+        ],
+        "tests/agent/test_primary_runtime_restore.py": [
+          "reason=FailoverReason.rate_limit, reset_at=time.time() + 3600",
+          "assert agent._restore_primary_runtime() is False"
         ]
       },
       "pytest_targets": [
