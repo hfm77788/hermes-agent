@@ -91,6 +91,11 @@ jobs:
       # changed; unit-level windows_only tests always run.
       desktop_updater: ${{ needs.detect.outputs.desktop_updater == 'true' }}
 
+  local-capability-preservation:
+    name: Local capability preservation
+    needs: detect
+    uses: ./.github/workflows/local-capability-preservation.yml
+
   lint:
     name: Python lints
     needs: detect
@@ -235,6 +240,7 @@ jobs:
       - detect
       - tests
       - tests-os
+      - local-capability-preservation
       - lint
       - js-tests
       - installer-tests
