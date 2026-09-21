@@ -70,7 +70,7 @@ def _decision(use, reason, tokens, rows, started=None, confidence=0.0):
     d = FastLaneDecision(use, reason, tokens, rows, elapsed, confidence)
     if reason != "short_history":
         logger.info(
-            "gateway_fast_lane decision=%s reason=%s history_rows=%d last_prompt_tokens=%d "
+            "gateway_fast_lane canary-decision=%s reason=%s history_rows=%d last_prompt_tokens=%d "
             "classifier_ms=%d confidence=%.3f",
             "accepted" if use else "fallback", reason, rows, tokens, elapsed, confidence,
         )
