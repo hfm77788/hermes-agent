@@ -129,6 +129,7 @@ def test_prepare_turn_fast_lane_skips_hygiene_and_preserves_loaded_history_view_
         def _hmwa_apply_message_timestamp(self, _event, text):
             return text, text, None
         def _bind_adapter_run_generation(self, *_a): return None
+        def _delivery_adapter_for(self, _source): return None
         def _adapter_for_source(self, _source): return None
         def _peek_session_state(self, _key): return None
         def _evict_cached_agent(self, key): evicted.append(key)
