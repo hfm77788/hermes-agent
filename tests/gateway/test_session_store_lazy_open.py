@@ -4,6 +4,8 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
+import pytest
+
 from gateway.config import GatewayConfig
 from gateway.session import SessionEntry, SessionStore
 
@@ -63,3 +65,29 @@ def test_lazy_open_restores_routing_without_opening_full_sessiondb(tmp_path, mon
     assert store._entries[key].session_id == "sid-live"
     assert store._routing_db_loaded is True
     assert store._db_handles == {}, "routing restore must not initialize full SessionDB"
+
+
+
+@pytest.mark.asyncio
+async def test_post_startup_warmup_opens_full_db_off_loop(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    import asyncio
+
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(session_store_lazy_open=True)
+    opener = MagicMock(return_value=object())
+    runner.session_store = SimpleNamespace(_open_session_db_for_active_scope=opener)
+    calls = []
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        calls.append((fn, args, kwargs))
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
+    await runner._warm_lazy_session_db_after_startup()
+
+    assert len(calls) == 1
+    opener.assert_called_once_with()
