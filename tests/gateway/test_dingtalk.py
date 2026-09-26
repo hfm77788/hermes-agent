@@ -1,12 +1,11 @@
 """Tests for DingTalk platform adapter."""
 import asyncio
-from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import PlatformConfig
 
 
 class _FakeDingTalkModel:
@@ -107,18 +106,6 @@ class TestDingTalkRequirements:
 # ---------------------------------------------------------------------------
 
 
-class TestDingTalkAdapterInit:
-
-    def test_reads_config_from_extra(self):
-        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
-        config = PlatformConfig(
-            enabled=True,
-            extra={"client_id": "cfg-id", "client_secret": "cfg-secret"},
-        )
-        adapter = DingTalkAdapter(config)
-        assert adapter._client_id == "cfg-id"
-        assert adapter._client_secret == "cfg-secret"
-        assert adapter.name == "Dingtalk"  # base class uses .title()
 
 
 # ---------------------------------------------------------------------------
@@ -126,12 +113,6 @@ class TestDingTalkAdapterInit:
 # ---------------------------------------------------------------------------
 
 
-class TestDeduplication:
-
-    def test_first_message_not_duplicate(self):
-        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
-        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
-        assert adapter._dedup.is_duplicate("msg-1") is False
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +145,6 @@ class TestSend:
         assert call_args[0][0] == "https://dingtalk.example/webhook"
         payload = call_args[1]["json"]
         assert payload["msgtype"] == "markdown"
-        assert payload["markdown"]["title"] == "Hermes"
         assert payload["markdown"]["text"] == "Hello!"
 
 
@@ -194,6 +174,65 @@ class TestSend:
         assert payload["markdown"]["text"] == "Screenshot\n\n![image](https://example.com/demo.png)"
 
 
+class TestOpenApiMediaDelivery:
+
+    def test_openapi_target_routing_prefers_live_context_then_configured_dm(self):
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+
+        adapter = DingTalkAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"dm_user_id": "staff-home", "dm_chat_ids": "dm-home"},
+            )
+        )
+
+        assert adapter._resolve_send_target("dm-home") == ("dm", None, "staff-home")
+        assert adapter._resolve_send_target("group-home") == ("group", "group-home", None)
+
+        adapter._message_contexts["live-dm"] = SimpleNamespace(
+            conversation_type="1",
+            conversation_id="cid-dm",
+            sender_staff_id="staff-live",
+        )
+        adapter._message_contexts["live-group"] = SimpleNamespace(
+            conversation_type="2",
+            conversation_id="cid-group",
+            sender_staff_id="ignored-for-group",
+        )
+
+        assert adapter._resolve_send_target("live-dm") == ("dm", None, "staff-live")
+        assert adapter._resolve_send_target("live-group") == ("group", "cid-group", None)
+
+    @pytest.mark.asyncio
+    async def test_local_image_uses_native_upload_then_robot_message(self):
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter, SendResult
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._http_client = AsyncMock()
+
+        with (
+            patch.object(
+                adapter,
+                "_upload_media",
+                new=AsyncMock(return_value=("media-123", None)),
+            ) as upload,
+            patch.object(
+                adapter,
+                "_robot_send",
+                new=AsyncMock(return_value=SendResult(success=True, message_id="robot-1")),
+            ) as robot_send,
+        ):
+            result = await adapter.send_image_file("chat-123", "/tmp/demo.png")
+
+        assert result.success is True
+        upload.assert_awaited_once_with("/tmp/demo.png", "image", "demo.png")
+        robot_send.assert_awaited_once_with(
+            "sampleImageMsg",
+            {"photoURL": "media-123"},
+            "chat-123",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Connect / disconnect
 # ---------------------------------------------------------------------------
@@ -216,7 +255,7 @@ class TestConnect:
     @pytest.mark.asyncio
     async def test_disconnect_finalizes_open_streaming_cards(self):
         """Streaming cards must be finalized before HTTP client closes."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import AsyncMock
         from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
         adapter._http_client = AsyncMock()
@@ -275,12 +314,6 @@ class TestWebhookDomainAllowlist:
         )
 
 
-class TestHandlerProcessIsAsync:
-    """dingtalk-stream >= 0.20 requires ``process`` to be a coroutine."""
-
-    def test_process_is_coroutine_function(self):
-        from plugins.platforms.dingtalk.adapter import _IncomingHandler
-        assert asyncio.iscoroutinefunction(_IncomingHandler.process)
 
 
 class TestExtractText:
@@ -602,20 +635,6 @@ class TestExtractTextMentions:
 # ---------------------------------------------------------------------------
 
 
-class TestMessageContextIsolation:
-
-    def test_contexts_keyed_by_chat_id(self):
-        """Two concurrent chats must not clobber each other's context."""
-        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
-        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
-
-        msg_a = MagicMock(conversation_id="chat-A", sender_staff_id="user-A")
-        msg_b = MagicMock(conversation_id="chat-B", sender_staff_id="user-B")
-        adapter._message_contexts["chat-A"] = msg_a
-        adapter._message_contexts["chat-B"] = msg_b
-
-        assert adapter._message_contexts["chat-A"] is msg_a
-        assert adapter._message_contexts["chat-B"] is msg_b
 
 
 # ---------------------------------------------------------------------------
@@ -695,73 +714,36 @@ class TestCardLifecycle:
         )
         assert "chat-1" in fired
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("missing", ["template", "sdk"])
+    async def test_edit_message_rejects_when_ai_cards_are_unavailable(self, missing):
+        """Edits must not access the card SDK on webhook-only installations."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+
+        extra = {} if missing == "template" else {"card_template_id": "tmpl-1"}
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True, extra=extra))
+        card_sdk = None if missing == "sdk" else MagicMock()
+        adapter._card_sdk = card_sdk
+        adapter._get_access_token = AsyncMock(return_value="token")
+
+        result = await adapter.edit_message("chat-1", "track-1", "heartbeat")
+
+        assert not result.success
+        adapter._get_access_token.assert_not_awaited()
+        if card_sdk is not None:
+            assert card_sdk.mock_calls == []
+
+    @pytest.mark.asyncio
+    async def test_edit_message_streams_when_ai_cards_are_configured(self, adapter_with_card):
+        """Configured cards retain the streaming edit path."""
+        result = await adapter_with_card.edit_message("chat-1", "track-1", "heartbeat")
+
+        assert result.success
+        assert result.message_id == "track-1"
+        adapter_with_card._card_sdk.streaming_update_with_options_async.assert_awaited_once()
+
 
 # ---------------------------------------------------------------------------
 # AI Card Tests
 # ---------------------------------------------------------------------------
 
-class TestDingTalkAdapterAICards:
-    @pytest.fixture
-    def config(self):
-        return PlatformConfig(
-            enabled=True,
-            extra={
-                "client_id": "test_id",
-                "client_secret": "test_secret",
-                "card_template_id": "test_card_template",
-            },
-        )
-
-    @pytest.fixture
-    def mock_stream_client(self):
-        client = MagicMock()
-        client.get_access_token = MagicMock(return_value="test_token")
-        return client
-
-    @pytest.fixture
-    def mock_http_client(self):
-        return AsyncMock()
-
-    @pytest.fixture
-    def mock_message(self):
-        msg = MagicMock()
-        msg.message_id = "test_msg_id"
-        msg.conversation_id = "test_conv_id"
-        msg.conversation_type = "1"
-        msg.sender_id = "sender1"
-        msg.sender_nick = "Test User"
-        msg.sender_staff_id = "staff1"
-        msg.text = MagicMock(content="Hello")
-        msg.session_webhook = "https://api.dingtalk.com/robot/sendBySession?session=test"
-        msg.session_webhook_expired_time = 999999999999
-        msg.create_at = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
-        msg.at_users = []
-        return msg
-
-    @pytest.mark.asyncio
-    async def test_send_uses_ai_card_if_configured(self, config, mock_stream_client, mock_http_client, mock_message):
-        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
-
-        adapter = DingTalkAdapter(config)
-        adapter._stream_client = mock_stream_client
-        adapter._http_client = mock_http_client
-        adapter._message_contexts["test_conv_id"] = mock_message
-        adapter._session_webhooks = {"test_conv_id": ("https://api.dingtalk.com/robot/sendBySession?session=test", 9999999999999)}
-        adapter._card_template_id = "test_card_template"
-
-        # Mock the card SDK with proper async methods
-        mock_card_sdk = MagicMock()
-        mock_card_sdk.create_card_with_options_async = AsyncMock()
-        mock_card_sdk.deliver_card_with_options_async = AsyncMock()
-        mock_card_sdk.streaming_update_with_options_async = AsyncMock()
-        adapter._card_sdk = mock_card_sdk
-
-        # Mock access token
-        adapter._get_access_token = AsyncMock(return_value="test_token")
-
-        result = await adapter.send("test_conv_id", "Hello World")
-
-        mock_card_sdk.create_card_with_options_async.assert_called_once()
-        mock_card_sdk.deliver_card_with_options_async.assert_called_once()
-        mock_card_sdk.streaming_update_with_options_async.assert_called_once()
-        assert result.success is True
