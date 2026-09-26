@@ -31,6 +31,7 @@ from plugins.memory.hindsight import (
     _build_embedded_profile_env,
     _normalize_observation_scopes,
     _normalize_retain_tags,
+    _resolve_bank_id_for_user,
     _resolve_bank_id_template,
     _WRITER_SENTINEL,
 )
@@ -1358,6 +1359,49 @@ class TestBankIdTemplate:
         )
         assert result == "user-josh-example-com"
 
+
+    def test_per_user_bank_override_matches_exact_user(self):
+        assert _resolve_bank_id_for_user(
+            "education_v2_bge_m3",
+            {"user-a": "jiayin_learning_v2_bge_m3"},
+            "user-a",
+        ) == "jiayin_learning_v2_bge_m3"
+
+    def test_per_user_bank_override_preserves_default_for_unknown_user(self):
+        assert _resolve_bank_id_for_user(
+            "education_v2_bge_m3",
+            {"user-a": "jiayin_learning_v2_bge_m3"},
+            "user-b",
+        ) == "education_v2_bge_m3"
+
+    @pytest.mark.parametrize("mapping", [None, [], "bad", {"user-a": ""}, {"user-a": 7}])
+    def test_per_user_bank_override_fails_closed_to_default(self, mapping):
+        assert _resolve_bank_id_for_user(
+            "education_v2_bge_m3", mapping, "user-a"
+        ) == "education_v2_bge_m3"
+
+    def test_provider_uses_per_user_bank_override_from_config(self, tmp_path, monkeypatch):
+        config = {
+            "mode": "cloud",
+            "apiKey": "k",
+            "api_url": "http://x",
+            "bank_id": "education_v2_bge_m3",
+            "bank_id_by_user": {"dingtalk-user-a": "jiayin_learning_v2_bge_m3"},
+        }
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+
+        p = HindsightMemoryProvider()
+        p.initialize(
+            session_id="s1",
+            hermes_home=str(tmp_path),
+            platform="dingtalk",
+            user_id="dingtalk-user-a",
+            agent_identity="hema-teacher",
+        )
+        assert p._bank_id == "jiayin_learning_v2_bge_m3"
 
     def test_provider_uses_bank_id_template_from_config(self, tmp_path, monkeypatch):
         config = {

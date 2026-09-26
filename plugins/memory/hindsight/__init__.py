@@ -639,6 +639,21 @@ def _sanitize_bank_segment(value: str) -> str:
     return "".join(out).strip("-_")
 
 
+def _resolve_bank_id_for_user(default_bank_id: str, mapping: Any, user_id: str) -> str:
+    """Return an explicit per-user bank override when configured.
+
+    The mapping is an exact gateway user_id -> bank id dictionary. Unmatched,
+    empty, or malformed entries preserve the already-resolved default bank.
+    Bank ids are sanitized with the same rules used by bank_id_template.
+    """
+    if not user_id or not isinstance(mapping, dict):
+        return default_bank_id
+    routed = mapping.get(user_id)
+    if not isinstance(routed, str) or not routed.strip():
+        return default_bank_id
+    return _sanitize_bank_segment(routed) or default_bank_id
+
+
 def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str) -> str:
     """Resolve a bank_id template string with the given placeholders.
 
@@ -1628,6 +1643,14 @@ class HindsightMemoryProvider(MemoryProvider):
             user=self._user_id,
             session=self._session_id,
         )
+        default_bank_id = self._bank_id
+        self._bank_id = _resolve_bank_id_for_user(
+            default_bank_id,
+            self._config.get("bank_id_by_user"),
+            self._user_id,
+        )
+        if self._bank_id != default_bank_id:
+            logger.info("Hindsight per-user bank override applied")
         budget = self._config.get("recall_budget") or self._config.get("budget") or banks.get("budget", "mid")
         self._budget = budget if budget in _VALID_BUDGETS else "mid"
 
