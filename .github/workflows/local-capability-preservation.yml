@@ -46,4 +46,4 @@ jobs:
           fi
           printf 'Protected regression targets:\n'
           printf '  %s\n' "${targets[@]}"
-          uv run python -m pytest "${targets[@]}" -q --tb=short
+          scripts/run_tests.sh "${targets[@]}" -q --tb=short
