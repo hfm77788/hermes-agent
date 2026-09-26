@@ -1345,6 +1345,12 @@ gateway:
   #   context_tail_rows: 0
   #   context_tail_max_message_chars: 160
   #   context_tail_min_confidence: 0.90
+  #   # Optional zero-classifier fast path for a tiny allowlist of short
+  #   # continuations/quiz values (for example "继续", "?", "31.4", "ok").
+  #   # It still replays context_tail_rows, so it preserves recent context.
+  #   # Disabled by default; enable only on profiles where short-turn latency matters.
+  #   direct_tail_enabled: false
+  #   direct_tail_max_message_chars: 32
 
 # =============================================================================
 # Toolsets
