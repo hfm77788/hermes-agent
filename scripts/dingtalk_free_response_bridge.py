@@ -34,6 +34,8 @@ class GroupRoute:
     allowed_members: dict[str, MemberRoute]
     ignored_sender_ids: set[str]
     skip_text_markers: tuple[str, ...]
+    resume_existing_session: bool
+    recent_context_messages: int
 
 
 class Bridge:
@@ -84,6 +86,8 @@ class Bridge:
                     allowed_members=members,
                     ignored_sender_ids=set(row.get("ignored_sender_ids") or []),
                     skip_text_markers=tuple(row.get("skip_text_markers") or ["@河马老师"]),
+                    resume_existing_session=bool(row.get("resume_existing_session", False)),
+                    recent_context_messages=max(0, int(row.get("recent_context_messages", 6))),
                 )
             )
         return out
@@ -192,31 +196,87 @@ class Bridge:
             raise RuntimeError(f"missing Hermes session binding for {group.name} / {member.role}")
         return row["session_id"]
 
+    def _recent_context(self, group: GroupRoute, created_time: str) -> str:
+        if not created_time or group.recent_context_messages <= 0:
+            return ""
+        proc = self._run(
+            [
+                self.dws,
+                "chat",
+                "+chat-messages",
+                "--group",
+                group.chat_id,
+                "--time",
+                created_time,
+                "--direction",
+                "older",
+                "--limit",
+                str(group.recent_context_messages),
+                "--format",
+                "json",
+            ],
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            LOG.warning("recent context fetch failed group=%s rc=%s", group.name, proc.returncode)
+            return ""
+        try:
+            payload = json.loads(proc.stdout or "{}")
+        except json.JSONDecodeError:
+            LOG.warning("recent context parse failed group=%s", group.name)
+            return ""
+        if isinstance(payload, dict):
+            rows = payload.get("messages") or payload.get("items") or []
+        elif isinstance(payload, list):
+            rows = payload
+        else:
+            rows = []
+        lines: list[str] = []
+        for row in sorted(
+            (x for x in rows if isinstance(x, dict)),
+            key=lambda x: str(x.get("createTime") or ""),
+        ):
+            body = str(row.get("text") or "").strip()
+            if not body:
+                continue
+            sender = str(row.get("sender") or "成员")
+            lines.append(f"{sender}: {body[:800]}")
+        return "\n".join(lines[-group.recent_context_messages :])
+
     def _generate_reply(
         self,
         group: GroupRoute,
         member: MemberRoute,
         text: str,
+        created_time: str,
     ) -> str:
-        sid = self._session_id(group, member)
+        recent = self._recent_context(group, created_time)
+        context_block = (
+            f"最近群聊上下文（按时间顺序，仅用于衔接当前对话）：\n{recent}\n"
+            if recent
+            else ""
+        )
         prompt = (
             "【DingTalk免@桥接入站】这条消息已由受信任的免@监听桥读取并通过硬身份校验，"
             "等价于正常课堂入站；不要要求用户再次@河马老师，也不要解释技术机制。"
-            f"来源群={group.name}；发送者角色={member.role}；原始消息：{text}\n"
-            "请按当前课堂Skill和既有会话上下文直接回应，只输出用户可见正文。"
+            f"来源群={group.name}；发送者角色={member.role}。\n"
+            f"{context_block}"
+            f"当前原始消息：{text}\n"
+            "请按当前课堂Skill、持久学习状态和以上最近上下文直接回应，只输出用户可见正文。"
         )
-        proc = self._run(
+        cmd = [self.hermes, "-p", self.profile]
+        if group.resume_existing_session:
+            cmd.extend(["--resume", self._session_id(group, member)])
+        cmd.extend(
             [
-                self.hermes,
-                "-p",
-                self.profile,
-                "--resume",
-                sid,
                 "-z",
                 prompt,
                 "--skills",
                 f"{group.skill},dingtalk-inbound-identity",
-            ],
+            ]
+        )
+        proc = self._run(
+            cmd,
             timeout=self.hermes_timeout,
         )
         if proc.returncode != 0:
@@ -293,7 +353,12 @@ class Bridge:
         pending = gs.setdefault("pending", {})
         reply = pending.get(message_id)
         if not reply:
-            reply = self._generate_reply(group, member, text)
+            reply = self._generate_reply(
+                group,
+                member,
+                text,
+                str(msg.get("createTime") or ""),
+            )
             pending[message_id] = reply
             self._save_state()
 
