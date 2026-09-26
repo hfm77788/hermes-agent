@@ -51,7 +51,8 @@ class FakeRunner:
     async def _handle_message(self, event):
         self.calls += 1
         self.adapter.seen = event
-        return "答对了。下一题"
+        event.source._local_inbound_response_future.set_result("答对了。下一题")
+        return None
 
 
 def _payload(message_id="m1", text="4000米", **extra):
@@ -123,3 +124,21 @@ def test_sidecar_source_mutes_gateway_presentation_only():
     )
     source._suppress_presentation = True
     assert _turn_presentation_muted({}, Platform.DINGTALK, {}, source) is True
+
+
+def test_run_turn_publishes_authoritative_final_response():
+    from gateway.run_turn import _publish_local_inbound_response
+
+    async def scenario():
+        source = SessionSource(
+            platform=Platform.DINGTALK,
+            chat_id="cid-math",
+            chat_type="group",
+            user_id="raw-sender",
+        )
+        future = asyncio.get_running_loop().create_future()
+        source._local_inbound_response_future = future
+        _publish_local_inbound_response(source, {"final_response": "最终正文"})
+        return await future
+
+    assert asyncio.run(scenario()) == "最终正文"

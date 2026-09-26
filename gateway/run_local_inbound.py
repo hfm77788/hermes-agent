@@ -73,6 +73,8 @@ async def _execute_local_inbound(runner, params: dict[str, Any]) -> dict[str, An
     # Process-local trust markers. They never serialize into SessionSource.
     source._suppress_presentation = True
     source._trusted_context_tail = True
+    response_future = asyncio.get_running_loop().create_future()
+    source._local_inbound_response_future = response_future
 
     skill = _clean(params.get("skill"))
     auto_skill = [skill] if skill else (
@@ -108,7 +110,8 @@ async def _execute_local_inbound(runner, params: dict[str, Any]) -> dict[str, An
         return {"accepted": False, "reason": "session_busy", "session_key": session_key}
 
     started = time.monotonic()
-    response = await runner._handle_message(event)
+    await runner._handle_message(event)
+    response = response_future.result() if response_future.done() else ""
     final_entry = (
         getattr(getattr(runner, "session_store", None), "_entries", None) or {}
     ).get(session_key)
