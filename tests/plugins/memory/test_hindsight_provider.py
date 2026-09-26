@@ -1360,24 +1360,44 @@ class TestBankIdTemplate:
         assert result == "user-josh-example-com"
 
 
-    def test_per_user_bank_override_matches_exact_user(self):
+    def test_per_user_bank_override_matches_exact_platform_user(self):
         assert _resolve_bank_id_for_user(
             "education_v2_bge_m3",
-            {"user-a": "jiayin_learning_v2_bge_m3"},
+            {"dingtalk:user-a": "jiayin_learning_v2_bge_m3"},
+            "dingtalk",
             "user-a",
         ) == "jiayin_learning_v2_bge_m3"
+
+    def test_per_user_bank_override_does_not_cross_platforms(self):
+        mapping = {"dingtalk:user-a": "jiayin_learning_v2_bge_m3"}
+        assert _resolve_bank_id_for_user(
+            "education_v2_bge_m3", mapping, "slack", "user-a"
+        ) == "education_v2_bge_m3"
+
+    def test_per_user_bank_override_raw_key_only_without_platform(self):
+        mapping = {"user-a": "jiayin_learning_v2_bge_m3"}
+        assert _resolve_bank_id_for_user(
+            "education_v2_bge_m3", mapping, "", "user-a"
+        ) == "jiayin_learning_v2_bge_m3"
+        assert _resolve_bank_id_for_user(
+            "education_v2_bge_m3", mapping, "dingtalk", "user-a"
+        ) == "education_v2_bge_m3"
 
     def test_per_user_bank_override_preserves_default_for_unknown_user(self):
         assert _resolve_bank_id_for_user(
             "education_v2_bge_m3",
-            {"user-a": "jiayin_learning_v2_bge_m3"},
+            {"dingtalk:user-a": "jiayin_learning_v2_bge_m3"},
+            "dingtalk",
             "user-b",
         ) == "education_v2_bge_m3"
 
-    @pytest.mark.parametrize("mapping", [None, [], "bad", {"user-a": ""}, {"user-a": 7}])
+    @pytest.mark.parametrize(
+        "mapping",
+        [None, [], "bad", {"dingtalk:user-a": ""}, {"dingtalk:user-a": 7}],
+    )
     def test_per_user_bank_override_fails_closed_to_default(self, mapping):
         assert _resolve_bank_id_for_user(
-            "education_v2_bge_m3", mapping, "user-a"
+            "education_v2_bge_m3", mapping, "dingtalk", "user-a"
         ) == "education_v2_bge_m3"
 
     def test_provider_uses_per_user_bank_override_from_config(self, tmp_path, monkeypatch):
@@ -1386,7 +1406,7 @@ class TestBankIdTemplate:
             "apiKey": "k",
             "api_url": "http://x",
             "bank_id": "education_v2_bge_m3",
-            "bank_id_by_user": {"dingtalk-user-a": "jiayin_learning_v2_bge_m3"},
+            "bank_id_by_user": {"dingtalk:dingtalk-user-a": "jiayin_learning_v2_bge_m3"},
         }
         config_path = tmp_path / "hindsight" / "config.json"
         config_path.parent.mkdir(parents=True, exist_ok=True)

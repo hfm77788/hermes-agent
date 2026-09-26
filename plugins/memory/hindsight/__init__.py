@@ -639,16 +639,28 @@ def _sanitize_bank_segment(value: str) -> str:
     return "".join(out).strip("-_")
 
 
-def _resolve_bank_id_for_user(default_bank_id: str, mapping: Any, user_id: str) -> str:
-    """Return an explicit per-user bank override when configured.
+def _resolve_bank_id_for_user(
+    default_bank_id: str,
+    mapping: Any,
+    platform: str,
+    user_id: str,
+) -> str:
+    """Return an explicit platform-scoped user bank override when configured.
 
-    The mapping is an exact gateway user_id -> bank id dictionary. Unmatched,
-    empty, or malformed entries preserve the already-resolved default bank.
-    Bank ids are sanitized with the same rules used by bank_id_template.
+    Gateway user ids are only unique within a platform, so gateway routing keys
+    use "<platform>:<user_id>". A raw user_id key is consulted only when no
+    platform is available, preventing an identifier collision across platforms.
+
+    Unmatched, empty, or malformed entries preserve the already-resolved
+    default bank. Bank ids are sanitized with the same rules used by
+    bank_id_template.
     """
     if not user_id or not isinstance(mapping, dict):
         return default_bank_id
-    routed = mapping.get(user_id)
+
+    normalized_platform = str(platform or "").strip().lower()
+    lookup_key = f"{normalized_platform}:{user_id}" if normalized_platform else user_id
+    routed = mapping.get(lookup_key)
     if not isinstance(routed, str) or not routed.strip():
         return default_bank_id
     return _sanitize_bank_segment(routed) or default_bank_id
@@ -1132,7 +1144,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "llm_model", "description": "LLM model", "default": "gpt-4o-mini", "default_from": {"field": "llm_provider", "map": _PROVIDER_DEFAULT_MODELS}, "when": {"mode": "local_embedded"}},
             {"key": "bank_id", "description": "Memory bank name (static fallback when bank_id_template is unset)", "default": "hermes"},
             {"key": "bank_id_template", "description": "Optional template to derive bank_id dynamically. Placeholders: {profile}, {workspace}, {platform}, {user}, {session}. Example: hermes-{profile}", "default": ""},
-            {"key": "bank_id_by_user", "description": "Optional exact gateway user_id -> bank_id mapping for hard per-user bank routing. Matching users override bank_id/bank_id_template; unmatched users keep the normal fallback.", "default": {}},
+            {"key": "bank_id_by_user", "description": "Optional platform-scoped <platform>:<user_id> -> bank_id mapping for hard per-user bank routing. Matching users override bank_id/bank_id_template; unmatched users keep the normal fallback.", "default": {}},
             {"key": "bank_mission", "description": "Mission/purpose description for the memory bank"},
             {"key": "bank_retain_mission", "description": "Custom extraction prompt for memory retention"},
             {"key": "recall_budget", "description": "Recall thoroughness", "default": "mid", "choices": ["low", "mid", "high"]},
@@ -1648,6 +1660,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._bank_id = _resolve_bank_id_for_user(
             default_bank_id,
             self._config.get("bank_id_by_user"),
+            self._platform,
             self._user_id,
         )
         if self._bank_id != default_bank_id:

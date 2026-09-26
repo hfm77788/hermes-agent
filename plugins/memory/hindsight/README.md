@@ -61,7 +61,7 @@ Config file: `~/.hermes/hindsight/config.json`
 |-----|---------|-------------|
 | `bank_id` | `hermes` | Memory bank name (static fallback used when `bank_id_template` is unset or resolves empty) |
 | `bank_id_template` | — | Optional template to derive the bank name dynamically. Placeholders: `{profile}`, `{workspace}`, `{platform}`, `{user}`, `{session}`. Example: `hermes-{profile}` isolates memory per active Hermes profile. Empty placeholders collapse cleanly (e.g. `hermes-{user}` with no user becomes `hermes`). |
-| `bank_id_by_user` | — | Optional JSON object mapping an exact gateway `user_id` to a bank id. A matching entry overrides the static/template bank for that user; unmatched or malformed entries preserve the normal fallback. Useful when one profile serves multiple known users that require hard memory separation. Keep this mapping in the profile-scoped private config, not shared prompts or logs. |
+| `bank_id_by_user` | — | Optional JSON object mapping a platform-scoped gateway key (`<platform>:<user_id>`, e.g. `dingtalk:<id>`) to a bank id. A matching entry overrides the static/template bank for that user; unmatched or malformed entries preserve the normal fallback. Raw `user_id` keys are only used when no platform is available, preventing cross-platform ID collisions. Keep this mapping in the profile-scoped private config, not shared prompts or logs. |
 | `bank_mission` | — | Reflect mission (identity/framing for reflect reasoning). Applied via Banks API. |
 | `bank_retain_mission` | — | Retain mission (steers what gets extracted). Applied via Banks API. |
 
