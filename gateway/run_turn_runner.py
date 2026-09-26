@@ -881,6 +881,71 @@ class TurnRunner:
         except Exception:
             logger.debug("Failed to attach session title callback", exc_info=True)
 
+    def _long_task_ack_settings(self, agent):
+        """Return (delay_s, message) for an enabled long human turn, else None."""
+        ctx = self._ctx
+        if ctx.mute_notification_reply or ctx.scheduled_heartbeat or not self._status_live():
+            return None
+        gateway_cfg = ctx.user_config.get("gateway") or {}
+        cfg = gateway_cfg.get("long_task_ack") or {}
+        if not isinstance(cfg, dict) or not bool(cfg.get("enabled", False)):
+            return None
+        from agent.adaptive_turn_budget import classify_turn
+        tier, _reason = classify_turn(agent, ctx.message)
+        if tier != "long":
+            return None
+        try:
+            delay_s = float(cfg.get("delay_seconds", 2.5))
+        except (TypeError, ValueError):
+            delay_s = 2.5
+        delay_s = min(max(delay_s, 0.5), 15.0)
+        message = str(cfg.get("message") or "已接单，正在查实际状态。").strip()
+        return (delay_s, message) if message else None
+
+    def _arm_long_task_ack(self, agent, stream_delta_cb, interim_assistant_cb):
+        """Delay one useful acknowledgement; cancel it on any real assistant output."""
+        settings = self._long_task_ack_settings(agent)
+        if settings is None:
+            return stream_delta_cb, interim_assistant_cb, None, None
+        delay_s, message = settings
+        visible = threading.Event()
+
+        def mark_visible(text) -> None:
+            if isinstance(text, str) and text.strip():
+                visible.set()
+
+        original_delta = stream_delta_cb
+        if original_delta is not None:
+            def wrapped_delta(text):
+                mark_visible(text)
+                return original_delta(text)
+            stream_delta_cb = wrapped_delta
+
+        original_interim = interim_assistant_cb
+        if original_interim is not None:
+            def wrapped_interim(text, *, already_streamed: bool = False):
+                mark_visible(text)
+                return original_interim(text, already_streamed=already_streamed)
+            interim_assistant_cb = wrapped_interim
+
+        def fire() -> None:
+            if visible.is_set() or not self._status_live():
+                return
+            visible.set()
+            self._status_callback_sync("long_task_ack", message)
+
+        timer = threading.Timer(delay_s, fire)
+        timer.daemon = True
+        timer.start()
+        return stream_delta_cb, interim_assistant_cb, visible, timer
+
+    @staticmethod
+    def _cancel_long_task_ack(visible, timer) -> None:
+        if visible is not None:
+            visible.set()
+        if timer is not None:
+            timer.cancel()
+
     def _status_callback_sync(self, event_type: str, message: str) -> None:
         from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets, _send_or_update_status_coro
         from gateway.warning_notifications import is_warning_status, render_notification
@@ -1948,10 +2013,22 @@ class TurnRunner:
         if pending_fallback_notice:
             # Reuse the in-agent one-shot notice so the pre-agent provider switch is user-visible too.
             agent._pending_fallback_notice = pending_fallback_notice
-        self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
-        agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
-        persist_msg, persist_ts = self._prepare_turn_message(agent_history)
-        result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
+        stream_delta_cb, interim_cb, ack_visible, ack_timer = self._arm_long_task_ack(
+            agent, stream_delta_cb, interim_cb
+        )
+        self._wire_turn_agent_callbacks(
+            agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim
+        )
+        try:
+            agent_history, observed_group_context, history_media_paths = self._load_turn_history(
+                agent, reused_cached_agent
+            )
+            persist_msg, persist_ts = self._prepare_turn_message(agent_history)
+            result = self._run_conversation_with_approval(
+                agent, agent_history, observed_group_context, persist_msg, persist_ts
+            )
+        finally:
+            self._cancel_long_task_ack(ack_visible, ack_timer)
         self._finish_stream_consumer(result, agent_history, stream_consumer)
         # The streaming-TTS consumer's finish() runs on the outer loop thread after the executor
         # returns, so early run_sync returns are also finalised.
