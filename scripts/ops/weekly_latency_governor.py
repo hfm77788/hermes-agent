@@ -35,7 +35,7 @@ PROFILE_PLATFORMS = {
 }
 def _run(cmd: list[str], *, env: dict[str, str] | None = None, timeout: int = 30) -> tuple[int, str, str]:
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout)
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, timeout=timeout)
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
     except Exception as exc:
         return -1, "", f"{type(exc).__name__}: {exc}"
@@ -43,7 +43,7 @@ def _run(cmd: list[str], *, env: dict[str, str] | None = None, timeout: int = 30
 
 def _load_json(path: Path) -> dict[str, Any] | None:
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
 
@@ -52,7 +52,7 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     out: list[dict[str, Any]] = []
-    for line in path.read_text(errors="replace").splitlines():
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
             value = json.loads(line)
             if isinstance(value, dict):
@@ -116,7 +116,7 @@ def _read_fast_lane(home: Path, profile: str) -> dict[str, Any] | None:
         return None
     try:
         import yaml
-        raw = yaml.safe_load(cfg.read_text()) or {}
+        raw = yaml.safe_load(cfg.read_text(encoding="utf-8")) or {}
         value = ((raw.get("gateway") or {}).get("fast_lane") or {})
         return value if isinstance(value, dict) else None
     except Exception as exc:
@@ -261,9 +261,9 @@ def build_package(home: Path, repo: Path, state_dir: Path, days: int) -> dict[st
 def persist(package: dict[str, Any], state_dir: Path) -> None:
     state_dir.mkdir(parents=True, exist_ok=True)
     tmp = state_dir / "latest.json.tmp"
-    tmp.write_text(json.dumps(package, ensure_ascii=False, indent=2) + "\n")
+    tmp.write_text(json.dumps(package, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     tmp.replace(state_dir / "latest.json")
-    with (state_dir / "history.jsonl").open("a") as fh:
+    with (state_dir / "history.jsonl").open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(package, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
