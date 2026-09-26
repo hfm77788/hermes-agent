@@ -7,7 +7,9 @@ session; presentation stays muted so the sidecar remains the single delivery pat
 from __future__ import annotations
 
 import asyncio
+import os
 import time
+from pathlib import Path
 from typing import Any
 
 from gateway.platforms.event import MessageEvent, MessageType
@@ -18,6 +20,7 @@ _MAX_TEXT_CHARS = 8000
 _MAX_CONTEXT_CHARS = 12000
 _MAX_ID_CHARS = 1024
 _RESULT_CACHE_MAX = 500
+_MEDIA_MAX_ATTACHMENTS = 8
 
 
 def _clean(value: Any, *, limit: int = _MAX_ID_CHARS) -> str:
@@ -50,11 +53,35 @@ async def _execute_local_inbound(runner, params: dict[str, Any]) -> dict[str, An
         return {"accepted": False, "reason": "unsupported_platform"}
 
     text = _clean(params.get("text"), limit=_MAX_TEXT_CHARS)
+    raw_media = list(params.get("media_urls") or [])[:_MEDIA_MAX_ATTACHMENTS]
+    raw_types = list(params.get("media_types") or [])[: len(raw_media)]
+    media_root = (
+        Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+        / "state"
+        / "dingtalk-free-response-media"
+    ).resolve()
+    media_urls: list[str] = []
+    media_types: list[str] = []
+    for index, value in enumerate(raw_media):
+        path = Path(_clean(value, limit=4096)).expanduser().resolve()
+        if not path.is_relative_to(media_root) or not path.is_file():
+            return {"accepted": False, "reason": "invalid_media_path"}
+        media_type = _clean(
+            raw_types[index] if index < len(raw_types) else "image",
+            limit=32,
+        ).lower()
+        if media_type != "image":
+            return {"accepted": False, "reason": "unsupported_media_type"}
+        media_urls.append(str(path))
+        media_types.append(media_type)
+    if media_urls and not text:
+        text = "请结合图片内容和当前课堂上下文回答。"
+
     chat_id = _clean(params.get("chat_id"))
     user_id = _clean(params.get("user_id"))
     user_id_alt = _clean(params.get("user_id_alt"))
     message_id = _clean(params.get("message_id"))
-    if not (text and chat_id and user_id and message_id):
+    if not ((text or media_urls) and chat_id and user_id and message_id):
         return {"accepted": False, "reason": "missing_required_field"}
 
     adapter = _profile_adapter(runner, profile, Platform.DINGTALK)
@@ -83,11 +110,13 @@ async def _execute_local_inbound(runner, params: dict[str, Any]) -> dict[str, An
     )
     event = MessageEvent(
         text=text,
-        message_type=MessageType.TEXT,
+        message_type=MessageType.PHOTO if media_urls else MessageType.TEXT,
         user_id=source.user_id,
         user_name=source.user_name,
         source=source,
         message_id=message_id,
+        media_urls=media_urls,
+        media_types=media_types,
         auto_skill=auto_skill,
         channel_prompt=(
             adapter._resolve_channel_prompt(chat_id)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -15,6 +16,7 @@ def write_cfg(tmp_path: Path) -> Path:
         "robot_code": "robot-code",
         "state_file": str(tmp_path / "state.json"),
         "sessions_json": str(tmp_path / "sessions.json"),
+        "media_cache_dir": str(tmp_path / "media"),
         "groups": [
             {
                 "name": "Math",
@@ -227,3 +229,118 @@ def test_gateway_injection_mode_never_falls_back_to_isolated_cli(tmp_path, monke
     with pytest.raises(RuntimeError, match="refusing isolated CLI fallback"):
         bridge._generate_reply(
             group, member, "4000米", "2026-09-26 22:30:00", "m-no-fallback")
+
+
+
+def test_image_message_passes_downloaded_media_to_gateway_and_cleans_cache(tmp_path, monkeypatch):
+    cfg_path = write_cfg(tmp_path)
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    cfg["gateway_inject_existing_session"] = True
+    cfg["media_cache_dir"] = str(tmp_path / "media")
+    cfg_path.write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
+
+    bridge = Bridge(cfg_path)
+    group = bridge.groups[0]
+    job = hashlib.sha256(b"img-bridge-1").hexdigest()[:24]
+    image = tmp_path / "media" / job / "page.jpg"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"jpeg-bytes")
+    captured = {}
+
+    monkeypatch.setattr(bridge, "_recent_context", lambda *_a, **_k: "")
+    monkeypatch.setattr(bridge, "_download_image_media", lambda *_a, **_k: [str(image)])
+    monkeypatch.setattr(bridge, "_send_reply", lambda *_a, **_k: None)
+
+    def inject(_home, params, *, timeout):
+        captured.update(params)
+        return {"accepted": True, "response": "我看到了图片。"}
+
+    monkeypatch.setattr(
+        "scripts.dingtalk_free_response_bridge.inject_gateway_local_inbound", inject)
+
+    msg = {
+        "messageId": "img-bridge-1",
+        "senderId": "child-id",
+        "text": "[图片消息](mediaId=@abc)请讲第二题",
+        "resourceRefs": [
+            {
+                "type": "mediaId",
+                "resourceId": "@abc",
+                "download": {"ready": True, "missing": [], "arguments": {"resource-id": "@abc"}},
+            }
+        ],
+    }
+    assert bridge._process_message(group, msg)
+    assert captured["text"] == "请讲第二题"
+    assert captured["media_urls"] == [str(image)]
+    assert captured["media_types"] == ["image"]
+    assert not image.exists()
+    assert "img-bridge-1" in bridge.state["groups"]["cid-math"]["processed_ids"]
+
+
+def test_image_bridge_refuses_isolated_cli_fallback(tmp_path):
+    cfg_path = write_cfg(tmp_path)
+    bridge = Bridge(cfg_path)
+    group = bridge.groups[0]
+    member = group.allowed_members["child-id"]
+
+    with pytest.raises(RuntimeError, match="image bridge requires gateway injection"):
+        bridge._generate_reply(
+            group,
+            member,
+            "讲第二题",
+            "2026-09-26 22:50:00",
+            "img-no-fallback",
+            media_urls=["/tmp/page.jpg"],
+        )
+
+
+
+def test_media_id_download_stays_inside_private_cache(tmp_path, monkeypatch):
+    bridge = Bridge(write_cfg(tmp_path))
+    group = bridge.groups[0]
+    calls = []
+
+    class Proc:
+        returncode = 0
+        stderr = ""
+        stdout = ""
+
+    def fake_run(cmd, **kwargs):
+        calls.append((list(cmd), dict(kwargs)))
+        rel_dir = cmd[cmd.index("--output") + 1].strip("./")
+        out_dir = Path(kwargs["cwd"]) / rel_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        image = out_dir / "page.jpg"
+        image.write_bytes(b"jpeg-bytes")
+        proc = Proc()
+        proc.stdout = json.dumps({
+            "localPath": f"{rel_dir}/page.jpg",
+            "sizeBytes": image.stat().st_size,
+        })
+        return proc
+
+
+    monkeypatch.setattr(
+        "scripts.dingtalk_free_response_bridge.subprocess.run", fake_run)
+
+    msg = {
+        "messageId": "img-download-1",
+        "resourceRefs": [{
+            "type": "mediaId",
+            "resourceId": "@abc",
+            "download": {
+                "ready": True,
+                "missing": [],
+                "arguments": {"resource-id": "@abc"},
+            },
+        }],
+    }
+    paths = bridge._download_image_media(group, msg)
+    assert len(paths) == 1
+    image = Path(paths[0])
+    assert image.is_file()
+    assert image.resolve().is_relative_to(bridge.media_cache_root.resolve())
+    assert "--message-id" in calls[0][0]
+    assert "--open-conversation-id" in calls[0][0]
+    assert calls[0][1]["cwd"] == str(bridge.media_cache_root)
