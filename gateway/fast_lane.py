@@ -110,7 +110,14 @@ def _decision(use, reason, tokens, rows, started=None, confidence=0.0, history_t
 def _static_block_reason(event, source, *, is_new_session, was_auto_reset, pending_sidecar):
     if is_new_session or was_auto_reset:
         return "session_boundary"
-    if pending_sidecar or getattr(event, "auto_skill", None) or getattr(event, "internal", False):
+    if (
+        pending_sidecar
+        or (
+            getattr(event, "auto_skill", None)
+            and not getattr(source, "_trusted_context_tail", False)
+        )
+        or getattr(event, "internal", False)
+    ):
         return "sidecar_context"
     if getattr(event, "reply_to_message_id", None) or getattr(event, "reply_to_text", None):
         return "reply_context"
@@ -160,6 +167,19 @@ async def decide_fast_lane(*, event, source, history, session_entry, config,
         return _decision(False, "short_history", tokens, rows)
 
     stripped_text = text.strip()
+    if (
+        getattr(source, "_trusted_context_tail", False)
+        and cfg["context_tail_rows"] > 0
+        and len(stripped_text) <= cfg["context_tail_max_message_chars"]
+    ):
+        return _decision(
+            True,
+            "trusted_context_tail",
+            tokens,
+            rows,
+            confidence=1.0,
+            history_tail_rows=min(rows, cfg["context_tail_rows"]),
+        )
     if (
         cfg["direct_tail_enabled"]
         and cfg["context_tail_rows"] > 0
