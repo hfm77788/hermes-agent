@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import logging
 from typing import Any, Dict, Optional, Tuple
 
+from agent.adaptive_turn_budget import partition_tool_calls, tool_budget_exhausted_content
 from agent.message_metadata import append_message
 from agent.message_sanitization import coalesce_tool_call_id
 from agent.turn_preflight import compress_after_tool_results
@@ -94,6 +95,12 @@ def run_tool_round(
     _invalid_batch_calls = [
         tc for tc in assistant_message.tool_calls if tc.function.name not in agent.valid_tool_names
     ] if _tvv.mixed_invalid_batch else []
+    _valid_batch_calls = [
+        tc for tc in assistant_message.tool_calls if tc.function.name in agent.valid_tool_names
+    ]
+    _budget_allowed_calls, _budget_skipped_calls = partition_tool_calls(
+        agent, _valid_batch_calls
+    )
 
     assistant_msg, duplicate_previous_interim = stage_tool_call_message(
         agent, assistant_message=assistant_message, finish_reason=finish_reason, messages=messages
@@ -111,9 +118,26 @@ def run_tool_round(
                     tc.function.name, agent.valid_tool_names
                 ),
             })
-        assistant_message.tool_calls = [
-            tc for tc in assistant_message.tool_calls if tc.function.name in agent.valid_tool_names
-        ]
+    if _budget_skipped_calls:
+        for tc in _budget_skipped_calls:
+            append_message(messages, {
+                "role": "tool",
+                "name": tc.function.name,
+                "tool_call_id": coalesce_tool_call_id(tc),
+                "content": tool_budget_exhausted_content(agent, tc.function.name),
+            })
+        logger.info(
+            "adaptive_tool_budget skipped=%d used=%d limit=%s session=%s",
+            len(_budget_skipped_calls),
+            int(getattr(agent, "_adaptive_tool_calls_used", 0) or 0),
+            getattr(agent, "_adaptive_tool_call_limit", None),
+            agent.session_id or "none",
+        )
+
+    # Only valid calls inside the remaining adaptive budget dispatch. The assistant
+    # row above still contains every model-emitted call; skipped/invalid calls have
+    # matching synthetic tool results so provider transcript invariants remain intact.
+    assistant_message.tool_calls = _budget_allowed_calls
 
     # Persist the tool-call turn before any tool side effects so resume sees the executed
     # block if a destructive tool restarts Hermes.
@@ -151,7 +175,10 @@ def run_tool_round(
         with suppress(Exception):
             agent.stream_delta_callback(None)
 
-    agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+    if assistant_message.tool_calls:
+        agent._execute_tool_calls(
+            assistant_message, messages, effective_task_id, api_call_count
+        )
 
     if getattr(agent, "_incremental_persistence_failed", False):
         # Tool result could not be made canonical: never send the in-memory result to

@@ -11,6 +11,7 @@ import os
 from contextlib import suppress
 from typing import Any, Callable, List, Optional, Tuple
 
+from agent.adaptive_turn_budget import effective_turn_max_iterations
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.delegation_context import is_dispatcher_owned_worker_context
 from agent.turn_failure_copy import exit_reason_failure, stamp_failure
@@ -125,15 +126,16 @@ def _resolve_budget_fallback(
 ) -> Tuple[Any, Any, bool]:
     """Iteration-budget exhaustion. Returns ``(final_response, _turn_exit_reason,
     preserved_verification_fallback)``."""
+    effective_max = effective_turn_max_iterations(agent)
     budget_exhausted = (
-        api_call_count >= agent.max_iterations or agent.iteration_budget.remaining <= 0
+        api_call_count >= effective_max or agent.iteration_budget.remaining <= 0
     )
     preserved_verification_fallback = False
     if (
         final_response is None and budget_exhausted and not interrupted and not failed
         and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
     ):
-        _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
+        _turn_exit_reason = f"max_iterations_reached({api_call_count}/{effective_max})"
         if _pending_verification_response:
             # A verification gate withheld a composed answer, then the budget ran out:
             # preserve it rather than make another fallible call. The explicit pending
@@ -146,12 +148,12 @@ def _resolve_budget_fallback(
         else:
             # _handle_max_iterations makes one extra toolless request for a summary.
             agent._emit_diagnostic_status(
-                f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
+                f"⚠️ Iteration budget exhausted ({api_call_count}/{effective_max}) "
                 "— asking model to summarise"
             )
             if not agent.quiet_mode:
                 agent._safe_print(
-                    f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
+                    f"\n⚠️  Iteration budget exhausted ({api_call_count}/{effective_max}) "
                     "— requesting summary...", diagnostic=True,
                 )
             final_response = agent._handle_max_iterations(messages, api_call_count)
@@ -177,7 +179,7 @@ def _resolve_budget_fallback(
     # closed via ``_record_task_failure`` (compare-and-swap receipt path) which is a no-op if another path
     # closed it — the CAS invariant in ``_end_run`` (``WHERE ended_at IS NULL``) guarantees idempotence.
     if _kanban_task:
-        _record_kanban_budget_exhausted(_kanban_task, api_call_count, agent.max_iterations, logger)
+        _record_kanban_budget_exhausted(_kanban_task, api_call_count, effective_max, logger)
     return final_response, _turn_exit_reason, preserved_verification_fallback
 
 
@@ -332,7 +334,8 @@ def _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_r
         + (" origin=%s" if _turn_origin else "")
     )
     _diag_args = (
-        _turn_exit_reason, agent.model, api_call_count, agent.max_iterations,
+        _turn_exit_reason, agent.model, api_call_count,
+        effective_turn_max_iterations(agent),
         agent.iteration_budget.used if agent.iteration_budget else 0,
         agent.iteration_budget.max_total if agent.iteration_budget else 0,
         _turn_tool_count, _last_msg_role, len(final_response) if final_response else 0,
@@ -520,7 +523,10 @@ def finalize_turn(
         final_response is not None
         and not failed
         and not interrupted
-        and (api_call_count < agent.max_iterations or str(_turn_exit_reason).startswith("text_response("))
+        and (
+            api_call_count < effective_turn_max_iterations(agent)
+            or str(_turn_exit_reason).startswith("text_response(")
+        )
     )
 
     _rollback_interrupted_preflight_display(agent, interrupted)

@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from agent.conversation_compression import recover_rotated_compression_session
-from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.memory_provider import is_trivial_prompt
 from agent.message_content import flatten_message_text
@@ -575,7 +574,7 @@ _PER_TURN_RESET_STATE: Tuple[Tuple[str, Any], ...] = (
 )
 
 
-def _reset_per_turn_agent_state(agent: Any) -> None:
+def _reset_per_turn_agent_state(agent: Any, user_message: Any = None) -> None:
     """Reset retry counters, guardrails, iteration and run budgets at turn start."""
     for name, value in _PER_TURN_RESET_STATE:
         setattr(agent, name, value)
@@ -605,7 +604,16 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
         agent._replay_compression_warning()
         agent._compression_warning = None  # send once
 
-    agent.iteration_budget = IterationBudget(agent.max_iterations)
+    from agent.adaptive_turn_budget import apply_adaptive_turn_budget
+    _adaptive_budget = apply_adaptive_turn_budget(agent, user_message)
+    logger.info(
+        "adaptive_turn_budget tier=%s iterations=%d tool_calls=%s reason=%s configured_max=%d",
+        _adaptive_budget.tier,
+        _adaptive_budget.iterations,
+        _adaptive_budget.tool_calls,
+        _adaptive_budget.reason,
+        agent.max_iterations,
+    )
     # Wall-clock run budget: stamped only when configured (one wrap-up notice per run).
     agent._run_budget_started_at = (
         time.time() if getattr(agent, "run_budget_seconds", None) else None
@@ -1032,7 +1040,7 @@ def build_turn_context(
         agent, task_id, stream_callback, persist_user_message,
         persist_user_timestamp, persist_user_platform_id,
     )
-    _reset_per_turn_agent_state(agent)
+    _reset_per_turn_agent_state(agent, user_message)
 
     _preview_text = summarize_user_message_for_log(user_message)
     _msg_preview = _preview_text[:80] + ("..." if len(_preview_text) > 80 else "")

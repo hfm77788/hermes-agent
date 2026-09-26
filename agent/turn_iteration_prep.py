@@ -291,7 +291,9 @@ def announce_api_call(
     """Print the request summary (verbose) or start the quiet-mode thinking indicator."""
     thinking_spinner = None
     if not agent.quiet_mode:
-        agent._vprint(f"\n{agent.log_prefix}🔄 Making API call #{api_call_count}/{agent.max_iterations}...")
+        from agent.adaptive_turn_budget import effective_turn_max_iterations
+        _effective_max = effective_turn_max_iterations(agent)
+        agent._vprint(f"\n{agent.log_prefix}🔄 Making API call #{api_call_count}/{_effective_max}...")
         agent._vprint(f"{agent.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
         agent._vprint(f"{agent.log_prefix}   🔧 Available tools: {len(agent.tools) if agent.tools else 0}")
     else:
