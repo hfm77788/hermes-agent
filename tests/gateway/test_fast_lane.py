@@ -58,6 +58,34 @@ def test_context_dependent_turn_is_rejected():
     assert decision.reason == "classifier_context_dependent"
 
 
+
+def test_context_dependent_short_turn_can_use_bounded_tail_when_enabled():
+    response={"choices":[{"message":{"content":'{"self_contained":false,"confidence":0.95,"reason":"needs_prior_context"}'}}]}
+    event=MessageEvent(text="31.4", message_type=MessageType.TEXT, source=_source())
+    config={"gateway":{"fast_lane":{
+        "context_tail_rows":12,
+        "context_tail_max_message_chars":160,
+        "context_tail_min_confidence":0.90,
+    }}}
+    with patch("agent.auxiliary_client.async_call_llm", new=AsyncMock(return_value=response)):
+        decision=asyncio.run(decide_fast_lane(
+            event=event, source=_source(), history=_history(70),
+            session_entry=SimpleNamespace(last_prompt_tokens=160000), config=config,
+            was_auto_reset=False, is_new_session=False, pending_sidecar=False,
+        ))
+    assert decision.use_fast_lane is True
+    assert decision.reason == "context_tail"
+    assert decision.history_tail_rows == 12
+
+
+def test_context_tail_stays_disabled_by_default():
+    response={"choices":[{"message":{"content":'{"self_contained":false,"confidence":0.99,"reason":"needs_prior_context"}'}}]}
+    event=MessageEvent(text="31.4", message_type=MessageType.TEXT, source=_source())
+    with patch("agent.auxiliary_client.async_call_llm", new=AsyncMock(return_value=response)):
+        decision=_run(event, history=_history(70), tokens=160000)
+    assert decision.use_fast_lane is False
+    assert decision.history_tail_rows == 0
+
 def test_reply_context_falls_back_without_classifier():
     event=MessageEvent(
         text="Change it.", message_type=MessageType.TEXT, source=_source(),
@@ -151,6 +179,59 @@ def test_prepare_turn_fast_lane_skips_hygiene_and_preserves_loaded_history_view_
     assert len(loaded) == 100
 
 
+
+
+def test_prepare_turn_context_tail_uses_only_recent_history_and_preserves_durable_transcript():
+    from gateway.run_turn import GatewayTurnMixin
+
+    source=_source()
+    event=MessageEvent(text="31.4", message_type=MessageType.TEXT, source=source)
+    loaded=_history(70)
+    seen={}
+    evicted=[]
+
+    class Store:
+        async def load_transcript(self, _sid):
+            return loaded
+
+    class Runner(GatewayTurnMixin):
+        config=SimpleNamespace(multiplex_profiles=False)
+        async_session_store=Store()
+        async def _hmwa_open_session(self, *_a): return (False, False)
+        def _set_session_env(self, _ctx): return ()
+        def _pinned_session_context_prompt(self, *_a): return ""
+        async def _hmwa_acquire_turn_lease(self, *_a): return None
+        async def _mark_durable_active_turn(self, *_a): return True
+        async def _hmwa_run_session_hygiene(self, *_a):
+            raise AssertionError("hygiene must be skipped for bounded context tail")
+        async def _hmwa_first_contact_notes(self, _source, history, _notes):
+            seen["first"]=history
+        def _voice_channel_sidecar_note(self, *_a): return None
+        async def _prepare_profile_scoped_inbound_message_text(self, *, history, **_kw):
+            seen["preprocess"]=history
+            return event.text
+        def _hmwa_apply_message_timestamp(self, _event, text):
+            return text, text, None
+        def _bind_adapter_run_generation(self, *_a): return None
+        def _delivery_adapter_for(self, _source): return None
+        def _adapter_for_source(self, _source): return None
+        def _peek_session_state(self, _key): return None
+        def _evict_cached_agent(self, key): evicted.append(key)
+
+    entry=SimpleNamespace(session_id="sid", session_key="skey", last_prompt_tokens=160000)
+    accepted=FastLaneDecision(True, "context_tail", 160000, len(loaded), 1, 0.95, 12)
+    with (
+        patch("gateway.run_turn.build_session_context", return_value=SimpleNamespace()),
+        patch("gateway.run._load_gateway_config", return_value={}),
+        patch("gateway.fast_lane.decide_fast_lane", new=AsyncMock(return_value=accepted)),
+    ):
+        prepared,_=asyncio.run(Runner()._hmwa_prepare_turn(event, source, entry, "skey", "qk", 1))
+    assert prepared.history == loaded[-12:]
+    assert prepared.durable_history is loaded
+    assert prepared.fast_lane is True
+    assert evicted == ["skey"]
+    assert seen["first"] is loaded
+    assert seen["preprocess"] is loaded
 
 def test_fast_lane_persistence_uses_durable_history_and_appends_only_current_turn():
     from gateway.run_turn import GatewayTurnMixin

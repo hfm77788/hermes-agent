@@ -1330,6 +1330,22 @@ gateway:
   # isn't running). Explicit per-platform vars like DISCORD_PROXY still apply.
   # trust_env: true
 
+  # Long-session fast lane. Self-contained requests can run without replaying
+  # prior chat. Optional context_tail_* settings allow short continuation replies
+  # (for example quiz answers) to replay only the newest rows when the classifier
+  # explicitly says prior context is required. The bounded-tail mode is OFF by
+  # default and must be enabled per profile.
+  # fast_lane:
+  #   enabled: true
+  #   min_history_rows: 60
+  #   min_prompt_tokens: 32000
+  #   max_message_chars: 1200
+  #   classifier_timeout_s: 4.0
+  #   min_confidence: 0.98
+  #   context_tail_rows: 0
+  #   context_tail_max_message_chars: 160
+  #   context_tail_min_confidence: 0.90
+
 # =============================================================================
 # Toolsets
 # =============================================================================

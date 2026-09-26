@@ -2124,7 +2124,15 @@ class GatewayTurnMixin:
             )
             if _fast_lane.use_fast_lane:
                 self._evict_cached_agent(session_key)
-                agent_history = []
+                if _fast_lane.history_tail_rows > 0:
+                    _tail_start = max(0, len(durable_history) - _fast_lane.history_tail_rows)
+                    agent_history = durable_history[_tail_start:]
+                    # Never begin a bounded replay on an orphan tool result.
+                    while (agent_history and isinstance(agent_history[0], dict)
+                           and agent_history[0].get("role") == "tool"):
+                        agent_history = agent_history[1:]
+                else:
+                    agent_history = []
             else:
                 durable_history = await self._hmwa_run_session_hygiene(
                     event, source, session_entry, session_key, durable_history, _quick_key, run_generation,
