@@ -357,3 +357,35 @@ def test_verbose_reason_does_not_override_high_confidence_true_classification():
         decision=_run(event)
     assert decision.use_fast_lane is True
     assert decision.reason == "self_contained"
+
+
+
+def test_trusted_learning_tail_accepts_short_answer_with_unit_without_classifier():
+    source = _source()
+    source._trusted_context_tail = True
+    event = MessageEvent(
+        text="4000米",
+        message_type=MessageType.TEXT,
+        source=source,
+        auto_skill=["math-skill"],
+    )
+    config = {"gateway": {"fast_lane": {
+        "context_tail_rows": 12,
+        "context_tail_max_message_chars": 160,
+    }}}
+    with patch("agent.auxiliary_client.async_call_llm", new=AsyncMock()) as call:
+        decision = asyncio.run(decide_fast_lane(
+            event=event,
+            source=source,
+            history=_history(70),
+            session_entry=SimpleNamespace(last_prompt_tokens=160000),
+            config=config,
+            was_auto_reset=False,
+            is_new_session=False,
+            pending_sidecar=False,
+        ))
+    assert decision.use_fast_lane is True
+    assert decision.reason == "trusted_context_tail"
+    assert decision.history_tail_rows == 12
+    assert decision.classifier_ms == 0
+    assert call.await_count == 0

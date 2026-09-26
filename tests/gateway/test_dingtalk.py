@@ -580,6 +580,7 @@ class TestChannelBindings:
             monkeypatch,
             extra={
                 "require_mention": False,
+                "free_response_chats": ["math-room"],
                 "channel_skill_bindings": [
                     {"id": "math-room", "skills": ["jiayin-math-tutor"]},
                 ],
@@ -615,6 +616,7 @@ class TestChannelBindings:
 
         event = adapter.handle_message.await_args.args[0]
         assert event.source.chat_id == "math-room"
+        assert event.source._trusted_context_tail is True
         assert event.auto_skill == ["jiayin-math-tutor"]
         assert event.channel_prompt == "learner_id=jiayin; subject=math"
 
