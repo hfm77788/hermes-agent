@@ -1959,12 +1959,22 @@ class GatewayInboundMixin:
         from tools.vision_tools import vision_analyze_tool
         from agent.memory_manager import sanitize_context
 
+        request_hint = (user_text or "").strip()
+        if len(request_hint) > 1600:
+            request_hint = request_hint[:1600] + "…"
         analysis_prompt = (
-            "Concisely describe this image in 2-4 sentences "
-            "(~200 Chinese characters or ~150 English words). "
-            "Cover the main subject, key visible text/data/code, and overall context. "
-            "If it is a chart, diagram, or scientific figure, include the important "
-            "labels, legend, and key values. Skip decorative details."
+            "Analyze this image once, with high fidelity, so a downstream assistant can "
+            "answer the user's current request without a second vision pass. "
+            f"User request: {request_hint or '(no text request; identify the image precisely)'}. "
+            "Prioritize exact visible text, numbers, formulas, symbols, labels, tables, charts, "
+            "and handwriting that are relevant to that request. Keep the result compact: do not "
+            "transcribe unrelated page content. For worksheets, homework, tests, or textbook pages, "
+            "extract the relevant question numbers, stems/options, mathematical symbols, the student's "
+            "final marked answer, cross-outs/corrections, and handwritten work. If the user did not "
+            "name a question, identify the clearly visible attempted questions and any visible error "
+            "or correction, with just enough surrounding text to verify them. Distinguish what is "
+            "visibly observed from what is inferred. If a required detail cannot be read with confidence, "
+            "say so explicitly. Skip decorative details unless relevant."
         )
         enriched_parts = []
         for path in image_paths:
@@ -1974,9 +1984,11 @@ class GatewayInboundMixin:
                 if result.get("success"):
                     description = sanitize_context(result.get("analysis", ""))
                     note = (
-                        f"[The user sent an image~ Here's what I can see:\n{description}]\n"
-                        f"[If you need a closer look, use vision_analyze with "
-                        f"image_url: {path} ~]"
+                        f"[The user sent an image~ Here's a targeted high-fidelity analysis:\n"
+                        f"{description}]\n"
+                        f"[This first pass was tailored to the user's current request. "
+                        f"Use vision_analyze again with image_url: {path} only if a specific "
+                        f"required detail is missing or explicitly marked uncertain.]"
                     )
                 else:
                     note = (
