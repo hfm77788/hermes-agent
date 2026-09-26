@@ -348,6 +348,16 @@ def _select_new_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
                 _core._parallel_safe_servers.add(own_key)
             else:
                 _core._parallel_safe_servers.discard(own_key)
+            explicit = srv_cfg.get("parallel_readonly_tools")
+            names = {
+                str(item).strip()
+                for item in explicit
+                if isinstance(item, str) and str(item).strip()
+            } if isinstance(explicit, (list, tuple, set)) else set()
+            if names:
+                _core._parallel_explicit_readonly_tools[own_key] = names
+            else:
+                _core._parallel_explicit_readonly_tools.pop(own_key, None)
     for srv in stale_cached:
         _loop._signal_reconnect(srv)
     return new_servers
@@ -676,10 +686,14 @@ def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
         key = _server_key(server_name)
         if key in _core._parallel_safe_servers:
             return True
+        explicit = set(_core._parallel_explicit_readonly_tools.get(key, set()))
         hints = dict(_core._tool_read_only_hints.get(key, {}))
-    if not hints:
-        return False
     from tools.mcp_tool_schema import mcp_prefixed_tool_name
+    if any(
+        mcp_prefixed_tool_name(server_name, raw_name) == tool_name
+        for raw_name in explicit
+    ):
+        return True
     return any(
         is_read_only and mcp_prefixed_tool_name(server_name, raw_name) == tool_name
         for raw_name, is_read_only in hints.items()
