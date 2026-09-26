@@ -54,6 +54,15 @@ def _turn_presentation_muted(display_metadata, platform, user_config, source) ->
     )
 
 
+def _publish_local_inbound_response(source, response) -> None:
+    """Return the authoritative final text to a trusted local sidecar, if one is waiting."""
+    future = getattr(source, "_local_inbound_response_future", None)
+    if not isinstance(future, asyncio.Future) or future.done():
+        return
+    final = response.get("final_response", "") if isinstance(response, dict) else ""
+    future.set_result(str(final or ""))
+
+
 _tool_call_logger_lock = threading.Lock()
 
 
@@ -4344,6 +4353,7 @@ class GatewayTurnMixin:
             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
             _executor_task_holder[0] = worker.executor_task  # read late by _notify_long_running
             response = await self._run_agent_await_turn_worker(worker, turn_ctx, _interrupt_detected, interrupt_monitor)
+            _publish_local_inbound_response(source, response)
             if isinstance(response, dict):
                 response["_notification_reply_muted"] = turn_ctx.mute_notification_reply
             self._run_agent_evict_on_fallback(turn_ctx)

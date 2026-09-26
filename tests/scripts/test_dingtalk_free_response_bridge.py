@@ -199,3 +199,31 @@ def test_gateway_injection_reuses_dual_identity_and_bootstraps_context_once(tmp_
     assert calls[1][0]["force_context"] is False
     assert calls[1][0]["recent_context"] == ""
     assert context_calls["n"] == 1
+
+
+def test_gateway_injection_mode_never_falls_back_to_isolated_cli(tmp_path, monkeypatch):
+    cfg_path = write_cfg(tmp_path)
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    cfg["gateway_inject_existing_session"] = True
+    cfg_path.write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
+    bridge = Bridge(cfg_path)
+    group = bridge.groups[0]
+    member = group.allowed_members["child-id"]
+
+    monkeypatch.setattr(
+        "scripts.dingtalk_free_response_bridge.inject_gateway_local_inbound",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(bridge, "_recent_context", lambda *_a, **_k: "")
+    original_run = bridge._run
+
+    def guarded_run(cmd, **kwargs):
+        if cmd and str(cmd[0]).endswith("/hermes"):
+            pytest.fail("isolated CLI fallback must not run")
+        return original_run(cmd, **kwargs)
+
+    monkeypatch.setattr(bridge, "_run", guarded_run)
+
+    with pytest.raises(RuntimeError, match="refusing isolated CLI fallback"):
+        bridge._generate_reply(
+            group, member, "4000米", "2026-09-26 22:30:00", "m-no-fallback")

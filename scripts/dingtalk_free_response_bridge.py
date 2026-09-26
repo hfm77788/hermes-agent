@@ -280,16 +280,17 @@ class Bridge:
                 },
                 timeout=self.hermes_timeout + 10,
             )
-            if injected is not None:
-                if not injected.get("accepted"):
-                    raise RuntimeError(
-                        f"gateway injection rejected: {injected.get('reason', 'unknown')}")
-                reply = str(injected.get("response") or "").strip()
-                if not reply:
-                    raise RuntimeError("gateway injection returned empty reply")
-                self._gateway_inject_bootstrapped.add(group.chat_id)
-                return reply
-            LOG.warning("gateway injection unavailable; falling back to isolated CLI generation")
+            if injected is None:
+                raise RuntimeError(
+                    "gateway injection unavailable; refusing isolated CLI fallback")
+            if not injected.get("accepted"):
+                raise RuntimeError(
+                    f"gateway injection rejected: {injected.get('reason', 'unknown')}")
+            reply = str(injected.get("response") or "").strip()
+            if not reply:
+                raise RuntimeError("gateway injection returned empty reply")
+            self._gateway_inject_bootstrapped.add(group.chat_id)
+            return reply
 
         recent = self._recent_context(group, created_time)
         context_block = (
