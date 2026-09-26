@@ -174,6 +174,65 @@ class TestSend:
         assert payload["markdown"]["text"] == "Screenshot\n\n![image](https://example.com/demo.png)"
 
 
+class TestOpenApiMediaDelivery:
+
+    def test_openapi_target_routing_prefers_live_context_then_configured_dm(self):
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+
+        adapter = DingTalkAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"dm_user_id": "staff-home", "dm_chat_ids": "dm-home"},
+            )
+        )
+
+        assert adapter._resolve_send_target("dm-home") == ("dm", None, "staff-home")
+        assert adapter._resolve_send_target("group-home") == ("group", "group-home", None)
+
+        adapter._message_contexts["live-dm"] = SimpleNamespace(
+            conversation_type="1",
+            conversation_id="cid-dm",
+            sender_staff_id="staff-live",
+        )
+        adapter._message_contexts["live-group"] = SimpleNamespace(
+            conversation_type="2",
+            conversation_id="cid-group",
+            sender_staff_id="ignored-for-group",
+        )
+
+        assert adapter._resolve_send_target("live-dm") == ("dm", None, "staff-live")
+        assert adapter._resolve_send_target("live-group") == ("group", "cid-group", None)
+
+    @pytest.mark.asyncio
+    async def test_local_image_uses_native_upload_then_robot_message(self):
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter, SendResult
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._http_client = AsyncMock()
+
+        with (
+            patch.object(
+                adapter,
+                "_upload_media",
+                new=AsyncMock(return_value=("media-123", None)),
+            ) as upload,
+            patch.object(
+                adapter,
+                "_robot_send",
+                new=AsyncMock(return_value=SendResult(success=True, message_id="robot-1")),
+            ) as robot_send,
+        ):
+            result = await adapter.send_image_file("chat-123", "/tmp/demo.png")
+
+        assert result.success is True
+        upload.assert_awaited_once_with("/tmp/demo.png", "image", "demo.png")
+        robot_send.assert_awaited_once_with(
+            "sampleImageMsg",
+            {"photoURL": "media-123"},
+            "chat-123",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Connect / disconnect
 # ---------------------------------------------------------------------------

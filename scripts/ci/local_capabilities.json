@@ -43,6 +43,41 @@
         "provider_cooldown_circuit",
         "restore_primary_runtime_gate"
       ]
+    },
+    {
+      "id": "merged_source_message_ids",
+      "introduced_by": [
+        "#46"
+      ],
+      "required_files": [
+        "gateway/platforms/base.py",
+        "plugins/platforms/feishu/adapter.py",
+        "tests/gateway/test_text_batch_source_ids.py"
+      ],
+      "pytest_targets": [
+        "tests/gateway/test_text_batch_source_ids.py"
+      ],
+      "post_deploy_smokes": [
+        "merged_source_message_ids_base",
+        "merged_source_message_ids_feishu"
+      ]
+    },
+    {
+      "id": "dingtalk_openapi_delivery",
+      "introduced_by": [
+        "#46"
+      ],
+      "required_files": [
+        "plugins/platforms/dingtalk/adapter.py",
+        "tests/gateway/test_dingtalk.py"
+      ],
+      "pytest_targets": [
+        "tests/gateway/test_dingtalk.py"
+      ],
+      "post_deploy_smokes": [
+        "dingtalk_dm_target_routing",
+        "dingtalk_native_media_delivery"
+      ]
     }
   ]
 }
