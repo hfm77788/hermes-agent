@@ -11,8 +11,11 @@ import re
 import time
 import traceback
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Set
+from zoneinfo import ZoneInfo
 
 # Optional SDKs: catch broad Exception, not just ImportError — their transitive cryptography
 # dependency can raise AttributeError on version skew; a broken optional SDK must degrade gracefully.
@@ -77,6 +80,7 @@ _OAPI_MEDIA_UPLOAD = "https://oapi.dingtalk.com/media/upload"
 _V1_TOKEN_URL = "https://api.dingtalk.com/v1.0/oauth2/accessToken"
 _MEDIA_MAX_BYTES = 20 * 1024 * 1024  # oapi media upload hard cap
 _IMAGE_EXTS = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
+_DINGTALK_LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def _csv_set(raw: Any) -> Set[str]:
@@ -163,6 +167,18 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._mention_patterns: List[re.Pattern] = self._compile_mention_patterns()
         self._allowed_users: Set[str] = {item.lower() for item in self._csv_setting("allowed_users", "DINGTALK_ALLOWED_USERS")}
         self._stream_client = self._stream_task = self._http_client = self._card_sdk = self._robot_sdk = None
+        self._history_poll_task = None
+        self._history_poll_groups = list(extra.get("history_poll_groups") or [])
+        self._history_poll_interval = max(1.0, float(extra.get("history_poll_interval_seconds") or 3.0))
+        self._history_poll_lookback = max(5, int(extra.get("history_poll_lookback_seconds") or 30))
+        self._history_poll_command = str(extra.get("history_poll_command") or "dws")
+        self._history_poll_home = str(extra.get("history_poll_home") or os.path.expanduser("~"))
+        self._history_poll_state_file = str(extra.get("history_poll_state_file") or "").strip()
+        self._history_poll_seen: Set[str] = set()
+        self._history_poll_seen_order: List[str] = []
+        self._history_poll_inflight: Set[str] = set()
+        self._history_poll_chat_locks: Dict[str, asyncio.Lock] = {}
+        self._load_history_poll_seen()
         self._robot_code: str = extra.get("robot_code") or self._client_id
         self._dedup = MessageDeduplicator(max_size=1000)
         self._session_webhooks: Dict[str, tuple[str, int]] = {}  # chat_id -> (webhook, expired_time_ms)
@@ -201,6 +217,9 @@ class DingTalkAdapter(BasePlatformAdapter):
             self._mark_connected()
             logger.info("[%s] Connected via Stream Mode", self.name)
             self._wire_plugin_handlers(self._stream_client)  # plugin-registered native handlers
+            if self._history_poll_groups and self._history_poll_task is None:
+                self._history_poll_task = asyncio.create_task(self._run_history_poll())
+                logger.info("[%s] History-poll bridge enabled for %d group(s)", self.name, len(self._history_poll_groups))
             return True
         except Exception as e:
             logger.error("[%s] Failed to connect: %s", self.name, e)
@@ -233,6 +252,184 @@ class DingTalkAdapter(BasePlatformAdapter):
             if debug_fmt:
                 logger.debug(debug_fmt, self.name, *args, e)
 
+    def _load_history_poll_seen(self) -> None:
+        """Load bounded durable message-id dedup for the optional history-poll bridge."""
+        if not self._history_poll_state_file:
+            return
+        try:
+            data = json.loads(Path(self._history_poll_state_file).read_text(encoding="utf-8"))
+            values = data.get("seen") if isinstance(data, dict) else []
+            self._history_poll_seen_order = [str(x) for x in (values or []) if str(x)][-1000:]
+            self._history_poll_seen = set(self._history_poll_seen_order)
+        except FileNotFoundError:
+            return
+        except Exception as e:
+            logger.warning("[%s] Could not load history-poll state: %s", self.name, e)
+
+    def _save_history_poll_seen(self) -> None:
+        """Atomically persist the bounded dedup ledger; best-effort so polling never takes down Stream Mode."""
+        if not self._history_poll_state_file:
+            return
+        try:
+            path = Path(self._history_poll_state_file)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps({"seen": self._history_poll_seen_order[-1000:]}, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, path)
+        except Exception as e:
+            logger.warning("[%s] Could not persist history-poll state: %s", self.name, e)
+
+    def _mark_history_poll_seen(self, message_id: str) -> None:
+        if not message_id or message_id in self._history_poll_seen:
+            return
+        self._history_poll_seen.add(message_id)
+        self._history_poll_seen_order.append(message_id)
+        if len(self._history_poll_seen_order) > 1000:
+            stale = self._history_poll_seen_order[:-1000]
+            self._history_poll_seen_order = self._history_poll_seen_order[-1000:]
+            for old in stale:
+                self._history_poll_seen.discard(old)
+        self._save_history_poll_seen()
+
+    async def _fetch_history_poll_messages(self, group: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Read the recent bounded group window through dws; stdout is the typed im.message-list.v1 JSON."""
+        chat_id = str(group.get("id") or "").strip()
+        if not chat_id:
+            return []
+        start = (datetime.now(tz=_DINGTALK_LOCAL_TZ) - timedelta(seconds=self._history_poll_lookback)).isoformat(timespec="seconds")
+        env = os.environ.copy()
+        env["HOME"] = self._history_poll_home
+        env["PATH"] = f"{self._history_poll_home}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+        proc = await asyncio.create_subprocess_exec(
+            self._history_poll_command, "chat", "+chat-messages",
+            "--group", chat_id, "--start", start, "--order", "asc",
+            "--limit", "50", "--format", "json",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env)
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=25.0)
+        except asyncio.CancelledError:
+            proc.kill()
+            await proc.communicate()
+            raise
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            raise RuntimeError(f"dws history poll timed out for {chat_id}")
+        if proc.returncode:
+            detail = (stderr or stdout or b"").decode("utf-8", "replace")[-500:]
+            raise RuntimeError(f"dws history poll rc={proc.returncode} for {chat_id}: {detail}")
+        payload = json.loads(stdout.decode("utf-8", "replace") or "{}")
+        return list(payload.get("messages") or []) if isinstance(payload, dict) else []
+
+    @staticmethod
+    def _history_poll_sender(group: Dict[str, Any], sender_id: str) -> Optional[Dict[str, Any]]:
+        senders = group.get("senders") or {}
+        value = senders.get(sender_id) if isinstance(senders, dict) else None
+        return value if isinstance(value, dict) else None
+
+    async def _dispatch_history_poll_message(
+        self, group: Dict[str, Any], sender: Dict[str, Any], message: Dict[str, Any],
+    ) -> None:
+        """Normalize one DWS history row into the SAME gateway ingress used by native DingTalk Stream Mode."""
+        chat_id = str(group.get("id") or "")
+        msg_id = str(message.get("messageId") or "")
+        raw_text = message.get("text")
+        text = raw_text.strip() if isinstance(raw_text, str) else ""
+        sender_id = str(sender.get("native_sender_id") or "").strip()
+        if not (chat_id and msg_id and text and sender_id):
+            return
+        sender_nick = str(sender.get("sender_nick") or message.get("sender") or sender_id)
+        sender_staff_id = str(sender.get("sender_staff_id") or "")
+        synthetic = SimpleNamespace(
+            _hermes_history_poll=True,
+            message_id=msg_id,
+            conversation_id=chat_id,
+            conversation_type="2",
+            conversation_title=str(group.get("name") or chat_id),
+            sender_id=sender_id,
+            sender_staff_id=sender_staff_id,
+            sender_nick=sender_nick,
+            is_in_at_list=False,
+            at_users=[],
+            chatbot_user_id="",
+            session_webhook="",
+            session_webhook_expired_time=0,
+            create_at=0,
+            message_type="text",
+            text=text,
+            rich_text=None,
+            rich_text_content=None,
+            image_content=None,
+            extensions={},
+        )
+        # Seed the same per-chat outbound context as native _on_message, but deliberately bypass
+        # native mention gating: exact group + exact sender were already checked by this bridge.
+        self._message_contexts[chat_id] = synthetic
+        self._done_emoji_fired.discard(chat_id)
+        source = self.build_source(
+            chat_id=chat_id, chat_name=synthetic.conversation_title, chat_type="group",
+            user_id=sender_id, user_name=sender_nick,
+            user_id_alt=sender_staff_id or None, message_id=msg_id)
+        await self.handle_message(MessageEvent(
+            text=text, source=source, message_id=msg_id, raw_message=synthetic,
+            auto_skill=self._resolve_channel_skills(chat_id),
+            channel_prompt=self._resolve_channel_prompt(chat_id),
+            metadata={"dingtalk_history_poll": True},
+            allow_gateway_control=False,
+            timestamp=datetime.now(tz=timezone.utc),
+        ))
+
+    async def _process_history_poll_message(
+        self, group: Dict[str, Any], sender: Dict[str, Any], message: Dict[str, Any],
+    ) -> None:
+        chat_id = str(group.get("id") or "")
+        msg_id = str(message.get("messageId") or "")
+        lock = self._history_poll_chat_locks.setdefault(chat_id, asyncio.Lock())
+        try:
+            async with lock:
+                await self._dispatch_history_poll_message(group, sender, message)
+            self._mark_history_poll_seen(msg_id)
+            logger.info("[%s] History-poll delivered message_id=%s chat_id=%s", self.name, msg_id, chat_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[%s] History-poll dispatch failed message_id=%s chat_id=%s", self.name, msg_id, chat_id)
+        finally:
+            self._history_poll_inflight.discard(msg_id)
+
+    async def _history_poll_once(self) -> None:
+        for group in self._history_poll_groups:
+            if not isinstance(group, dict):
+                continue
+            messages = await self._fetch_history_poll_messages(group)
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                msg_id = str(message.get("messageId") or "")
+                if not msg_id or msg_id in self._history_poll_seen or msg_id in self._history_poll_inflight:
+                    continue
+                sender = self._history_poll_sender(group, str(message.get("senderId") or ""))
+                raw_text = message.get("text")
+                text = raw_text.strip() if isinstance(raw_text, str) else ""
+                # History rows have no structured @ target. Fail closed on any @ marker so native
+                # Stream Mode remains authoritative for addressed messages and double replies are impossible.
+                if sender is None or not text or "@" in text or "＠" in text:
+                    self._mark_history_poll_seen(msg_id)
+                    continue
+                self._history_poll_inflight.add(msg_id)
+                self._spawn_bg(self._process_history_poll_message(group, sender, message))
+
+    async def _run_history_poll(self) -> None:
+        """Continuously recover configured non-@ group messages that DingTalk omits from bot Stream Mode."""
+        while self._running:
+            try:
+                await self._history_poll_once()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.warning("[%s] History-poll iteration failed: %s", self.name, e)
+            await asyncio.sleep(self._history_poll_interval)
+
     async def disconnect(self) -> None:
         """Disconnect from DingTalk."""
         self._running = False
@@ -241,6 +438,13 @@ class DingTalkAdapter(BasePlatformAdapter):
         websocket = getattr(self._stream_client, "websocket", None) if self._stream_client else None
         if websocket is not None:
             await self._quiet(websocket.close(), "[%s] websocket close during disconnect failed: %s")
+        if self._history_poll_task:
+            self._history_poll_task.cancel()
+            try:
+                await asyncio.wait_for(self._history_poll_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                logger.debug("[%s] history-poll task did not exit cleanly during disconnect", self.name)
+            self._history_poll_task = None
         if self._stream_task:
             if hasattr(self._stream_client, "close"):
                 await self._quiet(asyncio.to_thread(self._stream_client.close))  # sync close() may block on I/O
@@ -357,6 +561,8 @@ class DingTalkAdapter(BasePlatformAdapter):
             return
         self._done_emoji_fired.add(chat_id)
         msg = self._message_contexts.get(chat_id)
+        if getattr(msg, "_hermes_history_poll", False):
+            return  # history-polled messages were never delivered to the bot event stream; skip reactions
         msg_id, conversation_id = (getattr(msg, "message_id", None) or "", getattr(msg, "conversation_id", None) or "") if msg else ("", "")
         if not (msg_id and conversation_id):
             return
@@ -434,12 +640,18 @@ class DingTalkAdapter(BasePlatformAdapter):
         metadata = metadata or {}
         logger.debug("[%s] send() chat_id=%s card_enabled=%s", self.name, chat_id, bool(self._card_template_id and self._card_sdk))
         session_webhook = metadata.get("session_webhook") or (self._get_valid_webhook(chat_id) or ("",))[0]
+        current_message = self._message_contexts.get(chat_id)
+        if not session_webhook and getattr(current_message, "_hermes_history_poll", False):
+            # History-polled group messages have no chatbot sessionWebhook because DingTalk never
+            # delivered them to Stream Mode. They still target an exact configured group, so use
+            # the robot OpenAPI rather than rejecting an otherwise valid free-response turn.
+            text = self._normalize_markdown(content[: self.MAX_MESSAGE_LENGTH])
+            return await self._robot_send("sampleMarkdown", {"title": "Hermes", "text": text}, chat_id)
         if not session_webhook:
             logger.warning("[%s] No valid session_webhook for chat_id=%s", self.name, chat_id)
             return SendResult(success=False, error="No valid session_webhook available. Reply must follow an incoming message.")
         if not self._http_client:
             return SendResult(success=False, error="HTTP client not initialized")
-        current_message = self._message_contexts.get(chat_id)
         # ``reply_to`` is only set by base.py:_send_with_retry for the FINAL reply to an inbound message;
         # tool-progress, commentary and stream first-sends leave it None. It decides (1) finalize-on-create
         # (intermediate cards stay open so edits don't flicker) and (2) whether to fire the Done reaction.

@@ -619,6 +619,102 @@ class TestChannelBindings:
         assert event.channel_prompt == "learner_id=jiayin; subject=math"
 
 
+
+
+class TestHistoryPollBridge:
+
+    @pytest.mark.asyncio
+    async def test_dispatch_preserves_exact_sender_session_and_channel_skill(self, monkeypatch):
+        adapter = _make_gating_adapter(
+            monkeypatch,
+            extra={
+                "channel_skill_bindings": [
+                    {"id": "math-room", "skills": ["huangshang-math-tutor", "dingtalk-inbound-identity"]},
+                ],
+                "channel_prompts": {
+                    "math-room": "learner_id=xiaoma; subject=math",
+                },
+            },
+        )
+        adapter.handle_message = AsyncMock()
+        group = {"id": "math-room", "name": "小马快跑（数学）"}
+        sender = {
+            "native_sender_id": "$:native-moon",
+            "sender_nick": "Moon",
+            "sender_staff_id": "",
+        }
+        message = {
+            "messageId": "history-msg-1",
+            "senderId": "open-moon",
+            "sender": "Moon",
+            "text": "开始",
+        }
+
+        await adapter._dispatch_history_poll_message(group, sender, message)
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.chat_id == "math-room"
+        assert event.source.user_id == "$:native-moon"
+        assert event.source.user_name == "Moon"
+        assert event.auto_skill == ["huangshang-math-tutor", "dingtalk-inbound-identity"]
+        assert event.channel_prompt == "learner_id=xiaoma; subject=math"
+        assert event.metadata["dingtalk_history_poll"] is True
+        assert event.allow_gateway_control is False
+        assert adapter._message_contexts["math-room"]._hermes_history_poll is True
+
+    @pytest.mark.asyncio
+    async def test_poll_only_bridges_allowlisted_plain_messages(self, monkeypatch):
+        group = {
+            "id": "english-room",
+            "name": "小马快跑（英语）",
+            "senders": {
+                "open-parent": {
+                    "native_sender_id": "$:native-parent",
+                    "sender_nick": "七年蝉",
+                    "sender_staff_id": "staff-parent",
+                }
+            },
+        }
+        adapter = _make_gating_adapter(monkeypatch, extra={"history_poll_groups": [group]})
+        adapter.handle_message = AsyncMock()
+        adapter._fetch_history_poll_messages = AsyncMock(return_value=[
+            {"messageId": "m1", "senderId": "open-parent", "sender": "七年蝉", "text": "测试"},
+            {"messageId": "m2", "senderId": "open-parent", "sender": "七年蝉", "text": "开始@河马老师"},
+            {"messageId": "m3", "senderId": "unknown", "sender": "陌生人", "text": "测试"},
+        ])
+
+        await adapter._history_poll_once()
+        if adapter._bg_tasks:
+            await asyncio.gather(*list(adapter._bg_tasks))
+        await asyncio.sleep(0)
+
+        assert adapter.handle_message.await_count == 1
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "测试"
+        assert event.source.user_id == "$:native-parent"
+        assert {"m1", "m2", "m3"} <= adapter._history_poll_seen
+
+    @pytest.mark.asyncio
+    async def test_history_polled_reply_uses_robot_openapi_without_session_webhook(self, monkeypatch):
+        from gateway.platforms.base import SendResult
+
+        adapter = _make_gating_adapter(monkeypatch)
+        adapter._message_contexts["math-room"] = SimpleNamespace(
+            _hermes_history_poll=True,
+            conversation_type="2",
+            conversation_id="math-room",
+        )
+        adapter._robot_send = AsyncMock(return_value=SendResult(success=True, message_id="robot-msg"))
+
+        result = await adapter.send("math-room", "答复正文", reply_to="history-msg-1")
+
+        assert result.success is True
+        adapter._robot_send.assert_awaited_once()
+        args = adapter._robot_send.await_args.args
+        assert args[0] == "sampleMarkdown"
+        assert args[1]["text"] == "答复正文"
+        assert args[2] == "math-room"
+
 # ---------------------------------------------------------------------------
 # _IncomingHandler.process — session_webhook extraction & fire-and-forget
 # ---------------------------------------------------------------------------
