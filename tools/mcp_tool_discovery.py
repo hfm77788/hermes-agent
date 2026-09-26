@@ -660,13 +660,30 @@ def _forget_lazy_server(key) -> None:
 
 
 def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
-    """True when the tool's server opted into ``supports_parallel_tool_calls`` (provenance
-    captured at registration, never the ambiguous ``mcp__{server}__{tool}`` shape)."""
+    """Whether an MCP tool is safe to execute concurrently.
+
+    A whole server may opt in with ``supports_parallel_tool_calls``. Independently, a
+    specific tool is safe when discovery captured the MCP ``readOnlyHint=True`` annotation.
+    Missing or malformed annotations fail closed, so write-capable tools remain sequential even
+    when sibling read tools from the same mixed server run in parallel.
+    """
     if not tool_name.startswith(MCP_TOOL_NAME_PREFIX):
         return False
     with _core._lock:
         server_name = _core._mcp_tool_server_names.get(tool_name)
-        return bool(server_name and _server_key(server_name) in _core._parallel_safe_servers)
+        if not server_name:
+            return False
+        key = _server_key(server_name)
+        if key in _core._parallel_safe_servers:
+            return True
+        hints = dict(_core._tool_read_only_hints.get(key, {}))
+    if not hints:
+        return False
+    from tools.mcp_tool_schema import mcp_prefixed_tool_name
+    return any(
+        is_read_only and mcp_prefixed_tool_name(server_name, raw_name) == tool_name
+        for raw_name, is_read_only in hints.items()
+    )
 
 
 def get_mcp_status(configured: Optional[Dict[str, dict]] = None, *, include_runtime: bool = True) -> List[dict]:

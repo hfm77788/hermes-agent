@@ -4212,6 +4212,7 @@ class GatewayTurnMixin:
         from gateway.run import _float_env, _interim_metadata, _non_conversational_metadata
         _notify_start = time.time()
         _NOTIFY_INTERVAL = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
+        _FIRST_ACK_DELAY = max(0.0, _float_env("HERMES_AGENT_FIRST_ACK_DELAY", 3))
         _long_running_mode = disp._display_surface_mode("long_running_notifications", default=True, allow_generic=True)
         if _NOTIFY_INTERVAL <= 0 or _long_running_mode == "off":
             return
@@ -4221,8 +4222,49 @@ class GatewayTurnMixin:
         if not _notify_adapter:
             return
         _heartbeat_msg_id: Optional[str] = None
+        _first_periodic_delay = _NOTIFY_INTERVAL
+        if 0 < _FIRST_ACK_DELAY < _NOTIFY_INTERVAL:
+            await asyncio.sleep(_FIRST_ACK_DELAY)
+            if not self._should_emit_long_running_notification(
+                session_key, agent_holder[0], _executor_task_holder[0]
+            ):
+                return
+            _agent = agent_holder[0]
+            _tier = getattr(_agent, "_adaptive_turn_budget_tier", None)
+            _stream = turn_ctx.stream_consumer_holder[0] if turn_ctx.stream_consumer_holder else None
+            _stream_already_visible = bool(
+                _stream is not None and (
+                    getattr(_stream, "message_id", None)
+                    or getattr(_stream, "final_content_delivered", False)
+                )
+            )
+            if _tier in {"long", "research"} and not _stream_already_visible:
+                _first_text = (
+                    disp._generic_status_phrase("status")
+                    if _long_running_mode == "generic"
+                    else "⏳ Working — started"
+                )
+                try:
+                    _notify_res = await _notify_adapter.send(
+                        source.chat_id, _first_text,
+                        metadata=_interim_metadata(
+                            _non_conversational_metadata(
+                                _status_thread_metadata, platform=source.platform
+                            )
+                        ),
+                    )
+                    if getattr(_notify_res, "success", False) and getattr(_notify_res, "message_id", None):
+                        _heartbeat_msg_id = str(_notify_res.message_id)
+                        if turn_ctx._cleanup_progress:
+                            turn_ctx._cleanup_msg_ids.append(_heartbeat_msg_id)
+                except Exception as _ne:
+                    logger.debug("Fast first acknowledgement error: %s", _ne)
+            _first_periodic_delay = max(0.0, _NOTIFY_INTERVAL - _FIRST_ACK_DELAY)
+
+        _next_notify_delay = _first_periodic_delay
         while True:
-            await asyncio.sleep(_NOTIFY_INTERVAL)
+            await asyncio.sleep(_next_notify_delay)
+            _next_notify_delay = _NOTIFY_INTERVAL
             if not self._should_emit_long_running_notification(
                 session_key, agent_holder[0], _executor_task_holder[0]
             ):
