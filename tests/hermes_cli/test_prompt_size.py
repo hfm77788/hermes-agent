@@ -91,6 +91,33 @@ def test_skills_breakdown_shape_sorted_and_attributed(isolated_home):
     assert sum(s["index_line_bytes"] for s in skills) <= data["skills_index"]["bytes"]
 
 
+
+
+def test_platform_compact_categories_are_honored_by_prompt_size(isolated_home):
+    """The explicit diagnostic platform must drive per-platform skill compaction."""
+    (isolated_home / "config.yaml").write_text(
+        """
+skills:
+  platform_compact_categories:
+    feishu: [demo]
+""".strip(),
+        encoding="utf-8",
+    )
+    _seed_skill(isolated_home, "alpha-skill", "alpha description")
+    _seed_skill(isolated_home, "beta-skill", "beta description")
+
+    from agent import skill_utils
+    from agent.prompt_builder import clear_skills_system_prompt_cache
+    skill_utils._raw_config_cache_clear()
+    clear_skills_system_prompt_cache(clear_snapshot=True)
+
+    data = compute_prompt_breakdown("feishu")
+    by_name = {entry["name"]: entry for entry in data["skills_breakdown"]}
+
+    assert by_name["alpha-skill"]["index_line_skill_count"] == 2
+    assert by_name["beta-skill"]["index_line_skill_count"] == 2
+    assert by_name["alpha-skill"]["index_line_total_bytes"] == by_name["beta-skill"]["index_line_total_bytes"]
+
 def test_skills_breakdown_attributes_demoted_category_shared_line(isolated_home):
     """A real posture-demoted category retains every skill in the breakdown."""
     from agent.prompt_builder import build_skills_system_prompt
