@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
+import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -19,6 +22,9 @@ import yaml
 from gateway.control_socket import inject_gateway_local_inbound
 
 LOG = logging.getLogger("dingtalk_free_response_bridge")
+
+_IMAGE_PLACEHOLDER_RE = re.compile(r"\[图片消息\]\(mediaId=[^)]+\)")
+_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic"}
 
 
 @dataclass(frozen=True)
@@ -67,8 +73,17 @@ class Bridge:
         self.hermes_timeout = int(self.cfg.get("hermes_timeout_seconds", 180))
         self.gateway_inject = bool(self.cfg.get("gateway_inject_existing_session", False))
         self.gateway_home = Path(self.cfg.get("gateway_home", "/home/ubuntu/.hermes"))
+        self.media_cache_root = Path(
+            self.cfg.get(
+                "media_cache_dir",
+                "/home/ubuntu/.hermes/state/dingtalk-free-response-media",
+            )
+        )
+        self.max_media_attachments = max(1, min(int(self.cfg.get("max_media_attachments", 4)), 8))
+        self.max_media_bytes = max(1, int(self.cfg.get("max_media_bytes", 15 * 1024 * 1024)))
         self._gateway_inject_bootstrapped: set[str] = set()
         self.groups = self._parse_groups(self.cfg.get("groups") or [])
+        self._prune_media_cache()
         self.state = self._load_state()
 
     @staticmethod
@@ -158,6 +173,92 @@ class Bridge:
             check=False,
             env={**os.environ, "HOME": "/home/ubuntu"},
         )
+
+    def _prune_media_cache(self, *, max_age_seconds: int = 86400) -> None:
+        if not self.media_cache_root.exists():
+            return
+        cutoff = time.time() - max_age_seconds
+        for child in self.media_cache_root.iterdir():
+            try:
+                if child.stat().st_mtime < cutoff:
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink(missing_ok=True)
+            except OSError:
+                LOG.warning("failed pruning stale media cache path=%s", child)
+
+    @staticmethod
+    def _clean_image_text(text: str) -> str:
+        cleaned = _IMAGE_PLACEHOLDER_RE.sub("", text or "").strip()
+        return cleaned or "请结合图片内容和当前课堂上下文回答。"
+
+    def _download_image_media(
+        self, group: GroupRoute, msg: dict[str, Any]
+    ) -> list[str]:
+        refs = list(msg.get("resourceRefs") or [])
+        if not refs:
+            return []
+        message_id = str(msg.get("messageId") or "")
+        if not message_id:
+            return []
+        job_dir = self.media_cache_root / hashlib.sha256(
+            message_id.encode("utf-8")
+        ).hexdigest()[:24]
+        job_dir.mkdir(parents=True, exist_ok=True)
+        out: list[str] = []
+        for ref in refs[: self.max_media_attachments]:
+            if not isinstance(ref, dict) or str(ref.get("type") or "") != "mediaId":
+                continue
+            dl = ref.get("download") or {}
+            args = dl.get("arguments") or {}
+            if dl.get("ready") is False or dl.get("missing"):
+                continue
+            resource_id = str(args.get("resource-id") or ref.get("resourceId") or "")
+            if not resource_id:
+                continue
+            proc = subprocess.run(
+                [
+                    self.dws, "chat", "+messages-resource-download",
+                    "--resource-id", resource_id,
+                    "--message-id", message_id,
+                    "--open-conversation-id", group.chat_id,
+                    "--type", "mediaId",
+                    "--output", f"./{job_dir.name}/",
+                    "--overwrite", "-y", "--format", "json",
+                ],
+                cwd=str(self.media_cache_root),
+                text=True,
+                capture_output=True,
+                timeout=45,
+                check=False,
+                env={**os.environ, "HOME": "/home/ubuntu"},
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"dws media download failed rc={proc.returncode}: {proc.stderr[-500:]}"
+                )
+            payload = json.loads(proc.stdout or "{}")
+            local = str(payload.get("localPath") or "")
+            path = (self.media_cache_root / local).resolve()
+            root = self.media_cache_root.resolve()
+            if not path.is_relative_to(root) or not path.is_file():
+                raise RuntimeError("dws media download returned invalid local path")
+            size = int(payload.get("sizeBytes") or path.stat().st_size)
+            if size > self.max_media_bytes:
+                path.unlink(missing_ok=True)
+                raise RuntimeError(f"image attachment too large: {size} bytes")
+            if path.suffix.lower() not in _IMAGE_SUFFIXES:
+                path.unlink(missing_ok=True)
+                continue
+            out.append(str(path))
+        return out
+
+    def _cleanup_message_media(self, message_id: str) -> None:
+        job_dir = self.media_cache_root / hashlib.sha256(
+            message_id.encode("utf-8")
+        ).hexdigest()[:24]
+        shutil.rmtree(job_dir, ignore_errors=True)
 
     def _fetch_messages(self, group: GroupRoute, cursor_time: str) -> list[dict[str, Any]]:
         cmd = [
@@ -255,6 +356,7 @@ class Bridge:
         text: str,
         created_time: str,
         message_id: str = "",
+        media_urls: list[str] | None = None,
     ) -> str:
         if self.gateway_inject:
             force_context = group.chat_id not in self._gateway_inject_bootstrapped
@@ -272,6 +374,8 @@ class Bridge:
                     "user_name": member.role,
                     "message_id": message_id,
                     "text": text,
+                    "media_urls": list(media_urls or []),
+                    "media_types": ["image"] * len(media_urls or []),
                     "skill": group.skill,
                     "recent_context": recent_context,
                     "force_context": force_context,
@@ -291,6 +395,11 @@ class Bridge:
                 raise RuntimeError("gateway injection returned empty reply")
             self._gateway_inject_bootstrapped.add(group.chat_id)
             return reply
+
+        if media_urls:
+            raise RuntimeError(
+                "image bridge requires gateway injection; refusing isolated CLI fallback"
+            )
 
         recent = self._recent_context(group, created_time)
         context_block = (
@@ -387,7 +496,12 @@ class Bridge:
             self._mark_processed(gs, message_id)
             return True
 
-        if not text:
+        image_refs = [
+            ref
+            for ref in (msg.get("resourceRefs") or [])
+            if isinstance(ref, dict) and str(ref.get("type") or "") == "mediaId"
+        ]
+        if not text and not image_refs:
             LOG.info("ignored unsupported non-text message group=%s id=%s", group.name, message_id)
             self._mark_processed(gs, message_id)
             return True
@@ -395,17 +509,25 @@ class Bridge:
         pending = gs.setdefault("pending", {})
         reply = pending.get(message_id)
         if not reply:
+            media_urls: list[str] = []
+            if image_refs:
+                media_urls = self._download_image_media(group, msg)
+                if not media_urls:
+                    raise RuntimeError("image message had no downloadable image attachment")
+                text = self._clean_image_text(text)
             reply = self._generate_reply(
                 group,
                 member,
                 text,
                 str(msg.get("createTime") or ""),
                 message_id,
+                media_urls=media_urls,
             )
             pending[message_id] = reply
             self._save_state()
 
         self._send_reply(group, reply)
+        self._cleanup_message_media(message_id)
         self._mark_processed(gs, message_id)
         LOG.info("replied group=%s message_id=%s role=%s", group.name, message_id, member.role)
         return True

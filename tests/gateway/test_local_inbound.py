@@ -142,3 +142,51 @@ def test_run_turn_publishes_authoritative_final_response():
         return await future
 
     assert asyncio.run(scenario()) == "最终正文"
+
+
+
+def test_injected_image_uses_photo_event_from_controlled_media_cache(tmp_path, monkeypatch):
+    from gateway.platforms.event import MessageType
+
+    home = tmp_path / "hermes-home"
+    media = home / "state" / "dingtalk-free-response-media" / "job" / "page.jpg"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(b"jpeg-bytes")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    runner = FakeRunner()
+    result = asyncio.run(inject_local_inbound(
+        runner,
+        _payload(
+            message_id="img-1",
+            text="讲第二题",
+            media_urls=[str(media)],
+            media_types=["image"],
+        ),
+    ))
+    event = runner.adapter.seen
+    assert result["accepted"] is True
+    assert event.message_type is MessageType.PHOTO
+    assert event.media_urls == [str(media.resolve())]
+    assert event.media_types == ["image"]
+
+
+def test_injected_image_rejects_path_outside_controlled_media_cache(tmp_path, monkeypatch):
+    home = tmp_path / "hermes-home"
+    (home / "state" / "dingtalk-free-response-media").mkdir(parents=True)
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(b"jpeg-bytes")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    runner = FakeRunner()
+    result = asyncio.run(inject_local_inbound(
+        runner,
+        _payload(
+            message_id="img-2",
+            text="讲题",
+            media_urls=[str(outside)],
+            media_types=["image"],
+        ),
+    ))
+    assert result == {"accepted": False, "reason": "invalid_media_path"}
+    assert runner.calls == 0
