@@ -65,3 +65,20 @@ def test_formal_manifest_integrity_is_global_blocker(tmp_path, monkeypatch):
         assert str(e) == "formal_200_manifest_integrity_invalid"
     else:
         raise AssertionError("expected global blocker")
+
+
+def test_recovery_phase_clears_stale_error_metadata(tmp_path, monkeypatch):
+    mod=load_module(tmp_path)
+    mod.STATE.parent.mkdir(parents=True, exist_ok=True)
+    mod.atomic(mod.STATE, {
+        "phase": "technical_blocker",
+        "error": "RuntimeError",
+        "detail": "old problem",
+        "retry_in_seconds": 300,
+        "repeated_error_count": 110,
+    })
+    mod.write_state(phase="waiting_blind_review", batch=2)
+    state=json.loads(mod.STATE.read_text(encoding="utf8"))
+    assert state["phase"] == "waiting_blind_review"
+    for key in ("error","detail","retry_in_seconds","repeated_error_count"):
+        assert key not in state
