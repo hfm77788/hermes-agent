@@ -24,6 +24,7 @@ class FastLaneDecision:
     history_rows: int = 0
     classifier_ms: int = 0
     confidence: float = 0.0
+    history_tail_rows: int = 0
 
     @property
     def accepted(self) -> bool:
@@ -62,17 +63,20 @@ def _config(config: Mapping[str, Any] | None) -> dict[str, Any] | None:
         "max_message_chars": as_int("max_message_chars", 1200, 64, 8000),
         "timeout_s": as_float("classifier_timeout_s", 4.0, 0.5, 8.0),
         "min_confidence": as_float("min_confidence", 0.98, 0.8, 1.0),
+        "context_tail_rows": as_int("context_tail_rows", 0, 0, 100),
+        "context_tail_max_message_chars": as_int("context_tail_max_message_chars", 160, 16, 2000),
+        "context_tail_min_confidence": as_float("context_tail_min_confidence", 0.90, 0.5, 1.0),
     }
 
 
-def _decision(use, reason, tokens, rows, started=None, confidence=0.0):
+def _decision(use, reason, tokens, rows, started=None, confidence=0.0, history_tail_rows=0):
     elapsed = 0 if started is None else max(0, int((time.monotonic() - started) * 1000))
-    d = FastLaneDecision(use, reason, tokens, rows, elapsed, confidence)
+    d = FastLaneDecision(use, reason, tokens, rows, elapsed, confidence, history_tail_rows)
     if reason != "short_history":
         logger.info(
             "gateway_fast_lane decision=%s reason=%s history_rows=%d last_prompt_tokens=%d "
-            "classifier_ms=%d confidence=%.3f",
-            "accepted" if use else "fallback", reason, rows, tokens, elapsed, confidence,
+            "classifier_ms=%d confidence=%.3f history_tail_rows=%d",
+            "accepted" if use else "fallback", reason, rows, tokens, elapsed, confidence, history_tail_rows,
         )
     return d
 
@@ -185,6 +189,13 @@ async def decide_fast_lane(*, event, source, history, session_entry, config,
             reason = "ambiguous"
         if self_contained is True and confidence >= cfg["min_confidence"]:
             return _decision(True, "self_contained", tokens, rows, started, confidence)
+        if (raw_reason == "needs_prior_context" and cfg["context_tail_rows"] > 0
+                and len(text.strip()) <= cfg["context_tail_max_message_chars"]
+                and confidence >= cfg["context_tail_min_confidence"]):
+            return _decision(
+                True, "context_tail", tokens, rows, started, confidence,
+                history_tail_rows=min(rows, cfg["context_tail_rows"]),
+            )
         return _decision(False, "classifier_context_dependent", tokens, rows, started, confidence)
     except Exception:
         logger.debug("gateway fast-lane classifier failed; using full history", exc_info=True)
