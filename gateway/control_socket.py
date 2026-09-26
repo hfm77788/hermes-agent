@@ -397,3 +397,11 @@ def reload_gateway_plugins(home: Path, *, profile_home: Optional[Path] = None,
     session; only handlers go live."""
     params = {"home": str(profile_home or home)}
     return query_gateway_control(home, "reload-plugins", params=params, timeout=timeout)
+
+
+def inject_gateway_local_inbound(
+    home: Path, params: dict[str, Any], *, timeout: float = 190.0
+) -> Optional[dict[str, Any]]:
+    """Inject a trusted sidecar-observed message through the live gateway."""
+    return query_gateway_control(
+        home, "inject-local-inbound", params=params, timeout=timeout)

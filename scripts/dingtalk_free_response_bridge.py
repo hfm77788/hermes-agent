@@ -16,6 +16,8 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
+from gateway.control_socket import inject_gateway_local_inbound
+
 LOG = logging.getLogger("dingtalk_free_response_bridge")
 
 
@@ -63,6 +65,9 @@ class Bridge:
         )
         self.max_attempts = int(self.cfg.get("max_attempts", 3))
         self.hermes_timeout = int(self.cfg.get("hermes_timeout_seconds", 180))
+        self.gateway_inject = bool(self.cfg.get("gateway_inject_existing_session", False))
+        self.gateway_home = Path(self.cfg.get("gateway_home", "/home/ubuntu/.hermes"))
+        self._gateway_inject_bootstrapped: set[str] = set()
         self.groups = self._parse_groups(self.cfg.get("groups") or [])
         self.state = self._load_state()
 
@@ -249,7 +254,43 @@ class Bridge:
         member: MemberRoute,
         text: str,
         created_time: str,
+        message_id: str = "",
     ) -> str:
+        if self.gateway_inject:
+            force_context = group.chat_id not in self._gateway_inject_bootstrapped
+            recent_context = self._recent_context(group, created_time) if force_context else ""
+            injected = inject_gateway_local_inbound(
+                self.gateway_home,
+                {
+                    "profile": self.profile,
+                    "platform": "dingtalk",
+                    "chat_id": group.chat_id,
+                    "chat_name": group.name,
+                    "chat_type": "group",
+                    "user_id": member.open_dingtalk_id,
+                    "user_id_alt": member.hermes_session_user_id,
+                    "user_name": member.role,
+                    "message_id": message_id,
+                    "text": text,
+                    "skill": group.skill,
+                    "recent_context": recent_context,
+                    "force_context": force_context,
+                    "wait_for_idle_seconds": min(self.hermes_timeout, 120),
+                    "timeout_seconds": self.hermes_timeout + 5,
+                },
+                timeout=self.hermes_timeout + 10,
+            )
+            if injected is not None:
+                if not injected.get("accepted"):
+                    raise RuntimeError(
+                        f"gateway injection rejected: {injected.get('reason', 'unknown')}")
+                reply = str(injected.get("response") or "").strip()
+                if not reply:
+                    raise RuntimeError("gateway injection returned empty reply")
+                self._gateway_inject_bootstrapped.add(group.chat_id)
+                return reply
+            LOG.warning("gateway injection unavailable; falling back to isolated CLI generation")
+
         recent = self._recent_context(group, created_time)
         context_block = (
             f"最近群聊上下文（按时间顺序，仅用于衔接当前对话）：\n{recent}\n"
@@ -358,6 +399,7 @@ class Bridge:
                 member,
                 text,
                 str(msg.get("createTime") or ""),
+                message_id,
             )
             pending[message_id] = reply
             self._save_state()
