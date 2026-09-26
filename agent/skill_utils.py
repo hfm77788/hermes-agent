@@ -312,6 +312,27 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     return disabled - ESSENTIAL_SKILLS
 
 
+def get_compact_skill_categories(platform: str | None = None) -> Set[str]:
+    """Skill categories rendered as names-only in the prompt.
+
+    This is a footprint control, not an ability gate: skills remain discoverable and
+    loadable with ``skill_view``. Global ``skills.compact_categories`` is unioned
+    with ``skills.platform_compact_categories.<platform>`` so messaging profiles can
+    keep role capabilities without paying every skill description on every turn.
+    """
+    skills_cfg = _skills_cfg()
+    if skills_cfg is None:
+        return set()
+    from gateway.session_context import get_session_env
+    resolved_platform = platform or os.getenv("HERMES_PLATFORM") or get_session_env("HERMES_SESSION_PLATFORM")
+    compact = _normalize_string_set(skills_cfg.get("compact_categories"))
+    platform_map = skills_cfg.get("platform_compact_categories")
+    platform_compact = platform_map.get(resolved_platform) if isinstance(platform_map, dict) and resolved_platform else None
+    if platform_compact is not None:
+        compact |= _normalize_string_set(platform_compact)
+    return compact
+
+
 def parse_config_string_list(value) -> List[str]:
     """Normalize a config value that may hold a JSON-array string into a list.
     ``hermes config set`` stores lists as quoted JSON/Python-literal strings;

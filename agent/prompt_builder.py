@@ -23,7 +23,7 @@ from agent.model_metadata import CHARS_PER_TOKEN
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS, ORG_ACTIVE_MARKER, ORG_MIRROR_DIR_NAME, ORG_PROVENANCE_FILE, SKILL_SUPPORT_DIRS,
-    extract_skill_conditions, extract_skill_description, get_all_skills_dirs, get_disabled_skill_names,
+    extract_skill_conditions, extract_skill_description, get_all_skills_dirs, get_compact_skill_categories, get_disabled_skill_names,
     iter_skill_index_files, parse_frontmatter, read_active_org_id, skill_matches_apps, skill_matches_environment,
     skill_matches_platform, skill_matches_platform_list,
 )
@@ -1278,13 +1278,17 @@ def build_skills_system_prompt(
         skills_dir = get_skills_dir()
     try:
         external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
+        # Operator/profile compaction is additive with context-derived compaction.
+        # It only removes descriptions from the index; names and skill_view remain intact.
+        configured_compact = frozenset(get_compact_skill_categories())
+        resolved_compact = frozenset(compact_categories or ()) | configured_compact
         # Trusted project-local dirs — highest-precedence tier; cwd/trust are session-stable, so byte-stable.
         from agent.skill_utils import get_project_skills_dirs
         project_dirs = get_project_skills_dirs()
         if not skills_dir.exists() and not external_dirs and not project_dirs:
             return ""
         return _build_skills_system_prompt_inner(
-            skills_dir, external_dirs, available_tools, available_toolsets, compact_categories, project_dirs)
+            skills_dir, external_dirs, available_tools, available_toolsets, resolved_compact or None, project_dirs)
     finally:
         if _home_token is not None:
             reset_hermes_home_override(_home_token)
