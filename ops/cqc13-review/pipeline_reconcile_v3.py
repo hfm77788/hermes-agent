@@ -68,6 +68,12 @@ def valid_results(d, ids):
 
 def write_state(**kw):
     base=load(STATE,{}) or {}
+    # Once the pipeline leaves a technical blocker, stale error metadata must
+    # disappear or status/reporting layers can misdiagnose a recovered run.
+    phase=kw.get("phase")
+    if phase and phase!="technical_blocker":
+        for key in ("error","detail","retry_in_seconds","repeated_error_count"):
+            base.pop(key,None)
     base.update({"schema_version":"3.0","updated_at":time.time(),**kw})
     atomic(STATE,base)
 
