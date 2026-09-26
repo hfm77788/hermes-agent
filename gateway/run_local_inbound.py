@@ -21,6 +21,15 @@ _MAX_CONTEXT_CHARS = 12000
 _MAX_ID_CHARS = 1024
 _RESULT_CACHE_MAX = 500
 _MEDIA_MAX_ATTACHMENTS = 8
+_IMAGE_MIME_BY_SUFFIX = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".heic": "image/heic",
+}
 
 
 def _clean(value: Any, *, limit: int = _MAX_ID_CHARS) -> str:
@@ -68,9 +77,11 @@ async def _execute_local_inbound(runner, params: dict[str, Any]) -> dict[str, An
             return {"accepted": False, "reason": "invalid_media_path"}
         media_type = _clean(
             raw_types[index] if index < len(raw_types) else "image",
-            limit=32,
+            limit=64,
         ).lower()
-        if media_type != "image":
+        if media_type in {"", "image"}:
+            media_type = _IMAGE_MIME_BY_SUFFIX.get(path.suffix.lower(), "")
+        if not media_type.startswith("image/"):
             return {"accepted": False, "reason": "unsupported_media_type"}
         media_urls.append(str(path))
         media_types.append(media_type)

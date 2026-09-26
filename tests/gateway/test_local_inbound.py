@@ -168,7 +168,7 @@ def test_injected_image_uses_photo_event_from_controlled_media_cache(tmp_path, m
     assert result["accepted"] is True
     assert event.message_type is MessageType.PHOTO
     assert event.media_urls == [str(media.resolve())]
-    assert event.media_types == ["image"]
+    assert event.media_types == ["image/jpeg"]
 
 
 def test_injected_image_rejects_path_outside_controlled_media_cache(tmp_path, monkeypatch):
@@ -189,4 +189,25 @@ def test_injected_image_rejects_path_outside_controlled_media_cache(tmp_path, mo
         ),
     ))
     assert result == {"accepted": False, "reason": "invalid_media_path"}
+    assert runner.calls == 0
+
+
+def test_injected_media_rejects_non_image_type_inside_cache(tmp_path, monkeypatch):
+    home = tmp_path / "hermes-home"
+    media = home / "state" / "dingtalk-free-response-media" / "job" / "page.jpg"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(b"jpeg-bytes")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    runner = FakeRunner()
+    result = asyncio.run(inject_local_inbound(
+        runner,
+        _payload(
+            message_id="img-bad-type",
+            text="讲题",
+            media_urls=[str(media)],
+            media_types=["application/octet-stream"],
+        ),
+    ))
+    assert result == {"accepted": False, "reason": "unsupported_media_type"}
     assert runner.calls == 0
