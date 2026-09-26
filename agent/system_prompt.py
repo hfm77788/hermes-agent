@@ -306,7 +306,12 @@ def _skills_prompt(agent: Any) -> str:
     avail_toolsets = {model_tools.get_toolset_for_tool(tool_name) for tool_name in agent.valid_tool_names} - {None, ""}
     try:
         from agent.coding_context import coding_compact_skill_categories
-        _compact_cats = coding_compact_skill_categories(platform=agent.platform, cwd=resolve_context_cwd())
+        from agent.skill_utils import get_compact_skill_categories
+        _compact_cats = frozenset(coding_compact_skill_categories(platform=agent.platform, cwd=resolve_context_cwd()))
+        # Pass the agent platform explicitly. Messaging gateway turns bind a session-platform
+        # ContextVar, but offline diagnostics and bare-thread prompt builds do not; relying only
+        # on ambient context made ``prompt-size --platform`` disagree with production behavior.
+        _compact_cats |= frozenset(get_compact_skill_categories(getattr(agent, "platform", None)))
     except Exception:
         _compact_cats = frozenset()
     return _pb.build_skills_system_prompt(available_tools=agent.valid_tool_names, available_toolsets=avail_toolsets,
