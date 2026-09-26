@@ -66,19 +66,29 @@ class RecallStatus:
 TRIVIAL_PROMPT_RE = re.compile(
     r'^(yes|no|ok|okay|sure|thanks|thank you|y|n|yep|nope|yeah|nah|'
     r'hi|hey|hello|yo|sup|'
-    r'continue|go ahead|do it|proceed|got it|cool|nice|great|done|next|lgtm|k)'
-    r'[\s!?.:;,"' + "'" + r'~\u2018\u2019\u201c\u201d\u2014\u2013\u2026()\[\]{}<>*&^%$#@!+=`\u00a0]*$',
+    r'continue|go ahead|do it|proceed|got it|cool|nice|great|done|next|lgtm|k|'
+    r'好|好的|行|可以|嗯|对|不对|是|不是|继续|继续吧|继续做|推进|推进吧|'
+    r'推进闭环|做吧|开始吧|为什么|怎么回事|什么意思|啥意思|修|修复|彻底修复|'
+    r'收尾|下一步|然后呢|进度|进度如何|现在呢|怎么样|完成了吗|闭环了吗|'
+    r'再试试|重试|测试|确认|执行|落地|落地执行|按这个做|就这样)'
+    r'[\s!?.:;,，。！？；："' + "'" + r'~\u2018\u2019\u201c\u201d\u2014\u2013\u2026()\[\]{}<>*&^%$#@!+=`\u00a0]*$',
+    re.IGNORECASE,
+)
+TRIVIAL_VALUE_RE = re.compile(
+    r'^(?:[-+]?\d+(?:\.\d+)?%?|[a-d]|true|false|错|否)'
+    r'[\s!?.:;,，。！？；：]*$',
     re.IGNORECASE,
 )
 
 
 def is_trivial_prompt(text: Optional[str]) -> bool:
-    """True for empty input, slash commands and bare greetings/acknowledgements (skipping
-    recall saves a round-trip and keeps stale context from derailing one-word replies)."""
+    """True for empty input, slash commands, bare acknowledgements/continuations, and
+    answer-only values. Skipping recall saves a round-trip and keeps stale context from
+    derailing turns whose meaning comes from the immediately preceding conversation."""
     stripped = (text or "").strip()
     if not stripped or stripped.startswith("/"):
         return True
-    return bool(TRIVIAL_PROMPT_RE.match(stripped))
+    return bool(TRIVIAL_PROMPT_RE.match(stripped) or TRIVIAL_VALUE_RE.match(stripped))
 
 
 class MemoryProvider(ABC):

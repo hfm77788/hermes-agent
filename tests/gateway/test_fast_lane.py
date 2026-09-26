@@ -86,6 +86,61 @@ def test_context_tail_stays_disabled_by_default():
     assert decision.use_fast_lane is False
     assert decision.history_tail_rows == 0
 
+def test_direct_context_tail_skips_classifier_for_known_short_continuation():
+    event=MessageEvent(text="继续", message_type=MessageType.TEXT, source=_source())
+    config={"gateway":{"fast_lane":{
+        "direct_tail_enabled":True,
+        "direct_tail_max_message_chars":32,
+        "context_tail_rows":24,
+    }}}
+    with patch("agent.auxiliary_client.async_call_llm", new=AsyncMock()) as call:
+        decision=asyncio.run(decide_fast_lane(
+            event=event, source=_source(), history=_history(90),
+            session_entry=SimpleNamespace(last_prompt_tokens=120000), config=config,
+            was_auto_reset=False, is_new_session=False, pending_sidecar=False,
+        ))
+    assert decision.use_fast_lane is True
+    assert decision.reason == "direct_context_tail"
+    assert decision.history_tail_rows == 24
+    assert decision.classifier_ms == 0
+    assert call.await_count == 0
+
+
+def test_direct_context_tail_accepts_short_quiz_value_without_classifier():
+    event=MessageEvent(text="31.4", message_type=MessageType.TEXT, source=_source())
+    config={"gateway":{"fast_lane":{
+        "direct_tail_enabled":True,
+        "context_tail_rows":12,
+    }}}
+    with patch("agent.auxiliary_client.async_call_llm", new=AsyncMock()) as call:
+        decision=asyncio.run(decide_fast_lane(
+            event=event, source=_source(), history=_history(70),
+            session_entry=SimpleNamespace(last_prompt_tokens=160000), config=config,
+            was_auto_reset=False, is_new_session=False, pending_sidecar=False,
+        ))
+    assert decision.use_fast_lane is True
+    assert decision.reason == "direct_context_tail"
+    assert decision.history_tail_rows == 12
+    assert call.await_count == 0
+
+
+def test_direct_context_tail_does_not_guess_unknown_short_reference():
+    response={"choices":[{"message":{"content":'{"self_contained":false,"confidence":0.99,"reason":"needs_prior_context"}'}}]}
+    event=MessageEvent(text="把那个再改一下", message_type=MessageType.TEXT, source=_source())
+    config={"gateway":{"fast_lane":{
+        "direct_tail_enabled":True,
+        "context_tail_rows":24,
+    }}}
+    with patch("agent.auxiliary_client.async_call_llm", new=AsyncMock(return_value=response)) as call:
+        decision=asyncio.run(decide_fast_lane(
+            event=event, source=_source(), history=_history(90),
+            session_entry=SimpleNamespace(last_prompt_tokens=120000), config=config,
+            was_auto_reset=False, is_new_session=False, pending_sidecar=False,
+        ))
+    assert decision.reason == "context_tail"
+    assert call.await_count == 1
+
+
 def test_reply_context_falls_back_without_classifier():
     event=MessageEvent(
         text="Change it.", message_type=MessageType.TEXT, source=_source(),
