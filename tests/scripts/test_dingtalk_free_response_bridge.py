@@ -100,3 +100,62 @@ def test_pending_reply_prevents_duplicate_generation_on_send_retry(tmp_path, mon
     assert calls["generate"] == 1
     assert calls["send"] == 2
     assert "m4" in bridge.state["groups"]["cid-math"]["processed_ids"]
+
+
+def test_recent_context_is_chronological(tmp_path, monkeypatch):
+    bridge = Bridge(write_cfg(tmp_path))
+    group = bridge.groups[0]
+
+    class Proc:
+        returncode = 0
+        stderr = ""
+        stdout = json.dumps(
+            {
+                "messages": [
+                    {"createTime": "2026-09-26 20:00:02", "sender": "Moon", "text": "40"},
+                    {"createTime": "2026-09-26 20:00:01", "sender": "河马老师", "text": "Q1"},
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(bridge, "_run", lambda *a, **k: Proc())
+    assert bridge._recent_context(group, "2026-09-26 20:00:03") == "河马老师: Q1\nMoon: 40"
+
+
+def test_fresh_generation_avoids_heavy_session_resume(tmp_path, monkeypatch):
+    bridge = Bridge(write_cfg(tmp_path))
+    group = bridge.groups[0]
+    member = group.allowed_members["child-id"]
+    assert group.resume_existing_session is False
+
+    monkeypatch.setattr(
+        bridge,
+        "_recent_context",
+        lambda *_a, **_k: "河马老师: Q1\nMoon: 40",
+    )
+    captured = {}
+
+    class Proc:
+        returncode = 0
+        stderr = ""
+        stdout = "继续下一题"
+
+    def fake_run(cmd, *, timeout):
+        captured["cmd"] = cmd
+        captured["timeout"] = timeout
+        return Proc()
+
+    monkeypatch.setattr(bridge, "_run", fake_run)
+    reply = bridge._generate_reply(
+        group,
+        member,
+        "继续",
+        "2026-09-26 20:00:03",
+    )
+    assert reply == "继续下一题"
+    assert "--resume" not in captured["cmd"]
+    prompt = captured["cmd"][captured["cmd"].index("-z") + 1]
+    assert "河马老师: Q1" in prompt
+    assert "Moon: 40" in prompt
+    assert "当前原始消息：继续" in prompt
