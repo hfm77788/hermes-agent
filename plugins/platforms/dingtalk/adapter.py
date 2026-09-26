@@ -401,13 +401,33 @@ class DingTalkAdapter(BasePlatformAdapter):
         except (ValueError, OSError, TypeError):
             timestamp = datetime.now(tz=timezone.utc)
         logger.debug("[%s] Message from %s in %s: %s", self.name, sender_nick, chat_id[:20] if chat_id else "?", text[:80] if text else "(media)")
-        await self.handle_message(MessageEvent(text=text, message_type=msg_type, source=source, message_id=msg_id, raw_message=message,
-                                               media_urls=media_urls, media_types=media_types, timestamp=timestamp))
+        await self.handle_message(MessageEvent(
+            text=text,
+            message_type=msg_type,
+            source=source,
+            message_id=msg_id,
+            raw_message=message,
+            media_urls=media_urls,
+            media_types=media_types,
+            auto_skill=self._resolve_channel_skills(chat_id),
+            channel_prompt=self._resolve_channel_prompt(chat_id),
+            timestamp=timestamp,
+        ))
 
     _extract_text = staticmethod(extract_text)
 
     def _extract_media(self, message: "ChatbotMessage"):
         return extract_media(message)
+
+    def _resolve_channel_skills(self, chat_id: str) -> list[str] | None:
+        """Return auto-loaded skills bound to an exact DingTalk conversation id."""
+        from gateway.platforms.base import resolve_channel_skills
+        return resolve_channel_skills(self.config.extra, chat_id)
+
+    def _resolve_channel_prompt(self, chat_id: str) -> str | None:
+        """Return the ephemeral system prompt bound to an exact DingTalk conversation id."""
+        from gateway.platforms.base import resolve_channel_prompt
+        return resolve_channel_prompt(self.config.extra, chat_id)
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send a reply via AI Card (when configured) or DingTalk session webhook markdown."""
