@@ -159,3 +159,43 @@ def test_fresh_generation_avoids_heavy_session_resume(tmp_path, monkeypatch):
     assert "河马老师: Q1" in prompt
     assert "Moon: 40" in prompt
     assert "当前原始消息：继续" in prompt
+
+
+
+def test_gateway_injection_reuses_dual_identity_and_bootstraps_context_once(tmp_path, monkeypatch):
+    cfg_path = write_cfg(tmp_path)
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    cfg["gateway_inject_existing_session"] = True
+    cfg_path.write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
+
+    bridge = Bridge(cfg_path)
+    group = bridge.groups[0]
+    member = group.allowed_members["child-id"]
+    calls = []
+    context_calls = {"n": 0}
+
+    def recent(*_a, **_k):
+        context_calls["n"] += 1
+        return "河马老师: R2 求多少米？"
+
+    def inject(_home, params, *, timeout):
+        calls.append((dict(params), timeout))
+        return {"accepted": True, "response": "答对了。下一题"}
+
+    monkeypatch.setattr(bridge, "_recent_context", recent)
+    monkeypatch.setattr(
+        "scripts.dingtalk_free_response_bridge.inject_gateway_local_inbound", inject)
+
+    assert bridge._generate_reply(
+        group, member, "4000米", "2026-09-26 21:20:42", "m1") == "答对了。下一题"
+    assert calls[0][0]["user_id"] == "child-id"
+    assert calls[0][0]["user_id_alt"] == "hard-child-key"
+    assert calls[0][0]["skill"] == "math-skill"
+    assert calls[0][0]["force_context"] is True
+    assert calls[0][0]["recent_context"] == "河马老师: R2 求多少米？"
+
+    assert bridge._generate_reply(
+        group, member, "31.4", "2026-09-26 21:22:00", "m2") == "答对了。下一题"
+    assert calls[1][0]["force_context"] is False
+    assert calls[1][0]["recent_context"] == ""
+    assert context_calls["n"] == 1

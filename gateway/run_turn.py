@@ -45,6 +45,15 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+
+def _turn_presentation_muted(display_metadata, platform, user_config, source) -> bool:
+    """Mute a trusted local sidecar turn while preserving it as normal human input."""
+    return (
+        diagnostic_turn_muted(display_metadata, platform, user_config)
+        or bool(getattr(source, "_suppress_presentation", False))
+    )
+
+
 _tool_call_logger_lock = threading.Lock()
 
 
@@ -3139,8 +3148,8 @@ class GatewayTurnMixin:
             **{name: getattr(disp, name) for name in self._DISPLAY_TO_TURN_CTX}, **turn_params,
         )
         turn_runner = TurnRunner(self, turn_ctx)
-        turn_ctx.mute_notification_reply = diagnostic_turn_muted(
-            turn_ctx.persist_user_display_metadata, source.platform, turn_ctx.user_config)
+        turn_ctx.mute_notification_reply = _turn_presentation_muted(
+            turn_ctx.persist_user_display_metadata, source.platform, turn_ctx.user_config, source)
         # Agent tool-lifecycle callbacks live on the runner (bound methods, same signatures).
         turn_ctx.progress_callback = turn_runner.progress_callback
         turn_ctx.voice_ack_callback = turn_runner.voice_ack_callback
