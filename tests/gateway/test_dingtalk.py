@@ -550,6 +550,75 @@ class TestShouldProcessMessage:
         assert adapter._should_process_message(msg, "hi", is_group=True, chat_id="grp2") is False
 
 
+class TestChannelBindings:
+
+    def test_exact_chat_id_resolves_skill_and_prompt(self, monkeypatch):
+        adapter = _make_gating_adapter(
+            monkeypatch,
+            extra={
+                "channel_skill_bindings": [
+                    {"id": "math-room", "skills": ["jiayin-math-tutor"]},
+                    {"id": "physics-room", "skill": "jiayin-physics-tutor"},
+                ],
+                "channel_prompts": {
+                    "math-room": "learner_id=jiayin; subject=math",
+                    "physics-room": "learner_id=jiayin; subject=physics",
+                },
+            },
+        )
+
+        assert adapter._resolve_channel_skills("math-room") == ["jiayin-math-tutor"]
+        assert adapter._resolve_channel_prompt("math-room") == "learner_id=jiayin; subject=math"
+        assert adapter._resolve_channel_skills("physics-room") == ["jiayin-physics-tutor"]
+        assert adapter._resolve_channel_prompt("physics-room") == "learner_id=jiayin; subject=physics"
+        assert adapter._resolve_channel_skills("unknown-room") is None
+        assert adapter._resolve_channel_prompt("unknown-room") is None
+
+    @pytest.mark.asyncio
+    async def test_on_message_attaches_exact_channel_skill_and_prompt(self, monkeypatch):
+        adapter = _make_gating_adapter(
+            monkeypatch,
+            extra={
+                "require_mention": False,
+                "channel_skill_bindings": [
+                    {"id": "math-room", "skills": ["jiayin-math-tutor"]},
+                ],
+                "channel_prompts": {
+                    "math-room": "learner_id=jiayin; subject=math",
+                },
+            },
+        )
+        adapter._resolve_media_codes = AsyncMock()
+        adapter.handle_message = AsyncMock()
+
+        message = MagicMock()
+        message.message_id = "msg-1"
+        message.conversation_id = "math-room"
+        message.conversation_type = "2"
+        message.sender_id = "user-1"
+        message.sender_staff_id = "staff-1"
+        message.sender_nick = "Learner"
+        message.is_in_at_list = False
+        message.at_users = []
+        message.session_webhook = ""
+        message.session_webhook_expired_time = 0
+        message.create_at = 0
+        message.conversation_title = "display-name-does-not-route"
+        message.message_type = "text"
+        message.text = "开始"
+        message.rich_text = None
+        message.rich_text_content = None
+        message.image_content = None
+        message.extensions = {}
+
+        await adapter._on_message(message)
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.chat_id == "math-room"
+        assert event.auto_skill == ["jiayin-math-tutor"]
+        assert event.channel_prompt == "learner_id=jiayin; subject=math"
+
+
 # ---------------------------------------------------------------------------
 # _IncomingHandler.process — session_webhook extraction & fire-and-forget
 # ---------------------------------------------------------------------------
