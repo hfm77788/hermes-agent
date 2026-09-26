@@ -298,6 +298,36 @@ class TestBuildSkillsSystemPrompt:
 
 
 
+    def test_configured_compact_categories_preserve_skill_names(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+        (tmp_path / "config.yaml").write_text(
+            """
+skills:
+  compact_categories: [creative]
+  platform_compact_categories:
+    feishu: [devops]
+""".strip(), encoding="utf-8")
+        for category, name, desc in [
+            ("creative", "poster-maker", "Make polished posters"),
+            ("devops", "ops-helper", "Operate services safely"),
+            ("education", "math-tutor", "Teach mathematics"),
+        ]:
+            d = tmp_path / "skills" / category / name
+            d.mkdir(parents=True)
+            (d / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {desc}\n---\n", encoding="utf-8")
+        from agent import skill_utils
+        skill_utils._raw_config_cache_clear()
+
+        result = build_skills_system_prompt()
+
+        assert "poster-maker" in result and "Make polished posters" not in result
+        assert "ops-helper" in result and "Operate services safely" not in result
+        assert "math-tutor" in result and "Teach mathematics" in result
+        assert "[names only]" in result
+
+
     def test_excludes_disabled_skills(self, monkeypatch, tmp_path):
         """Skills in the user's disabled list should not appear in the system prompt."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

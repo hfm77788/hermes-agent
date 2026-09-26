@@ -5,6 +5,7 @@ from unittest.mock import patch
 import pytest
 
 from agent.skill_utils import (
+    get_compact_skill_categories,
     get_disabled_skill_names,
     get_external_skills_dirs,
     is_excluded_skill_path,
@@ -69,6 +70,33 @@ skills:
     ])["wiki.path"].endswith("/wiki")
     assert parse_count == 1
 
+
+
+
+def test_compact_skill_categories_union_global_and_platform(tmp_path, monkeypatch):
+    from agent import skill_utils
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        """
+skills:
+  compact_categories: [creative, productivity]
+  platform_compact_categories:
+    feishu: [devops]
+    dingtalk: [education]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    skill_utils._raw_config_cache_clear()
+
+    assert get_compact_skill_categories(platform="feishu") == {
+        "creative", "productivity", "devops"
+    }
+    assert get_compact_skill_categories(platform="dingtalk") == {
+        "creative", "productivity", "education"
+    }
 
 class TestParseConfigStringList:
     """#86661: `hermes config set` and JSON-mode editor saves store lists as
