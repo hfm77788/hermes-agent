@@ -341,7 +341,10 @@ def make_leg(root: Path, template_home: Path | None) -> Leg:
     _git("config", f"url.{origin}.insteadOf", OFFICIAL_URL, cwd=install)
     uv = _real_uv()
     py = H.WORKTREE / ".venv" / "bin" / "python"
-    base_python = str(Path(os.path.realpath(py))) if py.exists() else "python3"
+    # N-1's lock may target the floating 3.11 line rather than the exact patch
+    # used by the current E2E venv. Let uv select a compatible 3.11 interpreter
+    # for the release lock instead of forcing today's patch onto yesterday's lock.
+    base_python = "3.11"
     # The installer's tier 0: N-1's own uv.lock (hash-pinned, `--extra all`) into install/venv, with the
     # user's uv config hidden, so the N-1 venv is the one users of that release actually have.
     no_cfg = root / "uv-config"
