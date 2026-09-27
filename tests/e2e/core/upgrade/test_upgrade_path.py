@@ -364,7 +364,13 @@ def make_leg(root: Path, template_home: Path | None) -> Leg:
     # variables this fixture owns.
     uv_env = {k: v for k, v in os.environ.items() if not k.startswith("UV_") and k != "VIRTUAL_ENV"}
     uv_env.update(UV_PROJECT_ENVIRONMENT=str(install / "venv"), XDG_CONFIG_HOME=str(no_cfg), XDG_CONFIG_DIRS=str(no_cfg))
-    cp = subprocess.run([uv, "sync", "-q", "--locked", "--extra", "all", "--python", base_python], cwd=str(install),
+    # Let uv choose a managed interpreter satisfying the release's Python contract.
+    # Using a host 3.11 can make a multi-Python historical lock appear stale even
+    # when pyproject.toml and uv.lock are an exact release pair.
+    with (install / "pyproject.toml").open("rb") as manifest:
+        base_python = tomllib.load(manifest)["project"]["requires-python"]
+    cp = subprocess.run([uv, "sync", "-q", "--locked", "--extra", "all", "--managed-python",
+                         "--python", base_python], cwd=str(install),
                         env=uv_env, capture_output=True, text=True, timeout=1800)
     assert cp.returncode == 0, f"N-1 venv install from its uv.lock failed:\n{cp.stderr[-4000:]}"
     env_probe = H.isolated_env(root)
