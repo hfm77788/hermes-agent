@@ -108,8 +108,15 @@ def _refs() -> _Refs:
     """
     head = _git("rev-parse", "HEAD", cwd=H.WORKTREE)
     try:
-        tag = os.environ.get("HERMES_E2E_UPGRADE_BASE") or _git("describe", "--tags", "--abbrev=0", "HEAD~1",
-                                                                  cwd=H.WORKTREE)
+        # Fork main periodically merges an upstream release and then carries local commits.
+        # Plain `git describe` can select an older tag from a nearer side branch in that merge
+        # graph. Prefer the newest release tag that is actually an ancestor of HEAD.
+        tag = os.environ.get("HERMES_E2E_UPGRADE_BASE")
+        if not tag:
+            tags = _git("tag", "--merged", "HEAD~1", "--sort=-version:refname", "--list", "v2026.*", cwd=H.WORKTREE)
+            tag = next((t for t in tags.splitlines() if "+" not in t and "rc" not in t.lower()), "")
+            if not tag:
+                tag = _git("describe", "--tags", "--abbrev=0", "HEAD~1", cwd=H.WORKTREE)
         return _Refs(head, tag, _git("rev-parse", f"{tag}^{{commit}}", cwd=H.WORKTREE))
     except AssertionError:  # shallow CI checkout without tags
         return _Refs(head, "", "")

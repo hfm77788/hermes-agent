@@ -161,7 +161,10 @@ def _hung(timeout: float) -> Callable[[Ctx], Response]:
 
 SCENARIOS: list[Scenario] = [
     # provider faults that last forever: the turn must give up on its own
-    Scenario("provider_hang", lambda c: Hang()),
+    # A pure hang can consume the whole stale retry budget and legitimately trip the
+    # cross-turn breaker; verify the bounded/provider-free refusal rather than requiring
+    # a provider call that the breaker is specifically designed to prevent.
+    Scenario("provider_hang", lambda c: Hang(), probe="breaker"),
     # request_timeout LONG: only the explicit stale timeout can end it, and it must beat the
     # reasoning-model floor (#115024). The stale streak it leaves behind trips the cross-turn
     # stale breaker (#58962), so the PROBE must be refused at once, surfaced, and unbilled.
