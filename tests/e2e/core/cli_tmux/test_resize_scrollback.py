@@ -48,7 +48,7 @@ def test_resizes_keep_each_transcript_line_once_in_tmux_scrollback(tmp_path: Pat
     def transcript() -> str:
         return tmux("capture-pane", "-p", "-J", "-t", "p", "-S", "-", "-E", "-")
 
-    def wait_for(needle: str, timeout: float = 120.0) -> None:
+    def wait_for(needle: str, timeout: float = 60.0) -> None:
         end = time.monotonic() + timeout
         while needle not in transcript():
             assert time.monotonic() < end, f"{needle!r} never appeared:\n{transcript()[-3000:]}"

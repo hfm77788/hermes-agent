@@ -341,15 +341,14 @@ def make_leg(root: Path, template_home: Path | None) -> Leg:
     _git("config", f"url.{origin}.insteadOf", OFFICIAL_URL, cwd=install)
     uv = _real_uv()
     py = H.WORKTREE / ".venv" / "bin" / "python"
-    # N-1's lock may target the floating 3.11 line rather than the exact patch
-    # used by the current E2E venv. Let uv select a compatible 3.11 interpreter
-    # for the release lock instead of forcing today's patch onto yesterday's lock.
-    base_python = "3.11"
+    # Build N-1 with its own declared Python preference. The current checkout's
+    # CI interpreter is not part of the historical release contract.
+    base_python = (install / ".python-version").read_text(encoding="utf-8").strip()
     # The installer's tier 0: N-1's own uv.lock (hash-pinned, `--extra all`) into install/venv, with the
     # user's uv config hidden, so the N-1 venv is the one users of that release actually have.
     no_cfg = root / "uv-config"
     no_cfg.mkdir()
-    uv_env = {k: v for k, v in os.environ.items() if not k.startswith("UV_") and k != "VIRTUAL_ENV"}
+    uv_env = {k: v for k, v in os.environ.items() if k not in ("VIRTUAL_ENV", "UV_NO_CONFIG", "UV_CONFIG_FILE")}
     uv_env.update(UV_PROJECT_ENVIRONMENT=str(install / "venv"), XDG_CONFIG_HOME=str(no_cfg), XDG_CONFIG_DIRS=str(no_cfg))
     cp = subprocess.run([uv, "sync", "-q", "--locked", "--extra", "all", "--python", base_python], cwd=str(install),
                         env=uv_env, capture_output=True, text=True, timeout=1800)
