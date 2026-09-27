@@ -341,9 +341,10 @@ def make_leg(root: Path, template_home: Path | None) -> Leg:
     _git("config", f"url.{origin}.insteadOf", OFFICIAL_URL, cwd=install)
     uv = _real_uv()
     py = H.WORKTREE / ".venv" / "bin" / "python"
-    # Build N-1 with its own declared Python preference. The current checkout's
-    # CI interpreter is not part of the historical release contract.
-    base_python = (install / ".python-version").read_text(encoding="utf-8").strip()
+    # Build N-1 with its own declared Python preference. Read it from the N-1
+    # commit rather than the fixture clone: shared/bare fixture construction may
+    # omit dotfiles without changing the release commit being exercised.
+    base_python = _git("show", f"{_refs().base}:.python-version", cwd=H.WORKTREE).strip()
     # The installer's tier 0: N-1's own uv.lock (hash-pinned, `--extra all`) into install/venv, with the
     # user's uv config hidden, so the N-1 venv is the one users of that release actually have.
     no_cfg = root / "uv-config"
