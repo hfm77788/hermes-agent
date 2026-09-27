@@ -349,7 +349,7 @@ def make_leg(root: Path, template_home: Path | None) -> Leg:
     # user's uv config hidden, so the N-1 venv is the one users of that release actually have.
     no_cfg = root / "uv-config"
     no_cfg.mkdir()
-    uv_env = {k: v for k, v in os.environ.items() if k not in ("VIRTUAL_ENV", "UV_NO_CONFIG", "UV_CONFIG_FILE")}
+    uv_env = {k: v for k, v in os.environ.items() if not k.startswith("UV_") and k != "VIRTUAL_ENV"}
     uv_env.update(UV_PROJECT_ENVIRONMENT=str(install / "venv"), XDG_CONFIG_HOME=str(no_cfg), XDG_CONFIG_DIRS=str(no_cfg))
     cp = subprocess.run([uv, "sync", "-q", "--locked", "--extra", "all", "--python", base_python], cwd=str(install),
                         env=uv_env, capture_output=True, text=True, timeout=1800)
