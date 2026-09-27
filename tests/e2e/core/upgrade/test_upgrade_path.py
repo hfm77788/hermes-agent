@@ -51,6 +51,7 @@ import shutil
 import sqlite3
 import subprocess
 import time
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
@@ -108,8 +109,15 @@ def _refs() -> _Refs:
     """
     head = _git("rev-parse", "HEAD", cwd=H.WORKTREE)
     try:
-        tag = os.environ.get("HERMES_E2E_UPGRADE_BASE") or _git("describe", "--tags", "--abbrev=0", "HEAD~1",
-                                                                  cwd=H.WORKTREE)
+        # Fork main periodically merges an upstream release and then carries local commits.
+        # Plain `git describe` can select an older tag from a nearer side branch in that merge
+        # graph. Prefer the newest release tag that is actually an ancestor of HEAD.
+        tag = os.environ.get("HERMES_E2E_UPGRADE_BASE")
+        if not tag:
+            tags = _git("tag", "--merged", "HEAD~1", "--sort=-version:refname", "--list", "v2026.*", cwd=H.WORKTREE)
+            tag = next((t for t in tags.splitlines() if "+" not in t and "rc" not in t.lower()), "")
+            if not tag:
+                tag = _git("describe", "--tags", "--abbrev=0", "HEAD~1", cwd=H.WORKTREE)
         return _Refs(head, tag, _git("rev-parse", f"{tag}^{{commit}}", cwd=H.WORKTREE))
     except AssertionError:  # shallow CI checkout without tags
         return _Refs(head, "", "")
@@ -341,14 +349,29 @@ def make_leg(root: Path, template_home: Path | None) -> Leg:
     _git("config", f"url.{origin}.insteadOf", OFFICIAL_URL, cwd=install)
     uv = _real_uv()
     py = H.WORKTREE / ".venv" / "bin" / "python"
-    base_python = str(Path(os.path.realpath(py))) if py.exists() else "python3"
+    # Build N-1 with its declared Python preference when that release has one.
+    # Older supported releases predate .python-version; they require Python >=3.11,
+    # so use the CI lane's 3.11 contract rather than inventing a file in N-1.
+    cp = subprocess.run(["git", "show", f"{_refs().base}:.python-version"], cwd=H.WORKTREE,
+                        text=True, capture_output=True)
+    base_python = cp.stdout.strip() if cp.returncode == 0 and cp.stdout.strip() else "3.11"
     # The installer's tier 0: N-1's own uv.lock (hash-pinned, `--extra all`) into install/venv, with the
     # user's uv config hidden, so the N-1 venv is the one users of that release actually have.
     no_cfg = root / "uv-config"
     no_cfg.mkdir()
-    uv_env = {k: v for k, v in os.environ.items() if k not in ("VIRTUAL_ENV", "UV_NO_CONFIG", "UV_CONFIG_FILE")}
+    # CI exports UV_* knobs for the checkout under test (notably UV_PYTHON). They must
+    # not leak into the historical release: uv treats those as project inputs and can
+    # therefore judge an otherwise exact N-1 lock stale. Keep only the environment
+    # variables this fixture owns.
+    uv_env = {k: v for k, v in os.environ.items() if not k.startswith("UV_") and k != "VIRTUAL_ENV"}
     uv_env.update(UV_PROJECT_ENVIRONMENT=str(install / "venv"), XDG_CONFIG_HOME=str(no_cfg), XDG_CONFIG_DIRS=str(no_cfg))
-    cp = subprocess.run([uv, "sync", "-q", "--locked", "--extra", "all", "--python", base_python], cwd=str(install),
+    # Let uv choose a managed interpreter satisfying the release's Python contract.
+    # Using a host 3.11 can make a multi-Python historical lock appear stale even
+    # when pyproject.toml and uv.lock are an exact release pair.
+    with (install / "pyproject.toml").open("rb") as manifest:
+        base_python = tomllib.load(manifest)["project"]["requires-python"]
+    cp = subprocess.run([uv, "sync", "-q", "--locked", "--extra", "all", "--managed-python",
+                         "--python", base_python], cwd=str(install),
                         env=uv_env, capture_output=True, text=True, timeout=1800)
     assert cp.returncode == 0, f"N-1 venv install from its uv.lock failed:\n{cp.stderr[-4000:]}"
     env_probe = H.isolated_env(root)
