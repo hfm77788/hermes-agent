@@ -181,7 +181,7 @@ class TestBusySessionAck:
         if not content and call_kwargs.args:
             # positional args
             content = str(call_kwargs)
-        assert "Interrupting" in content or "respond" in content
+        assert "中断" in content or "interrupted" in content.lower()
         assert "/stop" not in content  # no need — we ARE interrupting
 
         # Verify agent interrupt was called
@@ -265,8 +265,8 @@ class TestBusySessionAck:
         agent.interrupt.assert_not_called()
         assert sk not in adapter._pending_messages
         content = adapter._send_with_retry.call_args.kwargs["content"]
-        assert "Steered" in content
-        assert "Queued" not in content
+        assert "并入当前任务" in content or "steered" in content.lower()
+        assert "消息已排队" not in content and "queued" not in content.lower()
 
 
     @pytest.mark.asyncio
@@ -296,8 +296,8 @@ class TestBusySessionAck:
         # Ack uses queue-mode wording (not steer, not interrupt)
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
-        assert "Queued for the next turn" in content
-        assert "Steered" not in content
+        assert "消息已排队" in content or "queued" in content.lower()
+        assert "并入当前任务" not in content and "steered" not in content.lower()
 
     @pytest.mark.asyncio
     async def test_steer_mode_falls_back_to_queue_when_agent_pending(self):
@@ -320,7 +320,7 @@ class TestBusySessionAck:
 
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
-        assert "Queued for the next turn" in content
+        assert "消息已排队" in content or "queued" in content.lower()
 
     @pytest.mark.asyncio
     async def test_interrupt_mode_text_followups_fifo_not_merged(self):
