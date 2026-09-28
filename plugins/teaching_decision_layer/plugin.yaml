@@ -1,0 +1,9 @@
+name: teaching_decision_layer
+version: 0.1.0
+description: "Teaching Decision Layer v1 for Hermes education profiles. Converts structured visual/learning evidence into bounded Jev probability judgments. Vision sees; Jev judges; the teacher model teaches. No raw image/OCR/student content is persisted."
+author: OpenAI + Hermes
+kind: standalone
+provides_tools:
+  - teaching_perception_judge
+  - teaching_pedagogy_judge
+  - teaching_decision_status
