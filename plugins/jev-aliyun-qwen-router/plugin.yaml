@@ -4,3 +4,5 @@ description: "Per-turn Jev routing for Alibaba Cloud Qwen3.8: dynamically select
 author: hfm77788
 requires_env:
   - TYPESAFE_API_KEY
+provides_middleware:
+  - llm_request
