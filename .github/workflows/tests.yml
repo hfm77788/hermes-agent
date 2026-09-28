@@ -276,7 +276,7 @@ jobs:
           # gateway liveness, delivery exactly-once through a real gateway,
           # the cron virtual-clock soak) legitimately run past the 300 s default.
           HERMES_TEST_FILE_TIMEOUT: ${{ github.event_name == 'pull_request' && '1800' || '900' }}
-          HERMES_TEST_WORKERS: ${{ github.event_name == 'pull_request' && '4' || '64' }}
+          HERMES_TEST_WORKERS: ${{ github.event_name == 'pull_request' && '2' || '64' }}
           # No automatic re-run of a failed file: the torture chamber and the
           # exactly-once/compaction suites are race detectors, and a rare
           # corruption that passes on retry is still a corruption.
@@ -300,6 +300,13 @@ jobs:
           # N-1 = `git describe --tags --abbrev=0 HEAD~1`.
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Fetch upstream release tags for real N-1
+        run: |
+          git fetch --force --no-tags --no-recurse-submodules \
+            https://github.com/NousResearch/hermes-agent.git \
+            '+refs/tags/v*:refs/tags/v*'
+          echo "Upgrade base: $(git describe --tags --abbrev=0 HEAD~1)"
 
       - name: Set up Node
         # `hermes update` builds the web UI / TUI workspaces.

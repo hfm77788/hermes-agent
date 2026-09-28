@@ -30,9 +30,9 @@ jobs:
     # cargo builds codegen units and test binaries in parallel across the
     # cores. This lane also builds the crate from the start when Cargo.toml
     # changes.
-    # PR correctness must not depend on scarce larger-runner capacity.
-    # Main retains the wider runner for faster post-merge validation.
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'ubuntu-latest-32-core' }}
+    # Keep this required lane on the standard pool. The larger-runner pool
+    # has shown multi-hour starvation and must not gate merges.
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     defaults:
       run:
