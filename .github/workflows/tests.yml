@@ -328,10 +328,12 @@ jobs:
           # fetching a manifest from raw.githubusercontent.com on EVERY job —
           # a transient fetch failure fails the whole job (2026-07-28 slice-5
           # incident). Pinned, the binary downloads directly; no manifest hop.
-          # Newer than the unit job's pin on purpose: 0.9.28 only knows CPython
-          # 3.11.14, whose bundled SQLite has the WAL-reset bug, so Hermes runs
-          # state.db in DELETE mode and the WAL torture chamber would skip.
-          version: "0.12.13"
+          # Upgrade E2E must install both HEAD and release N-1 from their
+          # committed lockfiles. uv 0.12.13 rejects v2026.9.24's otherwise
+          # valid lock as needing an update; 0.11.24 accepts both N-1 and HEAD.
+          # Python stays explicitly pinned to 3.11.15 below, so this does not
+          # reintroduce the old 3.11.14 / SQLite WAL-reset gap.
+          version: "0.11.24"
           # Persist uv's download/wheel cache (~/.cache/uv) across runs.
           # Keyed on the dependency manifests, so the cache is reused until
           # pyproject.toml or uv.lock changes. `uv sync` still runs every
