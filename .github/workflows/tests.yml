@@ -21,8 +21,11 @@ jobs:
     # 96 cores clear the floor that the slowest single test file sets (about
     # 82s). A second slice divides work that is already at that floor, and
     # adds a second setup.
-    runs-on: ubuntu-latest-96-core
-    timeout-minutes: 30
+    # PRs use the always-available standard runner; main keeps the larger
+    # runner for fast post-merge validation. Larger-runner capacity can queue
+    # indefinitely, so it must not be a merge-path dependency.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'ubuntu-latest-96-core' }}
+    timeout-minutes: 90
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -151,7 +154,10 @@ jobs:
           # across a 6x range. The suite has sufficient concurrency at this
           # size. The remaining time is the slowest files plus the setup.
           # Workers above the core count only add contention.
-          HERMES_TEST_WORKERS: 96
+          # Match concurrency to the runner class. Standard PR runners have
+          # far fewer cores; keeping 96 workers there creates contention and
+          # false timeouts without increasing coverage.
+          HERMES_TEST_WORKERS: ${{ github.event_name == 'pull_request' && '4' || '96' }}
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
@@ -169,8 +175,8 @@ jobs:
   e2e:
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
     # writer processes per test; a 4-vCPU runner serialises them into timeouts.
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 30
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'ubuntu-latest-32-core' }}
+    timeout-minutes: 90
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -269,7 +275,8 @@ jobs:
           # Multi-process episodes (torture chamber, compaction kill -9,
           # gateway liveness, delivery exactly-once through a real gateway,
           # the cron virtual-clock soak) legitimately run past the 300 s default.
-          HERMES_TEST_FILE_TIMEOUT: "900"
+          HERMES_TEST_FILE_TIMEOUT: ${{ github.event_name == 'pull_request' && '1800' || '900' }}
+          HERMES_TEST_WORKERS: ${{ github.event_name == 'pull_request' && '4' || '64' }}
           # No automatic re-run of a failed file: the torture chamber and the
           # exactly-once/compaction suites are race detectors, and a rare
           # corruption that passes on retry is still a corruption.
@@ -284,8 +291,8 @@ jobs:
     # autostash, killed mid-pull / mid-deps, offline), fresh-process import and
     # entrypoint smoke, and the config round-trip property matrix. Its own job:
     # it needs full history + tags, bubblewrap, and one file runs ~5-15 min.
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 60
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'ubuntu-latest-32-core' }}
+    timeout-minutes: 120
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -377,7 +384,8 @@ jobs:
           source .venv/bin/activate
           scripts/run_tests.sh --include-integration tests/e2e/core/upgrade
         env:
-          HERMES_TEST_FILE_TIMEOUT: "3000"
+          HERMES_TEST_FILE_TIMEOUT: ${{ github.event_name == 'pull_request' && '3600' || '3000' }}
+          HERMES_TEST_WORKERS: ${{ github.event_name == 'pull_request' && '2' || '64' }}
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""

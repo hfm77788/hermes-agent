@@ -52,7 +52,7 @@ jobs:
   os-tests:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -61,7 +61,10 @@ jobs:
             runner: macos-latest
             marker: macos_only
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            # Keep PR validation on the standard Windows pool so a larger
+            # runner shortage cannot block every merge. Main still uses the
+            # larger runner through the event-sensitive expression.
+            runner: ${{ github.event_name == 'pull_request' && 'windows-latest' || 'windows-latest-32-core' }}
             marker: windows_only
     steps:
       - name: Checkout code
