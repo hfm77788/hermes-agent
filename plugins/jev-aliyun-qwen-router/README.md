@@ -68,3 +68,10 @@ plugins:
 
 Only policy keys are overridable by a role policy; provider/model identity remains global.
 The cache is scoped by profile + turn id, and routing logs include `profile` and `policy`.
+
+### Central Jev credential
+
+When centralized profile policy is enabled, named profiles do **not** need their own copy of
+`TYPESAFE_API_KEY`. The router resolves that credential from the default Hermes root using a
+context-local home override and never persists it into the named profile. Legacy/non-centralized
+mode keeps the old profile-local environment behavior.

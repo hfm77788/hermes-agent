@@ -447,3 +447,23 @@ def test_turn_cache_is_scoped_by_profile(mod, monkeypatch):
     assert calls == ["default", "chief-engineer"]
     assert first["request"]["reasoning_effort"] == "low"
     assert second["request"]["reasoning_effort"] == "medium"
+
+
+
+def test_typesafe_key_legacy_mode_does_not_cross_profile_boundary(mod, monkeypatch):
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    assert mod._typesafe_key(centralized=False) == ""
+
+
+def test_route_passes_centralized_flag_to_jev_call(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_root_plugin_settings", _central_settings)
+    captured = {}
+
+    def fake(**kwargs):
+        captured["centralized"] = kwargs["centralized"]
+        return _response(effort="medium"), 1
+
+    monkeypatch.setattr(mod, "_call_jev", fake)
+    result = _route(mod, Ctx(), _request(), turn_id="central-secret-turn")
+    assert result is not None
+    assert captured["centralized"] is True

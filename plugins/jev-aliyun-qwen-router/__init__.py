@@ -381,8 +381,38 @@ def _probability(value: Any) -> float | None:
     return parsed
 
 
-def _call_jev(*, state: str, model: str, timeout: float) -> tuple[dict[str, Any], int]:
-    key = os.environ.get("TYPESAFE_API_KEY", "").strip()
+def _typesafe_key(*, centralized: bool) -> str:
+    """Resolve the Jev credential without copying it into every named profile.
+
+    Legacy mode keeps profile isolation: only the current process/profile environment is used.
+    Centralized profile-policy mode treats Jev as shared Decision Plane infrastructure and reads
+    the key from the default Hermes root under a context-local home override. The value is never
+    written into the named profile or process-global environment.
+    """
+    direct = os.environ.get("TYPESAFE_API_KEY", "").strip()
+    if direct or not centralized:
+        return direct
+    try:
+        from hermes_cli.config import get_env_value
+        from hermes_constants import (
+            get_default_hermes_root,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        token = set_hermes_home_override(get_default_hermes_root())
+        try:
+            return str(get_env_value("TYPESAFE_API_KEY") or "").strip()
+        finally:
+            reset_hermes_home_override(token)
+    except Exception:
+        return ""
+
+
+def _call_jev(
+    *, state: str, model: str, timeout: float, centralized: bool = False
+) -> tuple[dict[str, Any], int]:
+    key = _typesafe_key(centralized=centralized)
     if not key:
         raise RuntimeError("typesafe_key_missing")
     started = time.perf_counter()
@@ -567,6 +597,7 @@ def route_request(ctx: Any, **kwargs: Any) -> dict[str, Any] | None:
                 state=_state_payload(request, excerpt),
                 model=settings["jev_model"],
                 timeout=settings["timeout_seconds"],
+                centralized=settings["centralized_profile_policy"],
             )
             decision = _parse_route(
                 response,
