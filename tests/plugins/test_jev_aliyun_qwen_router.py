@@ -25,6 +25,7 @@ def _load_plugin():
 def mod():
     module = _load_plugin()
     module._TURN_CACHE.clear()
+    module._central_policy_settings = lambda: (None, "default", "local")
     return module
 
 
@@ -350,6 +351,94 @@ def test_manual_max_is_never_silently_downgraded(mod, monkeypatch):
     assert result["request"]["model"] == "qwen3.8-max-0902"
     assert result["request"]["reasoning_effort"] == "medium"
     assert result["reason"] == "max_medium"
+
+
+def test_central_policy_resolves_deep_role_without_profile_local_duplication(mod):
+    root = {
+        "providers": ["custom:aliyun_ws"],
+        "max_escalation_probability": 0.90,
+        "min_max_choice_confidence": 0.80,
+        "default_policy": "standard",
+        "profile_policies": {
+            "chief-engineer": "deep",
+            "hema-teacher": "deep",
+            "office-director": "deep",
+        },
+        "policies": {
+            "standard": {
+                "max_escalation_probability": 0.90,
+                "min_max_choice_confidence": 0.80,
+            },
+            "deep": {
+                "max_escalation_probability": 0.85,
+                "min_max_choice_confidence": 0.75,
+            },
+        },
+    }
+
+    deep, deep_name = mod._resolve_policy_settings(root, "chief-engineer")
+    standard, standard_name = mod._resolve_policy_settings(root, "worker-general")
+
+    assert deep_name == "deep"
+    assert deep["max_escalation_probability"] == 0.85
+    assert deep["min_max_choice_confidence"] == 0.75
+    assert standard_name == "standard"
+    assert standard["max_escalation_probability"] == 0.90
+    assert standard["min_max_choice_confidence"] == 0.80
+
+
+def test_central_policy_is_authoritative_over_profile_local_settings(mod, monkeypatch):
+    monkeypatch.setattr(
+        mod,
+        "_central_policy_settings",
+        lambda: (
+            {
+                "providers": ["custom:aliyun_ws"],
+                "max_escalation_probability": 0.85,
+                "min_max_choice_confidence": 0.75,
+            },
+            "chief-engineer",
+            "deep",
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_call_jev",
+        lambda **_: (
+            _response(
+                effort="xhigh",
+                confidence=0.96,
+                max_probability=0.86,
+                model_choice="max",
+                model_confidence=0.76,
+            ),
+            1,
+        ),
+    )
+    # Profile-local values deliberately disagree. Central root policy must win.
+    ctx = Ctx(
+        {
+            "max_escalation_probability": 0.99,
+            "min_max_choice_confidence": 0.99,
+        }
+    )
+    result = _route(mod, ctx, _request())
+
+    assert result["request"]["model"] == "qwen3.8-max-0902"
+    assert result["reason"] == "max_xhigh"
+
+
+def test_unknown_profile_policy_falls_back_to_default_policy(mod):
+    root = {
+        "default_policy": "standard",
+        "profile_policies": {"glass": "does-not-exist"},
+        "policies": {
+            "standard": {"max_escalation_probability": 0.90},
+        },
+    }
+    effective, policy_name = mod._resolve_policy_settings(root, "glass")
+    assert policy_name == "standard"
+    assert effective["max_escalation_probability"] == 0.90
 
 
 def test_custom_thresholds_and_models_are_honored(mod, monkeypatch):
