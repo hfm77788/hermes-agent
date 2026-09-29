@@ -83,7 +83,7 @@ def _response(
     }
 
 
-def _route(mod, ctx, request, *, turn_id="turn-1", provider="custom:aliyun_ws"):
+def _route(mod, ctx, request, *, turn_id="turn-1", provider="custom:aliyun_qwen"):
     return mod.route_request(
         ctx,
         request=request,
@@ -261,8 +261,16 @@ def test_only_latest_user_text_is_sent_and_secrets_are_force_redacted(mod, monke
 
 def test_wrong_provider_and_missing_turn_id_are_not_routed(mod, monkeypatch):
     monkeypatch.setattr(mod, "_call_jev", lambda **_: (_response(), 1))
-    assert _route(mod, Ctx(), _request(), provider="custom:aliyun_qwen") is None
+    assert _route(mod, Ctx(), _request(), provider="custom:aliyun_ws") is None
     assert _route(mod, Ctx(), _request(), turn_id="") is None
+
+
+def test_explicit_provider_list_can_enable_secondary_aliyun_endpoint(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_call_jev", lambda **_: (_response(effort="medium"), 1))
+    ctx = Ctx({"providers": ["custom:aliyun_qwen", "custom:aliyun_ws"]})
+    result = _route(mod, ctx, _request(), provider="custom:aliyun_ws")
+    assert result["request"]["model"] == "qwen3.8-flash"
+    assert result["request"]["reasoning_effort"] == "medium"
 
 
 def test_provider_default_medium_is_routeable_by_default(mod, monkeypatch):
