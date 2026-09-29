@@ -30,7 +30,7 @@ _TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone"
 _DEFAULT_JEV_MODEL = "jev-latest"
 _DEFAULT_FLASH_MODEL = "qwen3.8-flash"
 _DEFAULT_MAX_MODEL = "qwen3.8-max-0902"
-_DEFAULT_PROVIDER = "custom:aliyun_ws"
+_DEFAULT_PROVIDER = "custom:aliyun_qwen"
 _VALID_EFFORTS = frozenset({"low", "medium", "xhigh"})
 _CACHE_LIMIT = 512
 

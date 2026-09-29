@@ -20,7 +20,7 @@ Privacy boundary:
   provider configuration are not sent.
 
 Default production settings:
-- provider: custom:aliyun_ws
+- provider: custom:aliyun_qwen
 - flash_model: qwen3.8-flash
 - max_model: qwen3.8-max-0902
 - jev_model: jev-latest
