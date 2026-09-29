@@ -467,3 +467,29 @@ def test_route_passes_centralized_flag_to_jev_call(mod, monkeypatch):
     result = _route(mod, Ctx(), _request(), turn_id="central-secret-turn")
     assert result is not None
     assert captured["centralized"] is True
+
+
+
+def test_typesafe_key_centralized_reads_default_root_only(mod, monkeypatch):
+    import hermes_cli.config as config_mod
+    import hermes_constants as constants
+
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    seen = {}
+    fake_token = object()
+
+    monkeypatch.setattr(constants, "get_default_hermes_root", lambda: Path("/central/hermes"))
+
+    def set_override(path):
+        seen["set"] = str(path)
+        return fake_token
+
+    def reset_override(token):
+        seen["reset"] = token
+
+    monkeypatch.setattr(constants, "set_hermes_home_override", set_override)
+    monkeypatch.setattr(constants, "reset_hermes_home_override", reset_override)
+    monkeypatch.setattr(config_mod, "get_env_value", lambda key: "central-test-secret" if key == "TYPESAFE_API_KEY" else None)
+
+    assert mod._typesafe_key(centralized=True) == "central-test-secret"
+    assert seen == {"set": "/central/hermes", "reset": fake_token}
