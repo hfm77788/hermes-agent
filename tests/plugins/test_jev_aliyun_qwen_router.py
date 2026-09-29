@@ -83,11 +83,20 @@ def _response(
     }
 
 
-def _route(mod, ctx, request, *, turn_id="turn-1", provider="custom:aliyun_ws"):
+def _route(
+    mod,
+    ctx,
+    request,
+    *,
+    turn_id="turn-1",
+    provider="custom:aliyun_ws",
+    base_url="",
+):
     return mod.route_request(
         ctx,
         request=request,
         provider=provider,
+        base_url=base_url,
         api_mode="chat_completions",
         model=request.get("model", ""),
         turn_id=turn_id,
@@ -263,6 +272,51 @@ def test_wrong_provider_and_missing_turn_id_are_not_routed(mod, monkeypatch):
     monkeypatch.setattr(mod, "_call_jev", lambda **_: (_response(), 1))
     assert _route(mod, Ctx(), _request(), provider="custom:aliyun_qwen") is None
     assert _route(mod, Ctx(), _request(), turn_id="") is None
+
+
+def test_normalized_custom_provider_matches_allowlisted_configured_base_url(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_call_jev", lambda **_: (_response(effort="medium"), 1))
+    monkeypatch.setattr(
+        mod,
+        "_configured_provider_base_urls",
+        lambda: {"custom:aliyun_ws": "https://ws.example.com/compatible-mode/v1"},
+    )
+    result = _route(
+        mod,
+        Ctx(),
+        _request(),
+        provider="custom",
+        base_url="https://ws.example.com/compatible-mode/v1/",
+    )
+    assert result is not None
+    assert result["source"] == "jev-aliyun-qwen-router"
+    assert result["reason"] == "flash_medium"
+
+
+def test_normalized_custom_provider_rejects_other_custom_endpoint(mod, monkeypatch):
+    calls = []
+
+    def fake(**_):
+        calls.append(1)
+        return _response(effort="xhigh", max_probability=0.99), 1
+
+    monkeypatch.setattr(mod, "_call_jev", fake)
+    monkeypatch.setattr(
+        mod,
+        "_configured_provider_base_urls",
+        lambda: {
+            "custom:aliyun_ws": "https://ws.example.com/compatible-mode/v1",
+            "custom:aliyun_qwen": "https://beijing.example.com/compatible-mode/v1",
+        },
+    )
+    assert _route(
+        mod,
+        Ctx(),
+        _request(),
+        provider="custom",
+        base_url="https://beijing.example.com/compatible-mode/v1",
+    ) is None
+    assert calls == []
 
 
 def test_provider_default_medium_is_routeable_by_default(mod, monkeypatch):

@@ -162,6 +162,56 @@ def _settings(ctx: Any) -> dict[str, Any]:
     }
 
 
+def _normalized_base_url(value: Any) -> str:
+    return str(value or "").strip().rstrip("/")
+
+
+def _configured_provider_base_urls() -> dict[str, str]:
+    """Return non-secret configured custom-provider URLs keyed by provider id."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+    except Exception:
+        return {}
+    providers = config.get("providers") if isinstance(config, dict) else None
+    if not isinstance(providers, dict):
+        return {}
+    result: dict[str, str] = {}
+    for key, entry in providers.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        base_url = _normalized_base_url(entry.get("base_url"))
+        if base_url:
+            result[key.strip()] = base_url
+    return result
+
+
+def _provider_matches(
+    *, provider: str, base_url: str, allowed_providers: set[str]
+) -> bool:
+    """Match a normalized custom provider back to an allowlisted provider id.
+
+    Core normalizes named custom providers such as custom:aliyun_ws to provider=custom
+    before llm_request middleware. Exact ids still match directly; normalized custom
+    providers must also have a base URL identical to the configured allowlisted
+    provider, so another custom Qwen endpoint cannot accidentally inherit Max routing.
+    """
+    if provider in allowed_providers:
+        return True
+    if provider != "custom":
+        return False
+    runtime_base_url = _normalized_base_url(base_url)
+    if not runtime_base_url:
+        return False
+    configured = _configured_provider_base_urls()
+    return any(
+        key.startswith("custom:")
+        and configured.get(key) == runtime_base_url
+        for key in allowed_providers
+    )
+
+
 def _content_text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -395,9 +445,14 @@ def route_request(ctx: Any, **kwargs: Any) -> dict[str, Any] | None:
         return None
 
     provider = str(kwargs.get("provider") or "").strip()
+    base_url = str(kwargs.get("base_url") or "").strip()
     api_mode = str(kwargs.get("api_mode") or "").strip()
     active_model = str(request.get("model") or kwargs.get("model") or "").strip()
-    if provider not in settings["providers"] or api_mode != "chat_completions":
+    if not _provider_matches(
+        provider=provider,
+        base_url=base_url,
+        allowed_providers=settings["providers"],
+    ) or api_mode != "chat_completions":
         return None
     if active_model not in {settings["flash_model"], settings["max_model"]}:
         return None
