@@ -33,3 +33,38 @@ Default production settings:
 - respect_manual_max: true
 
 The plugin is opt-in through plugins.enabled and requires TYPESAFE_API_KEY.
+
+## Centralized profile policy
+
+Set `centralized_profile_policy: true` in the **default/root** plugin settings to make the
+root config the single routing-policy authority for every Hermes profile. Named profiles still
+own their operational credentials and provider definitions, but local router settings no longer
+change model policy.
+
+Example:
+
+```yaml
+plugins:
+  entries:
+    jev-aliyun-qwen-router:
+      settings:
+        centralized_profile_policy: true
+        providers: [custom:aliyun_ws]
+        flash_model: qwen3.8-flash
+        max_model: qwen3.8-max-0902
+        max_escalation_probability: 0.90
+        min_max_choice_confidence: 0.80
+        default_policy: standard
+        profile_policies:
+          chief-engineer: deep
+          hema-teacher: deep
+          office-director: deep
+        policies:
+          standard:
+            min_reasoning_effort: low
+          deep:
+            min_reasoning_effort: medium
+```
+
+Only policy keys are overridable by a role policy; provider/model identity remains global.
+The cache is scoped by profile + turn id, and routing logs include `profile` and `policy`.
