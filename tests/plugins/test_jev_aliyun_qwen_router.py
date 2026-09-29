@@ -22,9 +22,11 @@ def _load_plugin():
 
 
 @pytest.fixture()
-def mod():
+def mod(monkeypatch):
     module = _load_plugin()
     module._TURN_CACHE.clear()
+    monkeypatch.setattr(module, "_root_plugin_settings", lambda: {})
+    monkeypatch.setattr(module, "_active_profile_name", lambda: "default")
     return module
 
 
@@ -370,3 +372,124 @@ def test_custom_thresholds_and_models_are_honored(mod, monkeypatch):
     result = _route(mod, ctx, request)
     assert result["request"]["model"] == "qwen-max-custom"
     assert result["request"]["reasoning_effort"] == "medium"
+
+
+
+def _central_settings():
+    return {
+        "centralized_profile_policy": True,
+        "providers": ["custom:aliyun_ws"],
+        "flash_model": "qwen3.8-flash",
+        "max_model": "qwen3.8-max-0902",
+        "min_effort_confidence": 0.50,
+        "max_escalation_probability": 0.90,
+        "min_max_choice_confidence": 0.80,
+        "default_policy": "standard",
+        "profile_policies": {
+            "chief-engineer": "deep",
+            "hema-teacher": "deep",
+            "office-director": "deep",
+        },
+        "policies": {
+            "standard": {"min_reasoning_effort": "low"},
+            "deep": {"min_reasoning_effort": "medium"},
+        },
+    }
+
+
+def test_central_policy_applies_profile_effort_floor_and_ignores_local_settings(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_root_plugin_settings", _central_settings)
+    monkeypatch.setattr(mod, "_active_profile_name", lambda: "chief-engineer")
+    monkeypatch.setattr(mod, "_call_jev", lambda **_: (_response(effort="low"), 1))
+    local = Ctx({"flash_model": "wrong-local-model", "min_reasoning_effort": "xhigh"})
+    result = _route(mod, local, _request(), turn_id="deep-turn")
+    assert result["request"]["model"] == "qwen3.8-flash"
+    assert result["request"]["reasoning_effort"] == "medium"
+    assert result["reason"] == "flash_medium"
+
+
+def test_central_policy_default_profile_keeps_low_effort(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_root_plugin_settings", _central_settings)
+    monkeypatch.setattr(mod, "_active_profile_name", lambda: "worker-general")
+    monkeypatch.setattr(mod, "_call_jev", lambda **_: (_response(effort="low"), 1))
+    result = _route(mod, Ctx(), _request(), turn_id="standard-turn")
+    assert result["request"]["reasoning_effort"] == "low"
+    assert result["reason"] == "flash_low"
+
+
+def test_central_policy_preserves_same_max_gate_for_deep_role(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_root_plugin_settings", _central_settings)
+    monkeypatch.setattr(mod, "_active_profile_name", lambda: "office-director")
+    monkeypatch.setattr(
+        mod,
+        "_call_jev",
+        lambda **_: (_response(effort="xhigh", max_probability=0.89, model_choice="max"), 1),
+    )
+    result = _route(mod, Ctx(), _request(), turn_id="deep-gray-zone")
+    assert result["request"]["model"] == "qwen3.8-flash"
+    assert result["request"]["reasoning_effort"] == "xhigh"
+
+
+def test_turn_cache_is_scoped_by_profile(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_root_plugin_settings", _central_settings)
+    active = {"profile": "default"}
+    monkeypatch.setattr(mod, "_active_profile_name", lambda: active["profile"])
+    calls = []
+
+    def fake(**_):
+        calls.append(active["profile"])
+        return _response(effort="low"), 1
+
+    monkeypatch.setattr(mod, "_call_jev", fake)
+    first = _route(mod, Ctx(), _request(), turn_id="shared-turn")
+    active["profile"] = "chief-engineer"
+    second = _route(mod, Ctx(), _request(), turn_id="shared-turn")
+    assert calls == ["default", "chief-engineer"]
+    assert first["request"]["reasoning_effort"] == "low"
+    assert second["request"]["reasoning_effort"] == "medium"
+
+
+
+def test_typesafe_key_legacy_mode_does_not_cross_profile_boundary(mod, monkeypatch):
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    assert mod._typesafe_key(centralized=False) == ""
+
+
+def test_route_passes_centralized_flag_to_jev_call(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_root_plugin_settings", _central_settings)
+    captured = {}
+
+    def fake(**kwargs):
+        captured["centralized"] = kwargs["centralized"]
+        return _response(effort="medium"), 1
+
+    monkeypatch.setattr(mod, "_call_jev", fake)
+    result = _route(mod, Ctx(), _request(), turn_id="central-secret-turn")
+    assert result is not None
+    assert captured["centralized"] is True
+
+
+
+def test_typesafe_key_centralized_reads_default_root_only(mod, monkeypatch):
+    import hermes_cli.config as config_mod
+    import hermes_constants as constants
+
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    seen = {}
+    fake_token = object()
+
+    monkeypatch.setattr(constants, "get_default_hermes_root", lambda: Path("/central/hermes"))
+
+    def set_override(path):
+        seen["set"] = str(path)
+        return fake_token
+
+    def reset_override(token):
+        seen["reset"] = token
+
+    monkeypatch.setattr(constants, "set_hermes_home_override", set_override)
+    monkeypatch.setattr(constants, "reset_hermes_home_override", reset_override)
+    monkeypatch.setattr(config_mod, "get_env_value", lambda key: "central-test-secret" if key == "TYPESAFE_API_KEY" else None)
+
+    assert mod._typesafe_key(centralized=True) == "central-test-secret"
+    assert seen == {"set": "/central/hermes", "reset": fake_token}

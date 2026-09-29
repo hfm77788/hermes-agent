@@ -32,6 +32,14 @@ _DEFAULT_FLASH_MODEL = "qwen3.8-flash"
 _DEFAULT_MAX_MODEL = "qwen3.8-max-0902"
 _DEFAULT_PROVIDER = "custom:aliyun_ws"
 _VALID_EFFORTS = frozenset({"low", "medium", "xhigh"})
+_EFFORT_RANK = {"low": 0, "medium": 1, "xhigh": 2}
+_PROFILE_POLICY_OVERRIDE_KEYS = frozenset({
+    "min_effort_confidence",
+    "max_escalation_probability",
+    "min_max_choice_confidence",
+    "min_reasoning_effort",
+    "allow_max",
+})
 _CACHE_LIMIT = 512
 
 _CACHE_LOCK = threading.Lock()
@@ -127,38 +135,110 @@ def _as_bool(value: Any, default: bool) -> bool:
     return default
 
 
+def _active_profile_name() -> str:
+    try:
+        from hermes_constants import get_hermes_home, profile_name_for_home
+
+        return profile_name_for_home(get_hermes_home()) or "default"
+    except Exception:
+        return "default"
+
+
+def _root_plugin_settings() -> dict[str, Any]:
+    """Read this plugin's central settings from the default Hermes root.
+
+    Named profiles keep their own operational config, but model-routing policy has one
+    authority at the root. The context-local home override makes this safe inside the
+    multiplex gateway without mutating process-global HERMES_HOME.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_constants import (
+            get_default_hermes_root,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        token = set_hermes_home_override(get_default_hermes_root())
+        try:
+            config = load_config_readonly() or {}
+        finally:
+            reset_hermes_home_override(token)
+    except Exception:
+        return {}
+    if not isinstance(config, dict):
+        return {}
+    plugins = config.get("plugins")
+    entries = plugins.get("entries") if isinstance(plugins, dict) else None
+    entry = entries.get("jev-aliyun-qwen-router") if isinstance(entries, dict) else None
+    settings = entry.get("settings") if isinstance(entry, dict) else None
+    return dict(settings) if isinstance(settings, dict) else {}
+
+
 def _settings(ctx: Any) -> dict[str, Any]:
-    providers = ctx.get_config("providers", [_DEFAULT_PROVIDER])
+    root_settings = _root_plugin_settings()
+    centralized = _as_bool(root_settings.get("centralized_profile_policy"), False)
+    profile = _active_profile_name()
+
+    if centralized:
+        source = root_settings
+        default_policy = str(source.get("default_policy") or "standard").strip() or "standard"
+        profile_policies = source.get("profile_policies")
+        if not isinstance(profile_policies, dict):
+            profile_policies = {}
+        policy_name = str(profile_policies.get(profile) or default_policy).strip() or default_policy
+        policies = source.get("policies")
+        if not isinstance(policies, dict):
+            policies = {}
+        candidate = policies.get(policy_name)
+        policy = candidate if isinstance(candidate, dict) else {}
+
+        def value(key: str, default: Any) -> Any:
+            if key in _PROFILE_POLICY_OVERRIDE_KEYS and key in policy:
+                return policy[key]
+            return source.get(key, default)
+    else:
+        policy_name = "legacy"
+        policy = {}
+
+        def value(key: str, default: Any) -> Any:
+            return ctx.get_config(key, default)
+
+    providers = value("providers", [_DEFAULT_PROVIDER])
     if isinstance(providers, str):
         providers = [part.strip() for part in providers.split(",") if part.strip()]
     if not isinstance(providers, list):
         providers = [_DEFAULT_PROVIDER]
     providers = [str(item).strip() for item in providers if str(item).strip()]
+
+    min_reasoning_effort = str(value("min_reasoning_effort", "low") or "low").strip().lower()
+    if min_reasoning_effort not in _VALID_EFFORTS:
+        min_reasoning_effort = "low"
+
     return {
-        "enabled": _as_bool(ctx.get_config("enabled", True), True),
+        "enabled": _as_bool(value("enabled", True), True),
         "providers": set(providers or [_DEFAULT_PROVIDER]),
-        "flash_model": str(ctx.get_config("flash_model", _DEFAULT_FLASH_MODEL) or _DEFAULT_FLASH_MODEL).strip(),
-        "max_model": str(ctx.get_config("max_model", _DEFAULT_MAX_MODEL) or _DEFAULT_MAX_MODEL).strip(),
-        "jev_model": str(ctx.get_config("jev_model", _DEFAULT_JEV_MODEL) or _DEFAULT_JEV_MODEL).strip(),
-        "timeout_seconds": _as_float(ctx.get_config("timeout_seconds", 1.5), 1.5, low=0.2, high=10.0),
+        "flash_model": str(value("flash_model", _DEFAULT_FLASH_MODEL) or _DEFAULT_FLASH_MODEL).strip(),
+        "max_model": str(value("max_model", _DEFAULT_MAX_MODEL) or _DEFAULT_MAX_MODEL).strip(),
+        "jev_model": str(value("jev_model", _DEFAULT_JEV_MODEL) or _DEFAULT_JEV_MODEL).strip(),
+        "timeout_seconds": _as_float(value("timeout_seconds", 1.5), 1.5, low=0.2, high=10.0),
         "min_effort_confidence": _as_float(
-            ctx.get_config("min_effort_confidence", 0.50), 0.50, low=0.0, high=1.0
+            value("min_effort_confidence", 0.50), 0.50, low=0.0, high=1.0
         ),
         "max_escalation_probability": _as_float(
-            ctx.get_config("max_escalation_probability", 0.90), 0.90, low=0.5, high=1.0
+            value("max_escalation_probability", 0.90), 0.90, low=0.5, high=1.0
         ),
         "min_max_choice_confidence": _as_float(
-            ctx.get_config("min_max_choice_confidence", 0.80), 0.80, low=0.0, high=1.0
+            value("min_max_choice_confidence", 0.80), 0.80, low=0.0, high=1.0
         ),
-        "max_excerpt_chars": _as_int(ctx.get_config("max_excerpt_chars", 2400), 2400, low=128, high=8000),
-        # The custom provider injects its automatic default reasoning_effort=medium
-        # before llm_request middleware. This router must be allowed to replace that
-        # default, otherwise it would never activate in production. Operators who
-        # intentionally pin an effort can opt back into respect mode.
-        "respect_existing_reasoning": _as_bool(
-            ctx.get_config("respect_existing_reasoning", False), False
-        ),
-        "respect_manual_max": _as_bool(ctx.get_config("respect_manual_max", True), True),
+        "max_excerpt_chars": _as_int(value("max_excerpt_chars", 2400), 2400, low=128, high=8000),
+        "respect_existing_reasoning": _as_bool(value("respect_existing_reasoning", False), False),
+        "respect_manual_max": _as_bool(value("respect_manual_max", True), True),
+        "min_reasoning_effort": min_reasoning_effort,
+        "allow_max": _as_bool(value("allow_max", True), True),
+        "centralized_profile_policy": centralized,
+        "profile": profile,
+        "policy_name": policy_name,
     }
 
 
@@ -301,8 +381,38 @@ def _probability(value: Any) -> float | None:
     return parsed
 
 
-def _call_jev(*, state: str, model: str, timeout: float) -> tuple[dict[str, Any], int]:
-    key = os.environ.get("TYPESAFE_API_KEY", "").strip()
+def _typesafe_key(*, centralized: bool) -> str:
+    """Resolve the Jev credential without copying it into every named profile.
+
+    Legacy mode keeps profile isolation: only the current process/profile environment is used.
+    Centralized profile-policy mode treats Jev as shared Decision Plane infrastructure and reads
+    the key from the default Hermes root under a context-local home override. The value is never
+    written into the named profile or process-global environment.
+    """
+    direct = os.environ.get("TYPESAFE_API_KEY", "").strip()
+    if direct or not centralized:
+        return direct
+    try:
+        from hermes_cli.config import get_env_value
+        from hermes_constants import (
+            get_default_hermes_root,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        token = set_hermes_home_override(get_default_hermes_root())
+        try:
+            return str(get_env_value("TYPESAFE_API_KEY") or "").strip()
+        finally:
+            reset_hermes_home_override(token)
+    except Exception:
+        return ""
+
+
+def _call_jev(
+    *, state: str, model: str, timeout: float, centralized: bool = False
+) -> tuple[dict[str, Any], int]:
+    key = _typesafe_key(centralized=centralized)
     if not key:
         raise RuntimeError("typesafe_key_missing")
     started = time.perf_counter()
@@ -364,14 +474,20 @@ def _parse_route(
     # An explicit manual Max selection is never silently downgraded.
     manual_max = settings["respect_manual_max"] and active == max_model
     should_max = (
-        model_choice == "max"
+        settings["allow_max"]
+        and model_choice == "max"
         and max_probability >= settings["max_escalation_probability"]
         and model_confidence >= settings["min_max_choice_confidence"]
     )
 
-    # Contradictory "low effort but Max required" judgments are treated as uncertain.
+    # Contradictory "low effort but Max required" judgments are treated as uncertain
+    # before a role policy applies its minimum effort floor.
     if should_max and effort == "low" and not manual_max:
         return None
+
+    minimum_effort = settings["min_reasoning_effort"]
+    if _EFFORT_RANK[effort] < _EFFORT_RANK[minimum_effort]:
+        effort = minimum_effort
 
     model = max_model if (manual_max or should_max) else flash_model
     tier = ("max_" if model == max_model else "flash_") + effort
@@ -464,7 +580,8 @@ def route_request(ctx: Any, **kwargs: Any) -> dict[str, Any] | None:
         # Stable per-turn binding is a hard requirement; do not make uncached routing calls.
         return None
 
-    cached, decision = _cache_get(turn_id)
+    cache_key = f"{settings['profile']}::{turn_id}"
+    cached, decision = _cache_get(cache_key)
     if cached and decision is None:
         return None
 
@@ -473,13 +590,14 @@ def route_request(ctx: Any, **kwargs: Any) -> dict[str, Any] | None:
         user_text = _latest_user_text(request)
         excerpt = _redacted_excerpt(user_text, settings["max_excerpt_chars"])
         if not excerpt:
-            _cache_put(turn_id, None)
+            _cache_put(cache_key, None)
             return None
         try:
             response, latency_ms = _call_jev(
                 state=_state_payload(request, excerpt),
                 model=settings["jev_model"],
                 timeout=settings["timeout_seconds"],
+                centralized=settings["centralized_profile_policy"],
             )
             decision = _parse_route(
                 response,
@@ -492,18 +610,20 @@ def route_request(ctx: Any, **kwargs: Any) -> dict[str, Any] | None:
                 "jev-aliyun-qwen-router: Jev unavailable; leaving request unchanged (%s)",
                 type(exc).__name__,
             )
-            _cache_put(turn_id, None)
+            _cache_put(cache_key, None)
             return None
         if decision is None:
-            _cache_put(turn_id, None)
+            _cache_put(cache_key, None)
             return None
-        _cache_put(turn_id, decision)
+        _cache_put(cache_key, decision)
         fresh_decision = True
 
     rewritten = _apply_decision(request, decision)
     if fresh_decision:
         logger.info(
-            "jev-aliyun-qwen-router: tier=%s effort_conf=%.3f model_conf=%.3f max_p=%.3f latency_ms=%d",
+            "jev-aliyun-qwen-router: profile=%s policy=%s tier=%s effort_conf=%.3f model_conf=%.3f max_p=%.3f latency_ms=%d",
+            settings["profile"],
+            settings["policy_name"],
             decision.tier,
             decision.effort_confidence,
             decision.model_choice_confidence,
