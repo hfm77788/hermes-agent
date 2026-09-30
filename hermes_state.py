@@ -72,6 +72,7 @@ from hermes_state_repair import _claim_repair_attempt, preflight_db_writability,
 from hermes_state_titles import SessionTitlesMixin
 from hermes_state_usage import SessionUsageMixin
 from hermes_state_maintenance import SessionMaintenanceMixin
+from hermes_state_cold_archive import SessionColdArchiveMixin
 from hermes_state_gateway import SessionGatewayMixin
 from hermes_state_compression import SessionCompressionMixin
 from hermes_state_search import SessionSearchMixin
@@ -451,7 +452,7 @@ def _foreign_state_db_holders(db_path: Path) -> List[Tuple[int, str]]:
 class SessionDB(
     SessionSessionsMixin, SessionFtsSetupMixin, SessionSearchMixin, SessionSchemaMixin,
     SessionPortabilityMixin, SessionTelegramTopicsMixin, SessionCompressionMixin,
-    SessionGatewayMixin, SessionMaintenanceMixin, SessionUsageMixin, SessionTitlesMixin,
+    SessionGatewayMixin, SessionMaintenanceMixin, SessionColdArchiveMixin, SessionUsageMixin, SessionTitlesMixin,
     SessionMessagesMixin, SessionRewindMixin, SessionProfileRepairMixin,
 ):
     """SQLite-backed session storage with FTS5 search; many reader threads, one writer (WAL)."""

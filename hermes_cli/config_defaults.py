@@ -2248,6 +2248,15 @@ DEFAULT_CONFIG = {
         "auto_archive": False,
         # Idle days before auto-archive hides a session (only when auto_archive is true).
         "auto_archive_days": 3,
+        # Move old standalone archived sessions into checksummed compressed cold bundles before
+        # removing them from the hot SQLite store. Conservative upstream default is OFF; enabling
+        # this preserves canonical restore payload + full audit history under session-archive/.
+        "auto_cold_archive": False,
+        # Inactivity threshold for cold storage. v1 only moves ended, archived, unpinned,
+        # standalone sessions (no parent/children) and fails closed on live write guards.
+        "cold_archive_days": 90,
+        # Independent throttle for cold storage, so it is not coupled to prune cadence.
+        "cold_archive_min_interval_hours": 24,
         # VACUUM after a prune that deleted rows (SQLite never reclaims disk on DELETE). VACUUM
         # blocks writes (~seconds per 100MB), so it runs only at startup, only when ≥1 session was
         # deleted AND freelist/page_count > 25%.
