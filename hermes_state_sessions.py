@@ -1544,14 +1544,20 @@ class SessionSessionsMixin:
         self, session_id: str, sessions_dir: Optional[Path] = None,
         expected_delete_ids: Optional[List[str]] = None,
         expected_display_messages: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+        reject_active_write_guards: bool = False,
     ) -> bool:
         """Delete a session and its messages; delegate children cascade, branch/compression children
         are orphaned. Optional expected ids fence delegate drift; expected display snapshots fence
-        transcript drift. Both checks run inside the same write transaction as deletion."""
+        transcript drift. reject_active_write_guards also refuses a live turn/compression holder.
+        Every enabled check runs inside the same write transaction as deletion."""
         removed_ids: List[str] = []
         expected_ids = set(expected_delete_ids) if expected_delete_ids is not None else None
         def _do(conn):
             if conn.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)).fetchone() is None:
+                return False
+            if reject_active_write_guards and self._write_guards_reject(
+                conn, session_id, allow_closed_compression_parent=True
+            ):
                 return False
             if expected_ids is not None and expected_ids != {
                 session_id, *_collect_delegate_child_ids(conn, [session_id])
