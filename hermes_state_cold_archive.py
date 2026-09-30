@@ -399,8 +399,13 @@ class SessionColdArchiveMixin:
                 _sha256(snap["payload_bytes"]) != entry.get("payload_sha256")
                 or _sha256(snap["history_bytes"]) != entry.get("history_sha256")
             ):
-                result["skipped"].append({"session_id": sid, "reason": "existing_archive_stale"})
-                result["ok"] = False
+                # A previously verified cold copy can become stale if the hot row changed
+                # after the bundle was written but before its guarded delete completed.
+                # Do not strand that session in the hot store forever: write a new immutable
+                # revision from the current snapshot, verify it, then let the ordinary
+                # archive-before-delete fences decide whether deletion is still safe.
+                # _cold_index() already resolves the newest bundle per session id for restore.
+                new_items.append((sid, snap))
                 continue
             if self._delete_cold_snapshot(sid, snap, sessions_dir=sessions_dir):
                 result["deleted"] += 1

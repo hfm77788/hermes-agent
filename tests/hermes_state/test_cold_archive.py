@@ -151,6 +151,38 @@ def test_rerun_reuses_existing_bundle_instead_of_duplicate(tmp_path, db, monkeyp
     assert len(list(archive_dir.glob("*.cold.zip"))) == 1
 
 
+def test_stale_verified_archive_is_superseded_by_new_revision(tmp_path, db, monkeypatch):
+    archive_dir = tmp_path / "cold"
+    _old_archived(db, "stale-revision")
+
+    original_delete = db._delete_cold_snapshot
+    monkeypatch.setattr(db, "_delete_cold_snapshot", lambda *a, **k: False)
+    first = db.cold_archive(older_than_days=90, archive_dir=archive_dir)
+    assert first["deleted"] == 0
+    assert len(list(archive_dir.glob("*.cold.zip"))) == 1
+    assert db.get_session("stale-revision") is not None
+
+    # Simulate a safe post-bundle metadata update while preserving old inactivity.
+    db._conn.execute(
+        "UPDATE sessions SET title=? WHERE id=?",
+        ("newer title", "stale-revision"),
+    )
+    db._conn.commit()
+
+    monkeypatch.setattr(db, "_delete_cold_snapshot", original_delete)
+    second = db.cold_archive(older_than_days=90, archive_dir=archive_dir)
+
+    assert second["ok"] is True
+    assert second["deleted"] == 1
+    assert len(second["bundles"]) == 1
+    assert len(list(archive_dir.glob("*.cold.zip"))) == 2
+    assert db.get_session("stale-revision") is None
+
+    restored = db.cold_restore("stale-revision", archive_dir=archive_dir)
+    assert restored["ok"] is True
+    assert db.get_session("stale-revision")["title"] == "newer title"
+
+
 def test_live_turn_guard_excludes_candidate(tmp_path, db):
     archive_dir = tmp_path / "cold"
     _old_archived(db, "leased")
