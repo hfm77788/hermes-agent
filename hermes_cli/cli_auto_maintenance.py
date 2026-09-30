@@ -60,6 +60,8 @@ def _run_state_db_auto_maintenance(session_db) -> None:
                 older_than_days=int(cfg.get("cold_archive_days", 90)),
                 min_interval_hours=int(cfg.get("cold_archive_min_interval_hours", 24)),
                 sessions_dir=_hermes_home_maint / "sessions",
+                vacuum=bool(cfg.get("vacuum_after_prune", True)),
+                min_vacuum_interval_days=int(cfg.get("min_vacuum_interval_days", 30)),
             )
 
         if not cfg.get("auto_prune", False):
