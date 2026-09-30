@@ -185,6 +185,32 @@ def test_stale_verified_archive_is_superseded_by_new_revision(tmp_path, db, monk
     assert db.get_session("stale-revision")["title"] == "newer title"
 
 
+def test_mutating_cold_archive_serializes_on_maintenance_lock(tmp_path, db):
+    archive_dir = tmp_path / "cold"
+    _old_archived(db, "serialized")
+
+    import hermes_state_repair
+
+    held = hermes_state_repair._try_acquire_auto_maintenance_lock(db.db_path)
+    assert held is not None
+    try:
+        blocked = db.cold_archive(older_than_days=90, archive_dir=archive_dir)
+        assert blocked["ok"] is False
+        assert blocked["deleted"] == 0
+        assert blocked["skipped"] == [
+            {"session_id": None, "reason": "maintenance_lock_busy"}
+        ]
+        assert db.get_session("serialized") is not None
+        assert not archive_dir.exists()
+
+        preview = db.cold_archive(
+            older_than_days=90, dry_run=True, archive_dir=archive_dir
+        )
+        assert preview["candidate_ids"] == ["serialized"]
+    finally:
+        hermes_state_repair._release_auto_maintenance_lock(held)
+
+
 def test_live_turn_guard_excludes_candidate(tmp_path, db):
     archive_dir = tmp_path / "cold"
     _old_archived(db, "leased")

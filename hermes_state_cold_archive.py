@@ -347,10 +347,45 @@ class SessionColdArchiveMixin:
         sessions_dir: Optional[Path] = None,
         archive_dir: Optional[Path] = None,
         limit: Optional[int] = None,
+        _maintenance_lock_held: bool = False,
     ) -> Dict[str, Any]:
-        """Archive old standalone sessions and then remove verified copies from hot SQLite."""
+        """Archive old standalone sessions and then remove verified copies from hot SQLite.
+
+        Mutating runs serialize through the existing cross-process state.db maintenance
+        lock. Dry-runs remain read-only and lock-free. Internal auto-maintenance callers
+        that already hold the same lock pass _maintenance_lock_held=True.
+        """
         if older_than_days is None or older_than_days < 0:
             raise ValueError("older_than_days must be >= 0")
+        if not dry_run and not _maintenance_lock_held:
+            from hermes_state_repair import (
+                _release_auto_maintenance_lock,
+                _try_acquire_auto_maintenance_lock,
+            )
+            lock = _try_acquire_auto_maintenance_lock(self.db_path)
+            if lock is None:
+                return {
+                    "ok": False,
+                    "dry_run": False,
+                    "candidates": 0,
+                    "archived": 0,
+                    "deleted": 0,
+                    "bundles": [],
+                    "skipped": [
+                        {"session_id": None, "reason": "maintenance_lock_busy"}
+                    ],
+                }
+            try:
+                return self.cold_archive(
+                    older_than_days=older_than_days,
+                    dry_run=False,
+                    sessions_dir=sessions_dir,
+                    archive_dir=archive_dir,
+                    limit=limit,
+                    _maintenance_lock_held=True,
+                )
+            finally:
+                _release_auto_maintenance_lock(lock)
         cutoff = time.time() - float(older_than_days) * 86400.0
         rows = self._cold_archive_candidate_rows(
             cutoff, reclaim_stale_guards=not dry_run
@@ -639,6 +674,7 @@ class SessionColdArchiveMixin:
                 older_than_days=float(older_than_days),
                 sessions_dir=sessions_dir,
                 archive_dir=archive_dir,
+                _maintenance_lock_held=True,
             )
             result.update(
                 archived=int(outcome.get("archived") or 0),
