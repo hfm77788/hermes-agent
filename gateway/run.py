@@ -4737,7 +4737,9 @@ def _housekeeping_state_db_maintenance(launch: Optional[Tuple[Path, Path]] = Non
             _adb.maybe_auto_cold_archive(
                 older_than_days=int(_sess_cfg.get("cold_archive_days", 90)),
                 min_interval_hours=int(_sess_cfg.get("cold_archive_min_interval_hours", 24)),
-                sessions_dir=_profile_sessions_dir(launch))
+                sessions_dir=_profile_sessions_dir(launch),
+                vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
+                min_vacuum_interval_days=int(_sess_cfg.get("min_vacuum_interval_days", 30)))
         if _sess_cfg.get("auto_prune", False):
             _adb.maybe_auto_prune_and_vacuum(
                 retention_days=int(_sess_cfg.get("retention_days", 90)),

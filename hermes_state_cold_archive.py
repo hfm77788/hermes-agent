@@ -26,7 +26,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from hermes_state_common import _sql_session_last_active
+from hermes_state_common import AUTO_VACUUM_MIN_FREELIST_RATIO, _sql_session_last_active
 
 logger = logging.getLogger("hermes_state")
 
@@ -83,33 +83,60 @@ class SessionColdArchiveMixin:
                     out[sid] = (bundle, entry)
         return out
 
-    def _cold_archive_candidate_rows(self, cutoff: float) -> List[Dict[str, Any]]:
-        """Return safe standalone candidates and reclaim stale guards transactionally.
+    def _cold_archive_candidate_rows(
+        self, cutoff: float, *, reclaim_stale_guards: bool = True
+    ) -> List[Dict[str, Any]]:
+        """Return safe standalone candidates.
 
-        v1 deliberately excludes every session with a parent or child.  That avoids
-        breaking compression/branch/delegate lineages and, critically, prevents
-        delete_session's delegate cascade from removing a child that was never archived.
+        v1 deliberately excludes every session with a parent or child. That avoids
+        breaking compression/branch/delegate lineages and prevents delete_session's
+        delegate cascade from removing a child that was never archived.
+
+        Normal archive runs use the existing transactional guard check, which may reclaim
+        expired/dead guard rows. Dry-runs use a conservative read-only guard check so a
+        dry-run performs no writes.
         """
         last_active = _sql_session_last_active("s")
+        query = f"""
+            SELECT s.id, s.source, s.title, s.model, s.started_at,
+                   {last_active} AS last_active, s.ended_at, s.message_count
+            FROM sessions s
+            WHERE s.archived = 1
+              AND s.ended_at IS NOT NULL
+              AND COALESCE(s.pinned, 0) = 0
+              AND s.parent_session_id IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM sessions child WHERE child.parent_session_id = s.id
+              )
+              AND {last_active} < ?
+            ORDER BY last_active ASC, s.started_at ASC
+        """
+
+        if not reclaim_stale_guards:
+            now = time.time()
+            with self._read_ctx() as conn:
+                rows = conn.execute(query, (cutoff,)).fetchall()
+                safe = []
+                for row in rows:
+                    sid = str(row["id"])
+                    conversation_id = self._session_turn_lease_key_on_conn(conn, sid)
+                    lease = conn.execute(
+                        "SELECT expires_at FROM session_turn_leases WHERE conversation_id = ?",
+                        (conversation_id,),
+                    ).fetchone()
+                    if lease is not None and float(lease["expires_at"]) > now:
+                        continue
+                    lock = conn.execute(
+                        "SELECT expires_at FROM compression_locks WHERE session_id = ?",
+                        (sid,),
+                    ).fetchone()
+                    if lock is not None and float(lock["expires_at"]) > now:
+                        continue
+                    safe.append(dict(row))
+                return safe
 
         def _select(conn):
-            rows = conn.execute(
-                f"""
-                SELECT s.id, s.source, s.title, s.model, s.started_at,
-                       {last_active} AS last_active, s.ended_at, s.message_count
-                FROM sessions s
-                WHERE s.archived = 1
-                  AND s.ended_at IS NOT NULL
-                  AND COALESCE(s.pinned, 0) = 0
-                  AND s.parent_session_id IS NULL
-                  AND NOT EXISTS (
-                      SELECT 1 FROM sessions child WHERE child.parent_session_id = s.id
-                  )
-                  AND {last_active} < ?
-                ORDER BY last_active ASC, s.started_at ASC
-                """,
-                (cutoff,),
-            ).fetchall()
+            rows = conn.execute(query, (cutoff,)).fetchall()
             safe = []
             for row in rows:
                 sid = str(row["id"])
@@ -325,7 +352,9 @@ class SessionColdArchiveMixin:
         if older_than_days is None or older_than_days < 0:
             raise ValueError("older_than_days must be >= 0")
         cutoff = time.time() - float(older_than_days) * 86400.0
-        rows = self._cold_archive_candidate_rows(cutoff)
+        rows = self._cold_archive_candidate_rows(
+            cutoff, reclaim_stale_guards=not dry_run
+        )
         if limit is not None:
             rows = rows[: max(0, int(limit))]
         result: Dict[str, Any] = {
@@ -434,6 +463,9 @@ class SessionColdArchiveMixin:
         archive_dir: Optional[Path] = None,
         limit: int = _DEFAULT_LIST_LIMIT,
     ) -> List[Dict[str, Any]]:
+        limit = max(0, int(limit))
+        if limit == 0:
+            return []
         out: List[Dict[str, Any]] = []
         for bundle in reversed(self._cold_bundle_paths(archive_dir)):
             try:
@@ -453,7 +485,7 @@ class SessionColdArchiveMixin:
                         "bundle": str(bundle),
                     }
                 )
-                if len(out) >= max(0, int(limit)):
+                if len(out) >= limit:
                     return out
         return out
 
@@ -477,10 +509,12 @@ class SessionColdArchiveMixin:
     ) -> List[Dict[str, Any]]:
         """Bounded substring search over manifests and complete archived message history."""
         term = (query or "").strip().lower()
-        if not term:
+        max_bundles = max(0, int(max_bundles))
+        match_limit = max(0, int(match_limit))
+        if not term or max_bundles == 0 or match_limit == 0:
             return []
         matches: List[Dict[str, Any]] = []
-        bundles = self._cold_bundle_paths(archive_dir)[-max(0, int(max_bundles)) :]
+        bundles = self._cold_bundle_paths(archive_dir)[-max_bundles:]
         for bundle in reversed(bundles):
             try:
                 manifest = self._read_manifest(bundle)
@@ -506,7 +540,7 @@ class SessionColdArchiveMixin:
                                     "bundle": str(bundle),
                                 }
                             )
-                            if len(matches) >= max(0, int(match_limit)):
+                            if len(matches) >= match_limit:
                                 return matches
             except Exception:
                 continue
@@ -560,6 +594,9 @@ class SessionColdArchiveMixin:
         min_interval_hours: int = 24,
         sessions_dir: Optional[Path] = None,
         archive_dir: Optional[Path] = None,
+        vacuum: bool = True,
+        min_vacuum_interval_days: int = 30,
+        min_vacuum_freelist_ratio: float = AUTO_VACUUM_MIN_FREELIST_RATIO,
     ) -> Dict[str, Any]:
         """Throttled auto pass; callers own the config enable switch. Never raises."""
         from hermes_state_repair import (
@@ -572,6 +609,7 @@ class SessionColdArchiveMixin:
             "archived": 0,
             "deleted": 0,
             "bundles": [],
+            "vacuumed": False,
         }
         if older_than_days is None or older_than_days < 0:
             result["skipped"] = True
@@ -603,12 +641,55 @@ class SessionColdArchiveMixin:
             )
             if not outcome.get("ok", True):
                 result["error"] = "one_or_more_sessions_failed_closed"
+
+            # Cold storage may be enabled while auto_prune stays disabled. Reclaim free
+            # SQLite pages with the same holder/freelist/time admission gates used by
+            # ordinary maintenance so a successful cold move can actually shrink state.db.
+            if vacuum and result["deleted"] > 0:
+                try:
+                    raw_last_vacuum = self.get_meta("last_vacuum")
+                    since_vacuum = (
+                        None if not raw_last_vacuum else now - float(raw_last_vacuum)
+                    )
+                except (TypeError, ValueError):
+                    since_vacuum = None
+                vacuum_due = (
+                    since_vacuum is None
+                    or since_vacuum >= int(min_vacuum_interval_days) * 86400
+                )
+                if vacuum_due:
+                    result["freelist_ratio"] = ratio = self._freelist_ratio()
+                    from hermes_state_holders import (
+                        foreign_state_db_holders,
+                        in_process_state_db_holders,
+                    )
+                    holders = (
+                        foreign_state_db_holders(self.db_path)
+                        + in_process_state_db_holders(self.db_path, exclude=self)
+                    )
+                    if holders:
+                        result["vacuum_skipped_holders"] = len(holders)
+                    elif ratio is None or ratio > float(min_vacuum_freelist_ratio):
+                        try:
+                            from hermes_startup_watchdog import report_startup_progress
+                            report_startup_progress(
+                                900.0, phase="state_db_auto_cold_vacuum"
+                            )
+                            self.vacuum()
+                            result["vacuumed"] = True
+                            self.set_meta("last_vacuum", str(now))
+                        except Exception as exc:
+                            logger.warning(
+                                "state.db cold-archive VACUUM failed: %s", exc
+                            )
+
             self.set_meta("last_auto_cold_archive", str(now))
             if result["archived"]:
                 logger.info(
-                    "state.db auto cold-archive: %d session(s) moved into %d bundle(s)",
+                    "state.db auto cold-archive: %d session(s) moved into %d bundle(s)%s",
                     result["archived"],
                     len(result["bundles"]),
+                    " + VACUUM" if result["vacuumed"] else "",
                 )
         except Exception as exc:
             logger.warning("state.db auto cold-archive failed: %s", exc)

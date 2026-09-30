@@ -187,3 +187,61 @@ def test_auto_cold_archive_throttles_independently(tmp_path, db):
         archive_dir=archive_dir,
     )
     assert second["skipped"] is True
+
+
+def test_dry_run_is_strictly_read_only(tmp_path, db, monkeypatch):
+    archive_dir = tmp_path / "cold"
+    _old_archived(db, "preview-only")
+
+    def _forbid_write(*args, **kwargs):
+        pytest.fail("cold-archive dry-run attempted a write transaction")
+
+    monkeypatch.setattr(db, "_execute_write", _forbid_write)
+    preview = db.cold_archive(
+        older_than_days=90,
+        dry_run=True,
+        archive_dir=archive_dir,
+    )
+
+    assert preview["candidate_ids"] == ["preview-only"]
+    assert not archive_dir.exists()
+
+
+def test_auto_cold_archive_vacuums_only_after_safe_admission(
+    tmp_path, db, monkeypatch
+):
+    archive_dir = tmp_path / "cold"
+    _old_archived(db, "vacuum-me")
+
+    import hermes_state_holders
+
+    monkeypatch.setattr(
+        hermes_state_holders, "foreign_state_db_holders", lambda path: []
+    )
+    monkeypatch.setattr(
+        hermes_state_holders,
+        "in_process_state_db_holders",
+        lambda path, exclude=None: [],
+    )
+    monkeypatch.setattr(db, "_freelist_ratio", lambda: 0.50)
+    called = {"vacuum": 0}
+
+    def _vacuum():
+        called["vacuum"] += 1
+        return 0
+
+    monkeypatch.setattr(db, "vacuum", _vacuum)
+
+    result = db.maybe_auto_cold_archive(
+        older_than_days=90,
+        min_interval_hours=0,
+        archive_dir=archive_dir,
+        vacuum=True,
+        min_vacuum_interval_days=0,
+        min_vacuum_freelist_ratio=0.10,
+    )
+
+    assert result["deleted"] == 1
+    assert result["vacuumed"] is True
+    assert result["freelist_ratio"] == pytest.approx(0.50)
+    assert called["vacuum"] == 1
