@@ -87,6 +87,8 @@ def test_cold_archive_write_verify_delete_search_restore(tmp_path, db):
     assert [row["session_id"] for row in listed] == ["cold-1"]
     matches = db.cold_search("question from cold-1", archive_dir=archive_dir)
     assert matches and matches[0]["session_id"] == "cold-1"
+    id_matches = db.cold_search("cold-1", archive_dir=archive_dir)
+    assert id_matches and id_matches[0]["session_id"] == "cold-1"
 
     restored = db.cold_restore("cold-1", archive_dir=archive_dir)
     assert restored["ok"] is True
