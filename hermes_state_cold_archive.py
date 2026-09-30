@@ -527,7 +527,9 @@ class SessionColdArchiveMixin:
                     for entry in reversed(manifest.get("sessions") or []):
                         sid = str(entry.get("session_id") or "")
                         title = str(entry.get("title") or "")
-                        snippet = title if term in title.lower() or term in sid.lower() else ""
+                        title_match = term in title.lower()
+                        sid_match = term in sid.lower()
+                        snippet = title if title_match else (sid if sid_match else "")
                         if not snippet:
                             history = json.loads(zf.read(entry["history_part"]).decode("utf-8"))
                             for msg in history:
