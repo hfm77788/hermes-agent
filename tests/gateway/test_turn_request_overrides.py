@@ -138,3 +138,31 @@ def test_session_override_absent_is_noop():
     model, out = runner._apply_session_model_override("nope", "keepme", rk)
     assert model == "keepme"
     assert out["request_overrides"] == PROVIDER_OVERRIDES
+
+
+def test_task_model_route_is_opt_in_and_conservative(monkeypatch):
+    import gateway.run as gateway_run
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {"agent": {"task_model_routing": {
+        "enabled": True, "brain_model": "qwen3.8-max", "work_model": "qwen3.8-flash",
+        "low_risk_terms": ["状态", "进度", "health"],
+        "high_risk_terms": ["根因", "部署", "权限"], "high_reasoning_effort": "high",
+    }}})
+    runner = _runner()
+    low = runner._resolve_turn_agent_config("看一下当前进度", "qwen3.8-max", _runtime_kwargs())
+    assert (low["model"], low["task_model_route"]) == ("qwen3.8-flash", "work")
+    normal = runner._resolve_turn_agent_config("分析这个故障", "qwen3.8-max", _runtime_kwargs())
+    assert (normal["model"], normal["task_model_route"]) == ("qwen3.8-max", "brain")
+    high = runner._resolve_turn_agent_config("查根因并部署修复", "qwen3.8-max", _runtime_kwargs())
+    assert (high["model"], high["task_model_route"], high["task_reasoning_effort"]) == (
+        "qwen3.8-max", "brain-high", "high")
+
+
+def test_task_model_route_high_risk_wins_over_low_risk(monkeypatch):
+    import gateway.run as gateway_run
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {"agent": {"task_model_routing": {
+        "enabled": True, "brain_model": "max", "work_model": "flash",
+        "low_risk_terms": ["状态"], "high_risk_terms": ["部署"],
+    }}})
+    route = _runner()._resolve_turn_agent_config("部署状态", "max", _runtime_kwargs())
+    assert route["task_model_route"] == "brain-high"
+    assert route["model"] == "max"

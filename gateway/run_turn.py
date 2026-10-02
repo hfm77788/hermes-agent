@@ -321,6 +321,29 @@ class GatewayTurnMixin:
 
         return model, runtime_kwargs
 
+    @staticmethod
+    def _task_model_route(user_message: str, model: str) -> tuple[str, str, str | None]:
+        """Conservative deterministic brain/work routing for chief-engineer style profiles.
+
+        Opt-in via ``agent.task_model_routing``. Ambiguous work stays on the brain model; only
+        clearly low-risk status/read/inspection turns downgrade to the work model.
+        """
+        from gateway.run import _load_gateway_config
+        cfg = _load_gateway_config() or {}
+        routing = ((cfg.get("agent") or {}).get("task_model_routing") or {})
+        if not routing.get("enabled"):
+            return model, "default", None
+        brain = str(routing.get("brain_model") or model).strip()
+        work = str(routing.get("work_model") or "").strip()
+        text = str(user_message or "").strip().lower()
+        high = tuple(str(x).lower() for x in routing.get("high_risk_terms", []))
+        low = tuple(str(x).lower() for x in routing.get("low_risk_terms", []))
+        if high and any(term and term in text for term in high):
+            return brain, "brain-high", str(routing.get("high_reasoning_effort") or "high")
+        if work and low and any(term and term in text for term in low):
+            return work, "work", None
+        return brain, "brain", None
+
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         """Effective model/runtime config for one turn. With `/fast` priority on, fast-mode
         ``request_overrides`` are deep-merged OVER the per-provider ones so both reach the model."""
@@ -336,8 +359,12 @@ class GatewayTurnMixin:
         runtime["args"] = list(runtime["args"] or [])
         runtime["capabilities"] = dict(runtime["capabilities"] or {})
         base_request_overrides = dict(runtime_kwargs.get("request_overrides") or {})
+        model, task_route, task_reasoning_effort = self._task_model_route(user_message, model)
+        logger.info("Task model route=%s model=%s", task_route, model)
         route = {
             "model": model,
+            "task_model_route": task_route,
+            "task_reasoning_effort": task_reasoning_effort,
             "runtime": runtime,
             "signature": (
                 model, runtime["provider"], runtime["requested_provider"], runtime["base_url"],
@@ -2499,6 +2526,11 @@ class GatewayTurnMixin:
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            if turn_route.get("model") != model:
+                reasoning_config = self._resolve_session_reasoning_config(source=source, model=turn_route["model"])
+            if turn_route.get("task_reasoning_effort"):
+                reasoning_config = {"effort": turn_route["task_reasoning_effort"], "enabled": True}
+            self._reasoning_config = reasoning_config
 
             # Enrich the prompt with image descriptions (same as the main flow).
             enriched_prompt = prompt
