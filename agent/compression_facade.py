@@ -96,6 +96,46 @@ def _report_compression_timeout(
         )
 
 
+def _report_compression_foreground_hold(
+    agent, *, waited: float, budget: float, progress_observed: bool,
+) -> None:
+    """Record a user-latency hold expiry without misclassifying it as the generic total ceiling."""
+    from agent.conversation_compression import mark_context_compression_timed_out
+
+    mark_context_compression_timed_out(agent)
+    logger.warning(
+        "Context compression exceeded its %.1fs foreground turn-hold budget after %.1fs "
+        "(summary progress observed=%s); continuing this request uncompressed",
+        budget, waited, progress_observed,
+    )
+    touch = getattr(agent, "_touch_activity", None)
+    if callable(touch):
+        try:
+            touch(
+                "context compression foreground hold expired",
+                provenance=ActivityProvenance.AGENT_COMPRESSION_TIMEOUT,
+            )
+        except Exception:
+            logger.debug("foreground compression hold activity touch failed", exc_info=True)
+    record = getattr(getattr(agent, "context_compressor", None), "record_timeout_failure", None)
+    if callable(record):
+        try:
+            record(
+                "host compress_context foreground turn-hold exhausted",
+                failure_kind="foreground_hold",
+            )
+        except Exception:
+            logger.debug("failed to record foreground compression hold cooldown", exc_info=True)
+    emit = getattr(agent, "_emit_warning", None)
+    if callable(emit):
+        progress = " after summary output was observed" if progress_observed else ""
+        emit(
+            "⚠ Context compression exceeded the foreground wait budget "
+            f"after {waited:.1f}s{progress}. No messages were dropped — "
+            "continuing this request uncompressed. Compression will retry after its cooldown."
+        )
+
+
 def _warn_commit_overrun(agent, waited: float, ceiling: float) -> None:
     """Commit-phase ceiling breach: the SessionDB mutation must complete, so only surface it."""
     emit = getattr(agent, "_emit_warning", None)
@@ -160,6 +200,12 @@ def _run_under_progress_timeout(
         timeout_cause.update(total_exhausted=total_exhausted, progress_observed=progress_observed)
 
     def _on_timeout(idle, waited, since_progress):
+        if _foreground_hold is not None and timeout_cause["total_exhausted"]:
+            _report_compression_foreground_hold(
+                agent, waited=waited, budget=_foreground_hold,
+                progress_observed=timeout_cause["progress_observed"],
+            )
+            return
         _report_compression_timeout(
             agent, idle=idle, waited=waited, since_progress=since_progress, total_ceiling=total_ceiling, **timeout_cause
         )
