@@ -152,3 +152,58 @@ def test_pre_api_compression_mid_turn_keeps_this_turns_tool_pair_on_the_wire():
     ]
     assert [t["id"] for t in sent[-2]["tool_calls"]] == ["call_1"]
     assert sent[-1]["content"] == "RESULT-1"
+
+
+def test_post_tool_fit_window_foreground_timeout_continues_current_turn(monkeypatch):
+    from agent.conversation_compression import (
+        context_compression_timed_out,
+        mark_context_compression_timed_out,
+    )
+
+    class Compressor:
+        last_prompt_tokens = 100
+        threshold_tokens = 50
+        context_length = 1_000
+        awaiting_real_usage_after_compression = False
+
+        @staticmethod
+        def should_compress(_tokens):
+            return True
+
+    messages = [{"role": "user", "content": "current ask"}]
+    agent = SimpleNamespace(
+        context_compressor=Compressor(),
+        compression_enabled=True,
+        _clear_context_overflow_warn=lambda: None,
+        _safe_print=lambda *_args: None,
+        _persist_user_message_idx=0,
+    )
+
+    def _timed_out(current, system_message, **_kwargs):
+        mark_context_compression_timed_out(agent)
+        return current, system_message
+
+    agent._compress_context = _timed_out
+    monkeypatch.setattr(
+        "agent.turn_preflight.ensure_compression_feasibility_checked",
+        lambda *_args, **_kwargs: None,
+    )
+
+    verdict = compress_after_tool_results(
+        agent,
+        messages=messages,
+        system_message="system",
+        user_message="current ask",
+        active_system_prompt="system",
+        conversation_history=[],
+        compression_attempts=0,
+        max_compression_attempts=1,
+        effective_task_id="task",
+        final_response="",
+        turn_exit_reason=None,
+        current_turn_user_idx=0,
+    )
+
+    assert verdict.end_turn is False
+    assert verdict.messages is messages
+    assert context_compression_timed_out(agent) is False
