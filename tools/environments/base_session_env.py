@@ -143,6 +143,15 @@ def _wrap_command_script(
     if snapshot_ready:
         parts.append(f"source {quoted_snap} >/dev/null 2>&1 || true")
     parts += restore
+    # Hermes Native launches the CLI from the agent venv, but the terminal
+    # session snapshot may contain an older/profile-preferred Python.
+    # Re-pin the trusted Native interpreter after sourcing the snapshot.
+    parts.append(
+        'if [ -n "${HERMES_NATIVE_PYTHON:-}" ] '
+        '&& [ "${HERMES_NATIVE_PYTHON#/}" != "$HERMES_NATIVE_PYTHON" ] '
+        '&& [ -x "$HERMES_NATIVE_PYTHON" ]; then '
+        'export PATH="$(dirname "$HERMES_NATIVE_PYTHON"):$PATH"; fi'
+    )
     parts += [
         'export AI_AGENT="${AI_AGENT:-hermes-agent}" HERMES_AGENT="${HERMES_AGENT:-true}"',
         'export GIT_PAGER="${GIT_PAGER:-cat}" PAGER="${PAGER:-cat}"',

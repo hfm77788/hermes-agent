@@ -224,3 +224,68 @@ class TestSnapshotEndToEnd:
         assert str(fake_n_bin) in output
         # bashrc short-circuited on the interactive guard — its export never ran
         assert "FROM_BASHRC=bashrc-should-not-appear" not in output
+
+
+    def test_native_python_pin_wins_after_snapshot_profile_path(
+        self, tmp_path, monkeypatch
+    ):
+        """Native's interpreter must win even when shell init snapshots another venv first."""
+        native_bin = tmp_path / "native-venv" / "bin"
+        wrong_bin = tmp_path / "wrong-venv" / "bin"
+        native_bin.mkdir(parents=True)
+        wrong_bin.mkdir(parents=True)
+
+        native_python = native_bin / "python"
+        wrong_python = wrong_bin / "python"
+        native_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        wrong_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        native_python.chmod(0o755)
+        wrong_python.chmod(0o755)
+
+        init_file = tmp_path / "custom-init.sh"
+        init_file.write_text(f'export PATH="{wrong_bin}:$PATH"\n', encoding="utf-8")
+        monkeypatch.setenv("HERMES_NATIVE_PYTHON", str(native_python))
+
+        with patch(
+            "tools.environments.local._read_terminal_shell_init_config",
+            return_value=([str(init_file)], False),
+        ):
+            env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+            try:
+                result = env.execute('command -v python; printf "PATH=%s\\n" "$PATH"')
+            finally:
+                env.cleanup()
+
+        assert result["returncode"] == 0
+        output = result.get("output", "")
+        assert str(native_python) in output
+        path_line = next(line for line in output.splitlines() if line.startswith("PATH="))
+        assert path_line.split("=", 1)[1].split(":", 1)[0] == str(native_bin)
+
+
+    def test_normal_terminal_keeps_snapshot_python_precedence(
+        self, tmp_path, monkeypatch
+    ):
+        """Without the Native marker, normal terminal PATH semantics stay unchanged."""
+        wrong_bin = tmp_path / "profile-venv" / "bin"
+        wrong_bin.mkdir(parents=True)
+        wrong_python = wrong_bin / "python"
+        wrong_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        wrong_python.chmod(0o755)
+
+        init_file = tmp_path / "custom-init.sh"
+        init_file.write_text(f'export PATH="{wrong_bin}:$PATH"\n', encoding="utf-8")
+        monkeypatch.delenv("HERMES_NATIVE_PYTHON", raising=False)
+
+        with patch(
+            "tools.environments.local._read_terminal_shell_init_config",
+            return_value=([str(init_file)], False),
+        ):
+            env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+            try:
+                result = env.execute("command -v python")
+            finally:
+                env.cleanup()
+
+        assert result["returncode"] == 0
+        assert result.get("output", "").strip() == str(wrong_python)
