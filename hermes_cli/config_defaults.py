@@ -631,6 +631,10 @@ DEFAULT_CONFIG = {
         # commit is never abandoned: past the ceiling it is logged (WARNING, then ERROR) and
         # surfaced on the warning channel while the host keeps waiting.
         "context_total_ceiling_seconds": 600,
+        # Max pre-commit wall-clock an arriving foreground turn waits on automatic preflight compression when
+        # the request still fits the model window. 0 disables this extra cap. Manual /compress and
+        # over-window recovery keep the full context timeout/ceiling contract.
+        "context_max_turn_hold_seconds": 30,
         # Non-system head messages always kept verbatim, in ADDITION to the (always protected)
         # system prompt. 0 = pin nothing but system prompt + summary + tail.
         "protect_first_n": 3,

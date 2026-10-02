@@ -1184,6 +1184,8 @@ agent:
   #                                         # compress_context (0 = disable)
   #   context_total_ceiling_seconds: 600    # absolute cap on the pre-commit
   #                                         # wait even while tokens stream
+  #   context_max_turn_hold_seconds: 30     # foreground auto-compression pre-commit hold cap
+  #                                         # when the request still fits (0 = disable)
 
   # Graceful drain timeout for gateway stop/restart (seconds).
   # Default 0 = no drain: a restart interrupts in-flight agents immediately,
