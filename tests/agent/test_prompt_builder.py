@@ -1027,3 +1027,46 @@ class TestContextFileReadTimeout:
 
         with pytest.raises(FileNotFoundError):
             _read_text_with_timeout(tmp_path / "missing.md", timeout=1.0)
+
+
+def test_names_only_all_keeps_catalog_but_omits_static_descriptions(monkeypatch, tmp_path):
+    from agent.prompt_builder import build_skills_system_prompt, clear_skills_system_prompt_cache
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for name, desc in [("alpha-skill", "Alpha semantic description"), ("beta-skill", "Beta workflow description")]:
+        d = tmp_path / "skills" / "demo" / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {desc}\ntags: [retrieval, demo]\n---\n",
+            encoding="utf-8",
+        )
+    clear_skills_system_prompt_cache(clear_snapshot=True)
+    catalog = []
+    prompt = build_skills_system_prompt(names_only_all=True, catalog_out=catalog)
+    assert "alpha-skill" in prompt and "beta-skill" in prompt
+    assert "Alpha semantic description" not in prompt
+    assert "Beta workflow description" not in prompt
+    by_name = {entry["name"]: entry for entry in catalog}
+    assert by_name["alpha-skill"]["description"] == "Alpha semantic description"
+    assert "retrieval" in by_name["alpha-skill"]["semantic_terms"]
+
+
+def test_retrieval_catalog_respects_disabled_skill_visibility(monkeypatch, tmp_path):
+    from unittest.mock import patch
+    from agent.prompt_builder import build_skills_system_prompt, clear_skills_system_prompt_cache
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for name in ("visible-skill", "hidden-skill"):
+        d = tmp_path / "skills" / "tools" / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {name} description\n---\n",
+            encoding="utf-8",
+        )
+    clear_skills_system_prompt_cache(clear_snapshot=True)
+    catalog = []
+    with patch("agent.prompt_builder.get_disabled_skill_names", return_value={"hidden-skill"}):
+        prompt = build_skills_system_prompt(names_only_all=True, catalog_out=catalog)
+    assert "visible-skill" in prompt
+    assert "hidden-skill" not in prompt
+    assert {entry["name"] for entry in catalog} == {"visible-skill"}

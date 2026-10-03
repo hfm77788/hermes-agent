@@ -812,3 +812,31 @@ class TestCodexToolProgressBridge:
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
+
+
+def test_codex_app_server_receives_per_turn_skill_context(monkeypatch):
+    captured = {}
+
+    def fake_run_turn(self, user_input: str, **kwargs):
+        captured["user_input"] = user_input
+        return TurnResult(
+            final_text="done",
+            projected_messages=[{"role": "assistant", "content": "done"}],
+            turn_id="turn-skill-context-1",
+            thread_id="thread-skill-context-1",
+        )
+
+    monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+    monkeypatch.setattr(CodexAppServerSession, "ensure_started", lambda self: "thread-skill-context-1")
+    monkeypatch.setattr(
+        "agent.turn_context._skill_turn_retrieval",
+        lambda _agent, _message: "<relevant_skills>\n- pdf-tools: Convert PDF files\n</relevant_skills>",
+    )
+    agent = _make_codex_agent()
+    with patch.object(agent, "_spawn_background_review", return_value=None):
+        result = agent.run_conversation("please convert this PDF")
+
+    assert result["completed"] is True
+    assert captured["user_input"].startswith("please convert this PDF")
+    assert "<relevant_skills>" in captured["user_input"]
+    assert "pdf-tools" in captured["user_input"]
