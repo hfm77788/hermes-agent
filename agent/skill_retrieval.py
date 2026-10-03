@@ -44,7 +44,11 @@ def _tokens(text: Any) -> set[str]:
     tokenizer dependency. Whole short runs stay available for exact-ish matches.
     """
     norm = _normalize(text)
-    out = set(_ASCII_WORD_RE.findall(norm))
+    compounds = set(_ASCII_WORD_RE.findall(norm))
+    out = set(compounds)
+    for token in compounds:
+        if any(sep in token for sep in "-_/+."):
+            out.update(part for part in re.split(r"[-_/+.]+", token) if part)
     for run in _CJK_RUN_RE.findall(norm):
         if len(run) <= 8:
             out.add(run)

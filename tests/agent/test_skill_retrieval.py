@@ -108,3 +108,11 @@ def test_resumed_turn_can_reconstruct_missing_catalog(monkeypatch):
     monkeypatch.setattr(system_prompt, "_skills_prompt", fake_skills_prompt)
     context = _skill_turn_retrieval(agent, "WPS forms")
     assert "wps-query-app" in context
+
+
+def test_compound_skill_name_emits_component_tokens():
+    catalog = [_entry("pdf-tools", "Manipulate documents")]
+    hits = retrieve_skills("use PDF", catalog, top_k=2)
+    assert hits
+    assert hits[0]["name"] == "pdf-tools"
+    assert hits[0]["lexical_score"] > 0
