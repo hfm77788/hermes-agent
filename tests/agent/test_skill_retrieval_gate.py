@@ -17,6 +17,7 @@ def test_ci_gate_passes_without_nested_regressions():
     assert receipt["quality"]["top5"] == receipt["quality"]["total"]
     assert receipt["dynamic_context"]["candidate_count"] <= 8
     assert receipt["prompt"]["description_leak_count"] == 0
+    assert receipt["checks"]["semantic_channel"] is True
 
 
 @pytest.mark.parametrize(

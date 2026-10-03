@@ -98,6 +98,48 @@ def _dynamic_context(catalog: list[dict[str, Any]], query: str, expected: str) -
     }
 
 
+def _semantic_probe() -> dict[str, Any]:
+    import agent.skill_retrieval as sr
+
+    try:
+        import numpy  # noqa: F401
+    except Exception:
+        return {"available": False, "passed": False, "semantic_score": 0.0}
+
+    catalog = [
+        {
+            "name": "form-builder",
+            "category": "office",
+            "description": "spreadsheet forms survey workflow data collection",
+            "semantic_terms": [],
+        },
+        {
+            "name": "questionnaire-helper",
+            "category": "office",
+            "description": "questionnaire survey workflow audience research",
+            "semantic_terms": [],
+        },
+        {
+            "name": "deploy-helper",
+            "category": "devops",
+            "description": "docker server deployment runtime health",
+            "semantic_terms": [],
+        },
+        {
+            "name": "research-helper",
+            "category": "research",
+            "description": "audience research evidence sources",
+            "semantic_terms": [],
+        },
+    ]
+    sr.clear_skill_retrieval_cache()
+    hits = sr.retrieve_skills("audience questionnaire", catalog, top_k=4)
+    by_name = {str(hit.get("name") or ""): hit for hit in hits}
+    score = float(by_name.get("research-helper", {}).get("semantic_score") or 0.0)
+    sr.clear_skill_retrieval_cache()
+    return {"available": True, "passed": score > 0.0, "semantic_score": score}
+
+
 def _fallback(catalog: list[dict[str, Any]], query: str, expected: str) -> dict[str, Any]:
     import agent.skill_retrieval as sr
 
@@ -231,6 +273,7 @@ def _ci_receipt(fixture: dict[str, Any], *, run_regressions: bool) -> dict[str, 
     context = _dynamic_context(catalog, context_item["query"], context_item["expected"])
     fallback_item = fixture["ci_fallback_query"]
     fallback = _fallback(catalog, fallback_item["query"], fallback_item["expected"])
+    semantic = _semantic_probe()
     prompt = _synthetic_prompt(catalog)
     latency = _latency(catalog, queries)
     regressions = _run_regressions() if run_regressions else {"passed": True, "skipped": True}
@@ -245,6 +288,11 @@ def _ci_receipt(fixture: dict[str, Any], *, run_regressions: bool) -> dict[str, 
             and context["candidate_count"] <= int(cfg["max_context_candidates"])
         ),
         "lexical_fallback": fallback["rank"] == 1 and fallback["semantic_score"] == 0.0,
+        "semantic_channel": (
+            semantic["passed"]
+            if bool(cfg.get("require_semantic"))
+            else (not semantic["available"] or semantic["passed"])
+        ),
         "static_prompt_names_only": prompt["description_leak_count"] == 0,
         "prompt_budget": prompt["bytes_per_skill"] <= float(cfg["max_static_bytes_per_skill"]),
         "latency_cold": latency["cold_ms"] <= float(cfg["max_cold_ms"]),
@@ -257,6 +305,7 @@ def _ci_receipt(fixture: dict[str, Any], *, run_regressions: bool) -> dict[str, 
         "quality": quality,
         "dynamic_context": context,
         "fallback": fallback,
+        "semantic": semantic,
         "prompt": prompt,
         "latency": latency,
         "regressions": regressions,
@@ -288,6 +337,7 @@ def _runtime_receipt(fixture: dict[str, Any], *, run_regressions: bool) -> dict[
     }
     fallback_item = fixture["runtime_fallback_query"]
     fallback = _fallback(catalog, fallback_item["query"], fallback_item["expected"])
+    semantic = _semantic_probe()
     latency = _latency(catalog, queries)
     prompt = compute_prompt_breakdown("cli")
     skills_index_bytes = int(prompt["skills_index"]["bytes"])
@@ -312,6 +362,11 @@ def _runtime_receipt(fixture: dict[str, Any], *, run_regressions: bool) -> dict[
             and context["candidate_count"] <= int(cfg["max_context_candidates"])
         ),
         "lexical_fallback": fallback["rank"] == 1 and fallback["semantic_score"] == 0.0,
+        "semantic_channel": (
+            semantic["passed"]
+            if bool(cfg.get("require_semantic"))
+            else (not semantic["available"] or semantic["passed"])
+        ),
         "static_prompt_names_only": not full_description_leaks,
         "prompt_budget": (
             bytes_per_skill <= float(cfg["max_static_bytes_per_skill"])
@@ -327,6 +382,7 @@ def _runtime_receipt(fixture: dict[str, Any], *, run_regressions: bool) -> dict[
         "quality": quality,
         "dynamic_context": context,
         "fallback": fallback,
+        "semantic": semantic,
         "prompt": {
             "skills_index_bytes": skills_index_bytes,
             "system_prompt_bytes": system_prompt_bytes,
