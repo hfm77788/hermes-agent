@@ -97,6 +97,22 @@ jobs:
         # re-download, keeping the persisted cache small and fast to restore.
         run: uv cache prune --ci
 
+      - name: Skill Retrieval acceptance gate
+        run: |
+          set +e
+          .venv/bin/python scripts/skill_retrieval_gate.py \
+            --mode ci \
+            --json-out skill-retrieval-acceptance.json
+          status=$?
+          cat skill-retrieval-acceptance.json
+          exit "$status"
+
+      - name: Publish Skill Retrieval gate summary
+        if: always() && hashFiles('skill-retrieval-acceptance.json') != ''
+        run: |
+          echo '## Skill Retrieval Acceptance' >> "$GITHUB_STEP_SUMMARY"
+          cat skill-retrieval-acceptance.json >> "$GITHUB_STEP_SUMMARY"
+
       - name: Check SQLite runs WAL
         # Hermes picks DELETE journal mode on a SQLite with the WAL-reset
         # bug. If this interpreter links one, every WAL test silently runs
