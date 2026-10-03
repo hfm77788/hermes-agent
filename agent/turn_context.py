@@ -858,6 +858,33 @@ def _memory_query_text(original_user_message: Any) -> str:
     return ""
 
 
+def _skill_turn_retrieval(agent: Any, original_user_message: Any) -> str:
+    """Retrieve a bounded Skill shortlist for this turn without mutating the system prompt."""
+    query = _memory_query_text(original_user_message).strip()
+    catalog = getattr(agent, "_skill_retrieval_catalog", None) or []
+    if not catalog:
+        # A resumed session may restore the persisted system-prompt bytes without
+        # re-running _skills_prompt(). Reconstruct only the local retrieval catalog;
+        # the restored system prompt itself stays byte-exact for prefix caching.
+        try:
+            from agent.system_prompt import _skills_prompt
+
+            _skills_prompt(agent)
+            catalog = getattr(agent, "_skill_retrieval_catalog", None) or []
+        except Exception:
+            logger.debug("skill retrieval catalog reconstruction skipped", exc_info=True)
+            catalog = []
+    if not query or not catalog or is_trivial_prompt(query):
+        return ""
+    try:
+        from agent.skill_retrieval import build_skill_retrieval_context
+
+        return build_skill_retrieval_context(query, catalog, top_k=8)
+    except Exception:
+        logger.debug("skill retrieval skipped", exc_info=True)
+        return ""
+
+
 def _memory_turn_start_and_prefetch(
     agent: Any, original_user_message: Any, turn_author: Optional[Dict[str, Any]] = None,
 ) -> str:
@@ -1132,6 +1159,11 @@ def build_turn_context(
         original_user_message=original_user_message, messages=messages,
         conversation_history=conversation_history,
     )
+    skill_user_context = _skill_turn_retrieval(agent, original_user_message)
+    if skill_user_context:
+        plugin_user_context = (
+            plugin_user_context + "\n\n" + skill_user_context if plugin_user_context else skill_user_context
+        )
     plugin_user_context = _merge_gateway_notes(
         agent, messages, current_turn_user_idx, plugin_user_context
     )
