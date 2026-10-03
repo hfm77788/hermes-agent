@@ -128,6 +128,27 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
       packages.configKeys = configKeys;
 
       checks = {
+        # Skill Retrieval is a release invariant, not a one-off benchmark.
+        # Keep this inside the existing required nix flake check so forks
+        # that do not run the reusable Python CI orchestrator still fail closed
+        # before merge. Focused pytest regressions run again in the deployed
+        # runtime gate; this derivation intentionally uses only production
+        # dependencies and the deterministic core acceptance checks.
+        skill-retrieval-acceptance = pkgs.runCommand "hermes-skill-retrieval-acceptance" { } ''
+          set -euo pipefail
+          export HOME="$TMPDIR/home"
+          export HERMES_HOME="$HOME/.hermes"
+          export PYTHONDONTWRITEBYTECODE=1
+          mkdir -p "$HOME"
+          cd ${inputs.self}
+          ${hermesVenv}/bin/python3 scripts/skill_retrieval_gate.py \
+            --mode ci \
+            --skip-regressions \
+            --json-out "$TMPDIR/skill-retrieval-acceptance.json"
+          mkdir -p "$out"
+          echo ok > "$out/result"
+        '';
+
         # Cross-platform evaluation — catches "not supported for interpreter"
         # errors (e.g. sphinx dropping python311) without needing a darwin builder.
         # Evaluation is pure and instant; it doesn't build anything.
