@@ -116,3 +116,15 @@ def test_compound_skill_name_emits_component_tokens():
     assert hits
     assert hits[0]["name"] == "pdf-tools"
     assert hits[0]["lexical_score"] > 0
+
+
+def test_long_verbose_query_keeps_single_decisive_lexical_match():
+    catalog = [_entry("doc-handler", "Convert PDF files")]
+    query = (
+        "Please help me prepare a careful workflow for this customer request with several constraints, "
+        "review steps, naming rules, archival notes, and finally convert the attached PDF before delivery"
+    )
+    hits = retrieve_skills(query, catalog, top_k=2)
+    assert hits
+    assert hits[0]["name"] == "doc-handler"
+    assert hits[0]["lexical_score"] >= 0.08

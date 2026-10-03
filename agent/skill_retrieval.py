@@ -26,6 +26,7 @@ _SEMANTIC_RANK_MAX = 24
 _RRF_K = 40.0
 
 _SEMANTIC_CACHE: "OrderedDict[str, dict[str, Any] | None]" = OrderedDict()
+_LEXICAL_CACHE: "OrderedDict[str, tuple[tuple[set[str], set[str], set[str]], ...]]" = OrderedDict()
 _SEMANTIC_CACHE_LOCK = threading.Lock()
 
 
@@ -155,9 +156,33 @@ def _semantic_state(catalog: list[dict[str, Any]]) -> dict[str, Any] | None:
     return state
 
 
+def _lexical_state(catalog: list[dict[str, Any]]) -> tuple[tuple[set[str], set[str], set[str]], ...]:
+    key = _catalog_fingerprint(catalog)
+    with _SEMANTIC_CACHE_LOCK:
+        cached = _LEXICAL_CACHE.get(key)
+        if cached is not None:
+            _LEXICAL_CACHE.move_to_end(key)
+            return cached
+    state = tuple(
+        (
+            _tokens(entry.get("name")),
+            _tokens(_semantic_terms(entry)),
+            _tokens(_document_text(entry)),
+        )
+        for entry in catalog
+    )
+    with _SEMANTIC_CACHE_LOCK:
+        _LEXICAL_CACHE[key] = state
+        _LEXICAL_CACHE.move_to_end(key)
+        while len(_LEXICAL_CACHE) > _CACHE_MAX:
+            _LEXICAL_CACHE.popitem(last=False)
+    return state
+
+
 def clear_skill_retrieval_cache() -> None:
     with _SEMANTIC_CACHE_LOCK:
         _SEMANTIC_CACHE.clear()
+        _LEXICAL_CACHE.clear()
 
 
 def _semantic_scores(query: str, catalog: list[dict[str, Any]]) -> list[float]:
@@ -200,17 +225,29 @@ def _exact_score(query: str, entry: dict[str, Any]) -> float:
     return 0.0
 
 
-def _lexical_score(query: str, entry: dict[str, Any]) -> float:
-    q_tokens = _tokens(query)
+def _lexical_score_tokens(
+    q_tokens: set[str], name_tokens: set[str], semantic_tokens: set[str], doc_tokens: set[str]
+) -> float:
     if not q_tokens:
         return 0.0
-    name_tokens = _tokens(entry.get("name"))
-    semantic_tokens = _tokens(_semantic_terms(entry))
-    doc_tokens = _tokens(_document_text(entry))
-    overlap = len(q_tokens & doc_tokens) / max(1, len(q_tokens))
-    name_overlap = len(q_tokens & name_tokens) / max(1, len(q_tokens))
-    metadata_overlap = len(q_tokens & semantic_tokens) / max(1, len(q_tokens))
+
+    def cosine_overlap(target_tokens: set[str]) -> float:
+        if not target_tokens:
+            return 0.0
+        matched = len(q_tokens & target_tokens)
+        return matched / math.sqrt(len(q_tokens) * len(target_tokens)) if matched else 0.0
+
+    overlap = cosine_overlap(doc_tokens)
+    name_overlap = cosine_overlap(name_tokens)
+    metadata_overlap = cosine_overlap(semantic_tokens)
     return min(1.0, overlap + 0.65 * name_overlap + 0.45 * metadata_overlap)
+
+
+def _lexical_score(query: str, entry: dict[str, Any]) -> float:
+    q_tokens = _tokens(query)
+    return _lexical_score_tokens(
+        q_tokens, _tokens(entry.get("name")), _tokens(_semantic_terms(entry)), _tokens(_document_text(entry))
+    )
 
 
 def _rank_map(scores: Iterable[float], minimum: float) -> dict[int, int]:
@@ -226,7 +263,11 @@ def retrieve_skills(query: str, catalog: list[dict[str, Any]], *, top_k: int = 8
     if not isinstance(query, str) or not query.strip() or not catalog or top_k <= 0:
         return []
     exact = [_exact_score(query, entry) for entry in catalog]
-    lexical = [_lexical_score(query, entry) for entry in catalog]
+    q_tokens = _tokens(query)
+    lexical = [
+        _lexical_score_tokens(q_tokens, name_tokens, semantic_tokens, doc_tokens)
+        for name_tokens, semantic_tokens, doc_tokens in _lexical_state(catalog)
+    ]
     semantic = _semantic_scores(query, catalog)
     exact_ranks = _rank_map(exact, 0.8)
     lexical_ranks = _rank_map(lexical, 0.08)
