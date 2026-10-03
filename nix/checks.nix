@@ -140,13 +140,13 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
           export HERMES_HOME="$HOME/.hermes"
           export PYTHONDONTWRITEBYTECODE=1
           mkdir -p "$HOME"
-          cp -R ${inputs.self} source
-          chmod -R u+w source
-          cd source
+          cd ${inputs.self}
           ${hermesVenv}/bin/python3 scripts/skill_retrieval_gate.py \
             --mode ci \
             --skip-regressions \
-            --json-out "$out/receipt.json"
+            --json-out "$TMPDIR/skill-retrieval-acceptance.json"
+          mkdir -p "$out"
+          echo ok > "$out/result"
         '';
 
         # Cross-platform evaluation — catches "not supported for interpreter"
