@@ -88,6 +88,8 @@ def test_injected_turn_reuses_native_identity_and_stays_human_input():
     assert event.source.role_authorized is False
     assert event.source._suppress_presentation is True
     assert event.source._trusted_context_tail is True
+    assert event.source._local_inbound_skill == "math-skill"
+    assert event.source._local_inbound_has_media is False
     assert event.auto_skill == ["math-skill"]
     assert event.channel_context == "河马老师: R2 求多少米？"
     assert event.allow_gateway_control is False
@@ -169,6 +171,7 @@ def test_injected_image_uses_photo_event_from_controlled_media_cache(tmp_path, m
     assert event.message_type is MessageType.PHOTO
     assert event.media_urls == [str(media.resolve())]
     assert event.media_types == ["image/jpeg"]
+    assert event.source._local_inbound_has_media is True
 
 
 def test_injected_image_rejects_path_outside_controlled_media_cache(tmp_path, monkeypatch):
@@ -211,3 +214,57 @@ def test_injected_media_rejects_non_image_type_inside_cache(tmp_path, monkeypatc
     ))
     assert result == {"accepted": False, "reason": "unsupported_media_type"}
     assert runner.calls == 0
+
+
+def _tutor_source(*, skill="huangshang-math-tutor", has_media=False):
+    source = SessionSource(
+        platform=Platform.DINGTALK,
+        chat_id="cid-math",
+        chat_type="group",
+        user_id="child",
+    )
+    source._trusted_context_tail = True
+    source._local_inbound_skill = skill
+    source._local_inbound_has_media = has_media
+    return source
+
+
+def test_fast_tutoring_guard_blocks_tools_for_mid_lesson_short_answer():
+    from gateway.run_turn import _local_inbound_fast_tutoring_no_tools
+
+    source = _tutor_source()
+    history = [{"role": "assistant", "content": "C3：这道题是多少？"}]
+    assert _local_inbound_fast_tutoring_no_tools(source, "5亿元", history) is True
+    assert _local_inbound_fast_tutoring_no_tools(
+        source, "我最开始算成75升，为啥错啦？", history
+    ) is True
+
+
+def test_fast_tutoring_guard_keeps_tools_for_lifecycle_media_and_final_closeout():
+    from gateway.run_turn import _local_inbound_fast_tutoring_no_tools
+
+    source = _tutor_source()
+    history = [{"role": "assistant", "content": "C3：这道题是多少？"}]
+    assert _local_inbound_fast_tutoring_no_tools(source, "开始", history) is False
+    assert _local_inbound_fast_tutoring_no_tools(source, "搜集数学资料", history) is False
+
+    image_source = _tutor_source(has_media=True)
+    assert _local_inbound_fast_tutoring_no_tools(image_source, "讲第二题", history) is False
+
+    final_history = [{"role": "assistant", "content": "E1（最后一题）：请说说理由。"}]
+    assert _local_inbound_fast_tutoring_no_tools(source, "因为单位1变了", final_history) is False
+
+
+def test_fast_tutoring_guard_is_scoped_to_trusted_learning_group():
+    from gateway.run_turn import _local_inbound_fast_tutoring_no_tools
+
+    source = _tutor_source(skill="unrelated-skill")
+    assert _local_inbound_fast_tutoring_no_tools(
+        source, "5亿元", [{"role": "assistant", "content": "C3"}]
+    ) is False
+
+    dm = _tutor_source()
+    dm.chat_type = "dm"
+    assert _local_inbound_fast_tutoring_no_tools(
+        dm, "5亿元", [{"role": "assistant", "content": "C3"}]
+    ) is False
