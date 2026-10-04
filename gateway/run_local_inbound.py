@@ -115,6 +115,11 @@ async def _execute_local_inbound(runner, params: dict[str, Any]) -> dict[str, An
     source._local_inbound_response_future = response_future
 
     skill = _clean(params.get("skill"))
+    # Keep the trusted sidecar's explicit tutoring identity process-local. The
+    # gateway uses it only to apply the fast-tutoring runtime guard; it is never
+    # persisted into SessionSource or accepted from public platform payloads.
+    source._local_inbound_skill = skill
+    source._local_inbound_has_media = bool(media_urls)
     auto_skill = [skill] if skill else (
         adapter._resolve_channel_skills(chat_id)
         if hasattr(adapter, "_resolve_channel_skills") else None

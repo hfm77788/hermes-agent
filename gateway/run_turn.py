@@ -63,6 +63,68 @@ def _publish_local_inbound_response(source, response) -> None:
     future.set_result(str(final or ""))
 
 
+_FAST_TUTORING_SKILLS = frozenset({
+    "huangshang-math-tutor",
+    "huangshang-english-tutor",
+    "jiayin-math-tutor",
+    "jiayin-physics-tutor",
+})
+_FAST_TUTORING_TOOLFUL_PREFIXES = (
+    "开始", "开练", "数学练习", "英语练习", "对勾打团来", "兑勾打团来",
+)
+_FAST_TUTORING_TOOLFUL_MARKERS = (
+    "结束", "收工", "暂停", "不练", "交卷", "保存", "记录",
+    "搜集", "搜索", "查资料", "查教材", "教材", "题库", "档案",
+    "复盘", "总结", "学习计划", "周报",
+)
+_FAST_TUTORING_FINAL_MARKERS = (
+    "q10", "q 10", "第10题", "第 10 题", "e1", "最后一题", "最后一关",
+    "答完这题就交卷", "答完这题交卷",
+)
+
+
+def _local_inbound_fast_tutoring_no_tools(
+    source: "SessionSource", message: str, history: List[Dict[str, Any]],
+) -> bool:
+    """Return True for ordinary in-flight tutoring replies that must stay tool-free.
+
+    Only trusted local DingTalk group injections carrying one of the education
+    tutor skills qualify. Lifecycle, retrieval, media and final-question turns
+    retain the normal tool surface.
+    """
+    if (
+        source.platform != Platform.DINGTALK
+        or str(getattr(source, "chat_type", "") or "").lower() != "group"
+        or not getattr(source, "_trusted_context_tail", False)
+    ):
+        return False
+    if getattr(source, "_local_inbound_has_media", False):
+        return False
+    if str(getattr(source, "_local_inbound_skill", "") or "") not in _FAST_TUTORING_SKILLS:
+        return False
+
+    text = str(message or "").strip()
+    if not text or len(text) > 600:
+        return False
+    lowered = text.lower()
+    if any(lowered.startswith(marker.lower()) for marker in _FAST_TUTORING_TOOLFUL_PREFIXES):
+        return False
+    if any(marker.lower() in lowered for marker in _FAST_TUTORING_TOOLFUL_MARKERS):
+        return False
+
+    # The answer to the explicitly final question may need the closeout/write
+    # path. Detect it from the latest assistant turn instead of guessing from
+    # the child's short answer text.
+    for item in reversed(history or []):
+        if str(item.get("role") or "").lower() != "assistant":
+            continue
+        content = str(item.get("content") or "").lower()
+        if any(marker in content for marker in _FAST_TUTORING_FINAL_MARKERS):
+            return False
+        break
+    return True
+
+
 _tool_call_logger_lock = threading.Lock()
 
 
@@ -4341,6 +4403,16 @@ class GatewayTurnMixin:
         from run_agent import AIAgent
 
         disp = self._run_agent_display_settings(source)
+        if _local_inbound_fast_tutoring_no_tools(source, message, history):
+            # A non-empty zero-tool toolset is deliberate: an empty selection is
+            # treated as unconfigured/default in several tool-resolution paths.
+            disp = dataclasses.replace(disp, enabled_toolsets=["bot_room"])
+            logger.info(
+                "fast tutoring guard: tool-free turn platform=%s chat=%s skill=%s",
+                getattr(source.platform, "value", source.platform),
+                source.chat_id,
+                getattr(source, "_local_inbound_skill", ""),
+            )
         if scheduled_heartbeat:
             # A heartbeat is proactive work: tool chrome, drafts, thinking and periodic
             # liveness notices would create a user-visible ping before its final result is known.
