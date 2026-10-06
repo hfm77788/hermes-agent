@@ -8,6 +8,7 @@ ConditionPathExists=%h/.hermes/learning/edu-agent/config/dingtalk-free-response-
 Type=oneshot
 Environment=HOME=%h
 Environment=PYTHONUNBUFFERED=1
+Environment=PATH=%h/.hermes/hermes-agent/venv/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=%h/.hermes/hermes-agent
 ExecStart=%h/.hermes/hermes-agent/venv/bin/python %h/.hermes/hermes-agent/scripts/ops/hema_teacher_daily_health.py --write-state
 TimeoutStartSec=10min
