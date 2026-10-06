@@ -27,7 +27,7 @@ from typing import Any
 
 import yaml
 
-from gateway.control_socket import inject_gateway_local_inbound
+from gateway.control_socket import inject_gateway_local_inbound, query_gateway_control
 
 SCHEMA = "hermes.hema_teacher_daily_health.v1"
 HOME = Path.home() / ".hermes"
@@ -37,6 +37,7 @@ BRIDGE_CONFIG = HOME / "learning" / "edu-agent" / "config" / "dingtalk-free-resp
 GATEWAY_SERVICE = "hermes-gateway.service"
 BRIDGE_SERVICE = "hema-dingtalk-free-response-bridge.service"
 PROFILE = "hema-teacher"
+HERMES_BIN = str(REPO / "venv" / "bin" / "hermes")
 DEFAULT_CONTEXT_COMPRESS_PCT = 60
 DEFAULT_LATENCY_WARN_MS = 12_000
 DEFAULT_LATENCY_FAIL_MS = 25_000
@@ -121,7 +122,7 @@ def runtime_state(repo: Path = REPO, home: Path = HOME) -> dict[str, Any]:
 
 def prompt_footprint() -> dict[str, Any]:
     rc, out, err = run(
-        ["hermes", "-p", PROFILE, "prompt-size", "--platform", "dingtalk", "--json"],
+        [HERMES_BIN, "-p", PROFILE, "prompt-size", "--platform", "dingtalk", "--json"],
         timeout=45,
         env={**os.environ, "HERMES_SESSION_PLATFORM": "dingtalk"},
     )
@@ -203,16 +204,38 @@ def inject(route: dict[str, str], text: str, *, message_id: str, timeout: int = 
     return result if isinstance(result, dict) else {"accepted": False, "reason": "gateway_unavailable"}
 
 
-def parse_context(text: str) -> dict[str, int] | None:
-    match = _CONTEXT_RE.search(text or "")
-    if not match:
-        return None
-    used = int(match.group("used").replace(",", ""))
-    total = int(match.group("total").replace(",", ""))
-    pct = int(match.group("pct"))
-    if total <= 0:
-        return None
-    return {"used": used, "total": total, "pct": pct}
+def session_health(
+    route: dict[str, str],
+    *,
+    action: str = "inspect",
+    expected_message_prefix: str = "",
+    expected_text: str = "/context",
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    params = {
+        "profile": route.get("profile") or PROFILE,
+        "platform": "dingtalk",
+        "chat_id": route["chat_id"],
+        "chat_name": route.get("chat_name") or "healthcheck",
+        "chat_type": "group",
+        "user_id": route["user_id"],
+        "user_id_alt": route.get("user_id_alt") or route["user_id"],
+        "user_name": route.get("role") or "healthcheck",
+        "action": action,
+    }
+    if expected_message_prefix:
+        params["expected_message_prefix"] = expected_message_prefix
+        params["expected_text"] = expected_text
+    result = query_gateway_control(
+        HOME,
+        "local-session-health",
+        params=params,
+        timeout=timeout if timeout is not None else (190.0 if action == "compress" else 25.0),
+    )
+    return result if isinstance(result, dict) else {
+        "accepted": False,
+        "reason": "session_health_control_unavailable",
+    }
 
 
 def check_and_compact_contexts(
@@ -221,75 +244,106 @@ def check_and_compact_contexts(
     threshold_pct: int = DEFAULT_CONTEXT_COMPRESS_PCT,
     allow_compaction: bool = True,
 ) -> tuple[list[dict[str, Any]], list[Signal]]:
+    """Inspect existing tutoring sessions without adding a conversation turn."""
     results: list[dict[str, Any]] = []
     signals: list[Signal] = []
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    for idx, route in enumerate(routes):
+    for route in routes:
         route_key = short_hash(f"{route['chat_id']}|{route['user_id']}")
-        before = inject(route, "/context", message_id=f"hema-health-context-{stamp}-{idx}-before")
+        before = session_health(route, action="inspect")
         row: dict[str, Any] = {
             "route": route_key,
             "accepted": bool(before.get("accepted")),
             "reason": before.get("reason"),
-            "session_id": short_hash(str(before.get("session_id") or "")) if before.get("session_id") else None,
-            "elapsed_ms": before.get("elapsed_ms"),
+            "found": bool(before.get("found")),
+            "session_id": (
+                short_hash(str(before.get("session_id") or ""))
+                if before.get("session_id") else None
+            ),
+            "busy": bool(before.get("busy")),
+            "before": {
+                "used": before.get("last_prompt_tokens"),
+                "total": before.get("context_length"),
+                "pct": before.get("context_pct"),
+                "model": before.get("model"),
+            } if before.get("found") else None,
         }
         if not before.get("accepted"):
-            if before.get("reason") == "session_busy":
-                signals.append(
-                    Signal(
-                        "info",
-                        "context_probe_deferred_busy",
-                        f"route={route_key} active lesson/session; no forced compaction",
-                        self_healed=True,
-                    )
+            signals.append(
+                Signal(
+                    "high",
+                    "context_probe_failed",
+                    f"route={route_key} reason={before.get('reason')}",
                 )
-            else:
-                signals.append(
-                    Signal("high", "context_probe_failed", f"route={route_key} reason={before.get('reason')}")
-                )
+            )
             results.append(row)
             continue
-        context = parse_context(str(before.get("response") or ""))
-        row["before"] = context
-        if not context or context["pct"] < threshold_pct:
+        if not before.get("found"):
             results.append(row)
             continue
+        if before.get("busy"):
+            signals.append(
+                Signal(
+                    "info",
+                    "context_probe_deferred_busy",
+                    f"route={route_key} active lesson/session; no forced compaction",
+                    self_healed=True,
+                )
+            )
+            results.append(row)
+            continue
+
+        pct = before.get("context_pct")
+        used = int(before.get("last_prompt_tokens") or 0)
+        if used > 0 and pct is None:
+            signals.append(
+                Signal(
+                    "medium",
+                    "context_window_unknown",
+                    f"route={route_key} used={used}",
+                )
+            )
+            results.append(row)
+            continue
+        if not isinstance(pct, (int, float)) or pct < threshold_pct:
+            results.append(row)
+            continue
+
         row["compression_triggered"] = True
         if not allow_compaction:
             signals.append(
                 Signal(
                     "medium",
                     "context_pressure",
-                    f"route={route_key} pct={context['pct']} threshold={threshold_pct}",
+                    f"route={route_key} pct={pct} threshold={threshold_pct}",
                 )
             )
             results.append(row)
             continue
 
-        comp = inject(route, "/compress here 6", message_id=f"hema-health-context-{stamp}-{idx}-compress")
+        comp = session_health(route, action="compress", timeout=190)
         row["compression_accepted"] = bool(comp.get("accepted"))
-        row["compression_elapsed_ms"] = comp.get("elapsed_ms")
-        if not comp.get("accepted"):
-            signals.append(
-                Signal(
-                    "high",
-                    "proactive_compaction_failed",
-                    f"route={route_key} reason={comp.get('reason')}",
-                )
+        row["compression_changed"] = bool(comp.get("changed"))
+        row["compression_reason"] = comp.get("reason")
+        row["after"] = {
+            "used": comp.get("last_prompt_tokens"),
+            "total": comp.get("context_length"),
+            "pct": comp.get("context_pct"),
+            "model": comp.get("model"),
+        }
+        after_pct = comp.get("context_pct")
+        if (
+            comp.get("accepted")
+            and comp.get("compressed")
+            and (
+                after_pct is None
+                or (isinstance(after_pct, (int, float)) and after_pct < threshold_pct)
             )
-            results.append(row)
-            continue
-
-        after = inject(route, "/context", message_id=f"hema-health-context-{stamp}-{idx}-after")
-        after_ctx = parse_context(str(after.get("response") or "")) if after.get("accepted") else None
-        row["after"] = after_ctx
-        if after.get("accepted") and (after_ctx is None or after_ctx["pct"] < threshold_pct):
+        ):
             signals.append(
                 Signal(
                     "info",
                     "context_precompressed",
-                    f"route={route_key} before={context['pct']}% after={after_ctx['pct'] if after_ctx else 'reset'}",
+                    f"route={route_key} before={pct}% after={after_pct}",
                     self_healed=True,
                 )
             )
@@ -298,7 +352,7 @@ def check_and_compact_contexts(
                 Signal(
                     "high",
                     "proactive_compaction_unverified",
-                    f"route={route_key} before={context['pct']}% after={after_ctx}",
+                    f"route={route_key} before={pct}% reason={comp.get('reason')} after={after_pct}",
                 )
             )
         results.append(row)
@@ -494,7 +548,7 @@ def dispatch_chief_engineer(
     )
     rc, out, err = run(
         [
-            "hermes", "kanban", "create", f"[自动维修] 河马老师体检异常 {day}",
+            HERMES_BIN, "kanban", "create", f"[自动维修] 河马老师体检异常 {day}",
             "--body-file", str(body_path),
             "--assignee", "chief-engineer",
             "--idempotency-key", idempotency_key,
@@ -527,7 +581,7 @@ def dispatch_chief_engineer(
     if task_id and status == "blocked":
         rc2, out2, err2 = run(
             [
-                "hermes", "kanban", "unblock", task_id,
+                HERMES_BIN, "kanban", "unblock", task_id,
                 "--reason", "daily hema health incident dispatch",
             ],
             timeout=20,

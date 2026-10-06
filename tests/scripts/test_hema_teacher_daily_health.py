@@ -12,11 +12,6 @@ sys.modules[SPEC.name] = mod
 SPEC.loader.exec_module(mod)
 
 
-def test_parse_context_accepts_locale_independent_numeric_shape():
-    out = mod.parse_context("Context\nIn use: ~76,800 / 128,000 (~60%)\n")
-    assert out == {"used": 76800, "total": 128000, "pct": 60}
-
-
 def test_build_signals_flags_infra_drift_disk_and_prompt():
     services = {
         mod.GATEWAY_SERVICE: {"active": False, "state": "inactive"},
@@ -53,7 +48,7 @@ def test_actionable_ignores_info_and_self_healed():
     assert [x.code for x in mod.actionable(signals)] == ["response_latency_yellow"]
 
 
-def test_context_pressure_triggers_compress_and_verifies(monkeypatch):
+def test_context_pressure_triggers_control_compress_and_verifies(monkeypatch):
     route = {
         "profile": "hema-teacher",
         "chat_id": "c",
@@ -66,27 +61,36 @@ def test_context_pressure_triggers_compress_and_verifies(monkeypatch):
     replies = iter([
         {
             "accepted": True,
-            "response": "x 80,000 / 100,000 (80%)",
-            "elapsed_ms": 5,
+            "found": True,
             "session_id": "s",
+            "last_prompt_tokens": 80000,
+            "context_length": 100000,
+            "context_pct": 80.0,
+            "model": "qwen",
         },
         {
             "accepted": True,
-            "response": "compressed",
-            "elapsed_ms": 20,
+            "found": True,
             "session_id": "s",
-        },
-        {
-            "accepted": True,
-            "response": "x 20,000 / 100,000 (20%)",
-            "elapsed_ms": 4,
-            "session_id": "s",
+            "compressed": True,
+            "changed": True,
+            "last_prompt_tokens": 20000,
+            "context_length": 100000,
+            "context_pct": 20.0,
+            "model": "qwen",
         },
     ])
-    monkeypatch.setattr(mod, "inject", lambda *a, **k: next(replies))
+    actions = []
+
+    def fake(_route, *, action="inspect", **_kwargs):
+        actions.append(action)
+        return next(replies)
+
+    monkeypatch.setattr(mod, "session_health", fake)
     rows, signals = mod.check_and_compact_contexts([route], threshold_pct=60)
+    assert actions == ["inspect", "compress"]
     assert rows[0]["compression_triggered"] is True
-    assert rows[0]["after"]["pct"] == 20
+    assert rows[0]["after"]["pct"] == 20.0
     assert any(x.code == "context_precompressed" and x.self_healed for x in signals)
 
 
@@ -100,23 +104,25 @@ def test_context_below_threshold_does_not_compress(monkeypatch):
         "user_id_alt": "u",
         "role": "child",
     }
-    calls = []
+    actions = []
 
-    def fake(*args, **kwargs):
-        calls.append(args[1])
+    def fake(_route, *, action="inspect", **_kwargs):
+        actions.append(action)
         return {
             "accepted": True,
-            "response": "x 30,000 / 100,000 (30%)",
-            "elapsed_ms": 4,
+            "found": True,
             "session_id": "s",
+            "last_prompt_tokens": 30000,
+            "context_length": 100000,
+            "context_pct": 30.0,
+            "model": "qwen",
         }
 
-    monkeypatch.setattr(mod, "inject", fake)
+    monkeypatch.setattr(mod, "session_health", fake)
     rows, signals = mod.check_and_compact_contexts([route], threshold_pct=60)
-    assert calls == ["/context"]
-    assert rows[0]["before"]["pct"] == 30
+    assert actions == ["inspect"]
+    assert rows[0]["before"]["pct"] == 30.0
     assert signals == []
-
 
 
 def test_busy_session_is_deferred_without_actionable_incident(monkeypatch):
@@ -129,16 +135,54 @@ def test_busy_session_is_deferred_without_actionable_incident(monkeypatch):
         "user_id_alt": "u",
         "role": "child",
     }
-    monkeypatch.setattr(
-        mod,
-        "inject",
-        lambda *a, **k: {"accepted": False, "reason": "session_busy"},
-    )
-    rows, signals = mod.check_and_compact_contexts([route], threshold_pct=60)
-    assert rows[0]["reason"] == "session_busy"
+    actions = []
+
+    def fake(_route, *, action="inspect", **_kwargs):
+        actions.append(action)
+        return {
+            "accepted": True,
+            "found": True,
+            "busy": True,
+            "session_id": "s",
+            "last_prompt_tokens": 80000,
+            "context_length": 100000,
+            "context_pct": 80.0,
+            "model": "qwen",
+        }
+
+    monkeypatch.setattr(mod, "session_health", fake)
+    _rows, signals = mod.check_and_compact_contexts([route], threshold_pct=60)
+    assert actions == ["inspect"]
     assert [x.code for x in signals] == ["context_probe_deferred_busy"]
     assert signals[0].self_healed is True
     assert mod.actionable(signals) == []
+
+
+def test_unknown_context_window_is_actionable(monkeypatch):
+    route = {
+        "profile": "hema-teacher",
+        "chat_id": "c",
+        "chat_name": "g",
+        "skill": "huangshang-math-tutor",
+        "user_id": "u",
+        "user_id_alt": "u",
+        "role": "child",
+    }
+    monkeypatch.setattr(
+        mod,
+        "session_health",
+        lambda *_a, **_k: {
+            "accepted": True,
+            "found": True,
+            "session_id": "s",
+            "last_prompt_tokens": 50000,
+            "context_length": 0,
+            "context_pct": None,
+            "model": "qwen",
+        },
+    )
+    _rows, signals = mod.check_and_compact_contexts([route], threshold_pct=60)
+    assert [x.code for x in signals] == ["context_window_unknown"]
 
 
 def test_incident_body_requires_post_repair_green(tmp_path):

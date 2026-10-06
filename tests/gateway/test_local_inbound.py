@@ -2,7 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 from gateway.config import Platform
-from gateway.run_local_inbound import inject_local_inbound
+from gateway.run_local_inbound import inject_local_inbound, _local_session_health
 from gateway.session import SessionSource
 
 
@@ -40,9 +40,9 @@ class FakeRunner:
         self._profile_adapters = {
             "hema-teacher": {Platform.DINGTALK: self.adapter}
         }
-        self.session_store = SimpleNamespace(
-            _entries={"session-key": SimpleNamespace(session_id="sid-live")}
-        )
+        self.entry = SimpleNamespace(session_id="sid-live", last_prompt_tokens=60000)
+        self.session_store = SimpleNamespace(_entries={"session-key": self.entry})
+        self.async_session_store = SimpleNamespace()
         self.calls = 0
 
     def _is_session_running(self, _key):
@@ -106,6 +106,44 @@ def test_duplicate_message_id_returns_cached_result_without_second_turn():
     first, second = asyncio.run(scenario())
     assert first == second
     assert runner.calls == 1
+
+
+def test_local_session_health_inspects_without_creating_turn():
+    runner = FakeRunner()
+
+    async def resolve(_agent, _ctx, _entry, _source):
+        return 60000, 100000, "qwen-test"
+
+    runner._resident_agent_for = lambda _key: None
+    runner._resolve_context_figures = resolve
+
+    result = asyncio.run(_local_session_health(runner, _payload(action="inspect")))
+    assert result["accepted"] is True
+    assert result["found"] is True
+    assert result["last_prompt_tokens"] == 60000
+    assert result["context_length"] == 100000
+    assert result["context_pct"] == 60.0
+    assert runner.calls == 0
+
+
+def test_local_session_health_busy_compress_is_fail_closed():
+    runner = FakeRunner()
+
+    async def resolve(_agent, _ctx, _entry, _source):
+        return 70000, 100000, "qwen-test"
+
+    runner._resident_agent_for = lambda _key: None
+    runner._resolve_context_figures = resolve
+    runner._is_session_running = lambda _key: True
+
+    result = asyncio.run(_local_session_health(runner, _payload(action="compress")))
+    assert result["accepted"] is True
+    assert result["busy"] is True
+    assert result["changed"] is False
+    assert result["reason"] == "session_busy"
+    assert runner.calls == 0
+
+
 def test_unsupported_platform_fails_closed():
     runner = FakeRunner()
     payload = _payload()

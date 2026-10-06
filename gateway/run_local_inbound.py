@@ -211,3 +211,175 @@ def local_inbound_verb(runner, loop):
         return future.result(timeout=timeout)
 
     return handler
+
+async def _local_session_health(runner, params: dict[str, Any]) -> dict[str, Any]:
+    """Inspect or maintain one existing local session without creating a user turn."""
+    profile = _clean(params.get("profile")) or "default"
+    if _clean(params.get("platform")).lower() != "dingtalk":
+        return {"accepted": False, "reason": "unsupported_platform"}
+
+    chat_id = _clean(params.get("chat_id"))
+    user_id = _clean(params.get("user_id"))
+    user_id_alt = _clean(params.get("user_id_alt"))
+    if not (chat_id and user_id):
+        return {"accepted": False, "reason": "missing_required_field"}
+
+    adapter = _profile_adapter(runner, profile, Platform.DINGTALK)
+    if adapter is None:
+        return {"accepted": False, "reason": "adapter_unavailable"}
+    source = adapter.build_source(
+        chat_id=chat_id,
+        chat_name=_clean(params.get("chat_name")) or None,
+        chat_type=_clean(params.get("chat_type")) or "group",
+        user_id=user_id,
+        user_name=_clean(params.get("user_name")) or user_id,
+        user_id_alt=user_id_alt or None,
+        message_id=None,
+    )
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.TEXT,
+        user_id=source.user_id,
+        user_name=source.user_name,
+        source=source,
+    )
+    session_key = adapter._event_session_key(event)
+    entries = getattr(getattr(runner, "session_store", None), "_entries", None) or {}
+    entry = entries.get(session_key)
+    if entry is None:
+        return {"accepted": True, "found": False, "session_key": session_key}
+
+    adapter_busy = session_key in getattr(adapter, "_active_sessions", {})
+    runner_busy = bool(
+        callable(getattr(runner, "_is_session_running", None))
+        and runner._is_session_running(session_key)
+    )
+    busy = bool(adapter_busy or runner_busy)
+    resident = (
+        runner._resident_agent_for(session_key)
+        if callable(getattr(runner, "_resident_agent_for", None))
+        else None
+    )
+    ctx = getattr(resident, "context_compressor", None) if resident is not None else None
+    resolver = getattr(runner, "_resolve_context_figures", None)
+    if callable(resolver):
+        used, total, model = await resolver(resident, ctx, entry, source)
+    else:
+        used = max(0, int(getattr(entry, "last_prompt_tokens", 0) or 0))
+        total = 0
+        model = ""
+    used = max(0, int(used or 0))
+    total = max(0, int(total or 0))
+
+    def snapshot(**extra: Any) -> dict[str, Any]:
+        return {
+            "accepted": True,
+            "found": True,
+            "session_key": session_key,
+            "session_id": str(getattr(entry, "session_id", "") or ""),
+            "busy": busy,
+            "last_prompt_tokens": used,
+            "context_length": total,
+            "context_pct": round((used / total) * 100, 1) if total else None,
+            "model": str(model or ""),
+            **extra,
+        }
+
+    action = _clean(params.get("action"), limit=64).lower() or "inspect"
+    if action == "inspect":
+        return snapshot()
+    if busy:
+        return snapshot(action=action, changed=False, reason="session_busy")
+
+    store = getattr(runner, "async_session_store", None)
+    if store is None:
+        return snapshot(action=action, changed=False, reason="session_store_unavailable")
+
+    if action != "compress":
+        return snapshot(action=action, changed=False, reason="unsupported_action")
+
+    try:
+        history = await store.load_transcript(entry.session_id)
+    except Exception as exc:
+        return snapshot(
+            action=action,
+            changed=False,
+            reason=f"transcript_read_failed:{type(exc).__name__}",
+        )
+    from agent.conversation_compression_manual import MIN_MESSAGES, parse_compress_args
+    messages = [
+        row for row in history
+        if isinstance(row, dict) and row.get("role") in {"user", "assistant", "tool"}
+    ]
+    if len(messages) < MIN_MESSAGES:
+        return snapshot(action=action, changed=False, reason="not_enough_messages")
+
+    request = parse_compress_args("here 6")
+    try:
+        from gateway.run import _profile_runtime_scope
+        with _profile_runtime_scope(runner._resolve_profile_home_for_source(source)):
+            await runner._run_manual_compression(source, entry, history, request)
+    except Exception as exc:
+        return snapshot(
+            action=action,
+            changed=False,
+            reason=f"compression_failed:{type(exc).__name__}",
+        )
+
+    refreshed_entry = (
+        (getattr(getattr(runner, "session_store", None), "_entries", None) or {}).get(session_key)
+        or entry
+    )
+    refreshed_resident = (
+        runner._resident_agent_for(session_key)
+        if callable(getattr(runner, "_resident_agent_for", None))
+        else None
+    )
+    refreshed_ctx = (
+        getattr(refreshed_resident, "context_compressor", None)
+        if refreshed_resident is not None else None
+    )
+    if callable(resolver):
+        after_used, after_total, after_model = await resolver(
+            refreshed_resident, refreshed_ctx, refreshed_entry, source
+        )
+    else:
+        after_used = max(0, int(getattr(refreshed_entry, "last_prompt_tokens", 0) or 0))
+        after_total = total
+        after_model = model
+    after_used = max(0, int(after_used or 0))
+    after_total = max(0, int(after_total or 0))
+    return {
+        "accepted": True,
+        "found": True,
+        "session_key": session_key,
+        "session_id": str(getattr(refreshed_entry, "session_id", "") or ""),
+        "busy": False,
+        "action": "compress",
+        "changed": after_used < used,
+        "compressed": after_used < used,
+        "before_prompt_tokens": used,
+        "last_prompt_tokens": after_used,
+        "context_length": after_total,
+        "context_pct": round((after_used / after_total) * 100, 1) if after_total else None,
+        "model": str(after_model or ""),
+    }
+
+
+def local_session_health_verb(runner, loop):
+    """Control socket handler for zero-presentation session inspection and maintenance."""
+    def handler(params: dict[str, Any]) -> dict[str, Any]:
+        action = _clean(params.get("action"), limit=64).lower() or "inspect"
+        timeout = 185.0 if action == "compress" else 20.0
+        future = asyncio.run_coroutine_threadsafe(
+            _local_session_health(runner, params), loop
+        )
+        try:
+            return future.result(timeout=timeout)
+        except Exception as exc:
+            return {
+                "accepted": False,
+                "reason": f"control_failed:{type(exc).__name__}",
+            }
+
+    return handler
