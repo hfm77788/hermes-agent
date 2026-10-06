@@ -55,12 +55,24 @@ def _turn_presentation_muted(display_metadata, platform, user_config, source) ->
 
 
 def _publish_local_inbound_response(source, response) -> None:
-    """Return the authoritative final text to a trusted local sidecar, if one is waiting."""
+    """Return the authoritative final text to a trusted local sidecar, if one is waiting.
+
+    Local inbound bridges bypass the gateway's later final-send normalization, so this is
+    a security/reliability boundary: failed/partial turns must never hand raw tool/provider
+    diagnostics to DingTalk (or another chat sidecar).
+    """
     future = getattr(source, "_local_inbound_response_future", None)
     if not isinstance(future, asyncio.Future) or future.done():
         return
     final = response.get("final_response", "") if isinstance(response, dict) else ""
-    future.set_result(str(final or ""))
+    final = str(final or "")
+    # Reuse the normal chat boundary for partial/failed turn copy, provider envelopes, secret
+    # redaction and transport sentinels. Import lazily because gateway.run imports this mixin.
+    from gateway.run import _normalize_empty_agent_response, _sanitize_gateway_final_response
+    if isinstance(response, dict):
+        final = _normalize_empty_agent_response(response, final, history_len=0)
+    final = _sanitize_gateway_final_response(source.platform, final)
+    future.set_result(final)
 
 
 _FAST_TUTORING_SKILLS = frozenset({
