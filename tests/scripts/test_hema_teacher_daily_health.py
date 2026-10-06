@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).parents[2] / "scripts" / "ops" / "hema_teacher_daily_health.py"
 SPEC = importlib.util.spec_from_file_location("hema_teacher_daily_health", MODULE_PATH)
 mod = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
+sys.modules[SPEC.name] = mod
 SPEC.loader.exec_module(mod)
 
 
