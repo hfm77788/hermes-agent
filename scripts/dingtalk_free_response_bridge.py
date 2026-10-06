@@ -27,6 +27,104 @@ _IMAGE_PLACEHOLDER_RE = re.compile(r"\[图片消息\]\(mediaId=[^)]+\)")
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic"}
 
 
+_MATH_PLAIN_TEXT_SKILLS = frozenset({"huangshang-math-tutor", "jiayin-math-tutor"})
+_RAW_MATH_MARKUP_RE = re.compile(r"\\(?:[A-Za-z]+|[\(\)\[\]\{\}])")
+
+
+def _take_braced(value: str, start: int) -> tuple[str, int] | None:
+    if start >= len(value) or value[start] != "{":
+        return None
+    depth = 0
+    for index in range(start, len(value)):
+        char = value[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return value[start + 1 : index], index + 1
+    return None
+
+
+def _replace_fraction_commands(value: str) -> str:
+    for command in (r"\dfrac", r"\frac"):
+        while command in value:
+            start = value.find(command)
+            first = _take_braced(value, start + len(command))
+            if first is None:
+                break
+            numerator, after_first = first
+            second = _take_braced(value, after_first)
+            if second is None:
+                break
+            denominator, after_second = second
+            value = value[:start] + f"({numerator})/({denominator})" + value[after_second:]
+    return value
+
+
+def _replace_sqrt_commands(value: str) -> str:
+    command = r"\sqrt"
+    while command in value:
+        start = value.find(command)
+        item = _take_braced(value, start + len(command))
+        if item is None:
+            break
+        radicand, after = item
+        value = value[:start] + f"√({radicand})" + value[after:]
+    return value
+
+
+def _plain_markdown_tables(value: str) -> str:
+    lines: list[str] = []
+    separator = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
+    for line in value.splitlines():
+        if separator.fullmatch(line):
+            continue
+        stripped = line.strip()
+        if stripped.startswith("|") and stripped.endswith("|") and line.count("|") >= 2:
+            cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+            lines.append("  ".join(cell for cell in cells if cell))
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _normalize_dingtalk_math_reply(value: str) -> str:
+    """Render model math markup as DingTalk-safe plain text without semantic guessing."""
+    out = str(value or "")
+    out = _replace_fraction_commands(out)
+    out = _replace_sqrt_commands(out)
+    replacements = (
+        (r"\subseteq", "⊆"), (r"\notin", "∉"), (r"\times", "×"),
+        (r"\div", "÷"), (r"\pm", "±"), (r"\neq", "≠"), (r"\ne", "≠"),
+        (r"\geq", "≥"), (r"\ge", "≥"), (r"\leq", "≤"), (r"\le", "≤"),
+        (r"\in", "∈"),
+    )
+    for raw, rendered in replacements:
+        out = re.sub(re.escape(raw) + r"(?![A-Za-z])", rendered, out)
+    out = out.replace(r"\left", "").replace(r"\right", "")
+    out = out.replace("$", "").replace("$", "")
+    for delimiter in (r"\(", r"\)", r"\[", r"\]"):
+        out = out.replace(delimiter, "")
+    out = re.sub(r"([A-Za-z0-9\)\]])\^\{?2\}?", r"\1²", out)
+    out = re.sub(r"([A-Za-z0-9\)\]])\^\{?3\}?", r"\1³", out)
+    out = _plain_markdown_tables(out)
+    fence = chr(96) * 3
+    tick = chr(96)
+    out = out.replace(fence, "").replace(tick, "").replace("**", "").strip()
+    if "$" in out or tick in out or "**" in out or _RAW_MATH_MARKUP_RE.search(out):
+        raise ValueError("dingtalk_math_markup_residual")
+    if not out:
+        raise ValueError("dingtalk_math_reply_empty_after_normalization")
+    return out
+
+
+def _prepare_dingtalk_reply(skill: str, value: str) -> str:
+    if skill not in _MATH_PLAIN_TEXT_SKILLS:
+        return value
+    return _normalize_dingtalk_math_reply(value)
+
+
 @dataclass(frozen=True)
 class MemberRoute:
     open_dingtalk_id: str
@@ -440,6 +538,12 @@ class Bridge:
         return reply
 
     def _send_reply(self, group: GroupRoute, reply: str) -> None:
+        try:
+            reply = _prepare_dingtalk_reply(group.skill, reply)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"DingTalk math outbound blocked before send: {exc}"
+            ) from exc
         proc = self._run(
             [
                 self.dws,
