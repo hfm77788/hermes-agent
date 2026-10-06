@@ -43,6 +43,7 @@ def test_non_math_route_is_not_rewritten() -> None:
 def test_supported_sqrt_and_markdown_are_rendered_without_markup() -> None:
     raw = "### 题目\n**求值**：$\\sqrt{9} \\times 2$\n\n| 项 | 值 |\n|---|---|\n| A | 6 |"
     rendered = _normalize_dingtalk_math_reply(raw)
+    assert rendered.startswith("题目\n求值：")
     assert "√(9) × 2" in rendered
     assert "项  值" in rendered
     assert "A  6" in rendered

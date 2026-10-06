@@ -80,6 +80,7 @@ def _plain_markdown_tables(value: str) -> str:
     for line in value.splitlines():
         if separator.fullmatch(line):
             continue
+        line = re.sub(r"^\s{0,3}#{1,6}\s+", "", line)
         stripped = line.strip()
         if stripped.startswith("|") and stripped.endswith("|") and line.count("|") >= 2:
             cells = [cell.strip() for cell in stripped.strip("|").split("|")]
@@ -95,10 +96,12 @@ def _normalize_dingtalk_math_reply(value: str) -> str:
     out = _replace_fraction_commands(out)
     out = _replace_sqrt_commands(out)
     replacements = (
-        (r"\subseteq", "⊆"), (r"\notin", "∉"), (r"\times", "×"),
-        (r"\div", "÷"), (r"\pm", "±"), (r"\neq", "≠"), (r"\ne", "≠"),
-        (r"\geq", "≥"), (r"\ge", "≥"), (r"\leq", "≤"), (r"\le", "≤"),
-        (r"\in", "∈"),
+        (r"\Rightarrow", "⇒"), (r"\rightarrow", "→"), (r"\subseteq", "⊆"),
+        (r"\emptyset", "∅"), (r"\notin", "∉"), (r"\times", "×"),
+        (r"\cdot", "·"), (r"\div", "÷"), (r"\pm", "±"), (r"\neq", "≠"),
+        (r"\geq", "≥"), (r"\leq", "≤"), (r"\cup", "∪"), (r"\cap", "∩"),
+        (r"\iff", "⇔"), (r"\to", "→"), (r"\ne", "≠"), (r"\ge", "≥"),
+        (r"\le", "≤"), (r"\in", "∈"),
     )
     for raw, rendered in replacements:
         out = re.sub(re.escape(raw) + r"(?![A-Za-z])", rendered, out)
