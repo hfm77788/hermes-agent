@@ -675,6 +675,21 @@ _GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
     + ")",
     re.IGNORECASE)
 
+_GATEWAY_INTERNAL_FAILURE_SHAPE_RE = re.compile(
+    r"^\s*(?:model generated invalid tool call:|traceback \(most recent call last\):|"
+    r"tool call validation failed|invalid tool call arguments|invalid function_call arguments)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_gateway_internal_failure(text: str) -> bool:
+    """True only for terminal internal diagnostics on failed/partial turns.
+
+    The caller supplies the failed/partial verdict; this shape check deliberately does not
+    sanitize ordinary successful replies that happen to discuss a traceback or tool error.
+    """
+    return bool(text and _GATEWAY_INTERNAL_FAILURE_SHAPE_RE.search(str(text).strip()))
+
 
 def _looks_like_gateway_provider_error(text: str) -> bool:
     """True when text is a provider failure envelope, not normal content.
@@ -3118,6 +3133,24 @@ def _normalize_empty_agent_response(
     generic provider-failed reply and the user never sees /compact. Curated agent text survives.
     """
     is_overflow = is_context_overflow_failure_result(agent_result, history_len)
+    failure_reason = str(agent_result.get("failure_reason") or "")
+    if response and (agent_result.get("failed") or agent_result.get("partial")):
+        if _looks_like_gateway_internal_failure(response):
+            logger.warning(
+                "Agent turn ended with internal diagnostic; reply sanitized for chat. Detail: %s",
+                str(response)[:500],
+            )
+            if (
+                failure_reason == "invalid_tool_call"
+                or str(response).lstrip().lower().startswith("model generated invalid tool call:")
+            ):
+                from agent.turn_failure_copy import site_copy
+                safe = site_copy("invalid_tool_call")
+                return safe if safe.startswith("⚠️") else f"⚠️ {safe}"
+            return (
+                "⚠️ Something went wrong internally and I couldn't finish this reply safely. "
+                "Please send your message again. Technical details were kept in the gateway log."
+            )
     if response and not (is_overflow and _looks_like_gateway_provider_error(response)):
         return response
     if agent_result.get("failed"):
@@ -3125,7 +3158,6 @@ def _normalize_empty_agent_response(
         error_detail = agent_result.get("error") or "unknown error"
         error_str = str(error_detail).lower()
         # Persistence failures: suggesting /reset would destroy context without fixing storage.
-        failure_reason = str(agent_result.get("failure_reason") or "")
         if failure_reason.startswith("session_persistence_failed") or "session storage" in error_str:
             if failure_reason.endswith(":disk") or "disk" in error_str:
                 return (
@@ -3172,14 +3204,23 @@ def _normalize_empty_agent_response(
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
             return ""
         if agent_result.get("partial"):
-            # ``error`` mirrors the loop's own final text (curated, e.g. "Response truncated due to
-            # output length limit") and is kept; a raw provider envelope goes to the log instead.
+            # ``error`` is diagnostic metadata and is not always safe chat copy. Invalid-tool
+            # exhaustion historically put the rejected tool name here verbatim; keep that detail
+            # in logs while rendering a stable user-facing failure category.
             err = str(agent_result.get("error") or "processing incomplete")
+            failure_reason = str(agent_result.get("failure_reason") or "")
+            from agent.turn_failure_copy import SITE_FAILURE_CODES, site_copy
+            if (
+                failure_reason == "invalid_tool_call"
+                or err.lstrip().lower().startswith("model generated invalid tool call:")
+            ):
+                logger.warning("Agent turn ended on invalid tool call; internal detail kept in log: %s", err[:500])
+                safe = site_copy("invalid_tool_call")
+                return safe if safe.startswith("⚠️") else f"⚠️ {safe}"
             # A loop site code (truncated, context_overflow, ...) already wrote the full
             # what-happened / what-to-do sentence: deliver it verbatim. Wrapping it would cut it
             # mid-sentence at 200 chars and append a second, conflicting set of instructions.
-            from agent.turn_failure_copy import SITE_FAILURE_CODES
-            if (str(agent_result.get("failure_reason") or "") in SITE_FAILURE_CODES
+            if (failure_reason in SITE_FAILURE_CODES
                     and err.strip() and not _looks_like_gateway_provider_error(err)):
                 return err if err.startswith("⚠️") else f"⚠️ {err}"
             if _looks_like_gateway_provider_error(err):

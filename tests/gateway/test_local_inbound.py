@@ -184,6 +184,50 @@ def test_run_turn_publishes_authoritative_final_response():
     assert asyncio.run(scenario()) == "最终正文"
 
 
+def test_local_inbound_partial_invalid_tool_diagnostic_is_not_published():
+    from gateway.run_turn import _publish_local_inbound_response
+
+    async def scenario():
+        source = SessionSource(
+            platform=Platform.DINGTALK, chat_id="cid-math", chat_type="group", user_id="child",
+        )
+        future = asyncio.get_running_loop().create_future()
+        source._local_inbound_response_future = future
+        _publish_local_inbound_response(source, {
+            "final_response": "Model generated invalid tool call: terminal",
+            "partial": True,
+            "error": "Model generated invalid tool call: terminal",
+        })
+        return await future
+
+    reply = asyncio.run(scenario())
+    assert reply
+    assert "invalid tool call" not in reply.lower()
+    assert "terminal" not in reply.lower()
+
+
+def test_local_inbound_failed_traceback_is_not_published():
+    from gateway.run_turn import _publish_local_inbound_response
+
+    async def scenario():
+        source = SessionSource(
+            platform=Platform.DINGTALK, chat_id="cid-math", chat_type="group", user_id="child",
+        )
+        future = asyncio.get_running_loop().create_future()
+        source._local_inbound_response_future = future
+        _publish_local_inbound_response(source, {
+            "final_response": "Traceback (most recent call last):\n  File \"secret.py\", line 1",
+            "failed": True,
+            "error": "internal",
+        })
+        return await future
+
+    reply = asyncio.run(scenario())
+    assert reply
+    assert "traceback" not in reply.lower()
+    assert "secret.py" not in reply
+
+
 
 def test_injected_image_uses_photo_event_from_controlled_media_cache(tmp_path, monkeypatch):
     from gateway.platforms.event import MessageType
