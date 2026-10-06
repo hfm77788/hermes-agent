@@ -21,7 +21,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +41,10 @@ HERMES_BIN = str(REPO / "venv" / "bin" / "hermes")
 DEFAULT_CONTEXT_COMPRESS_PCT = 60
 DEFAULT_LATENCY_WARN_MS = 12_000
 DEFAULT_LATENCY_FAIL_MS = 25_000
+#: Static prompt weight alone is not an incident. large_tool_schema only becomes
+#: actionable when it accompanies latency regression or a significant jump vs
+#: the historical baseline (weekly latency governor: NOOP without >=1s gain).
+TOOL_SCHEMA_GROWTH_PCT = 25
 ERROR_PATTERNS = re.compile(
     r"gateway injection unavailable|gateway injection rejected|"
     r"summary timed out|compression .*failed|Traceback|\bERROR\b|no progress|stalled",
@@ -143,19 +147,56 @@ def prompt_footprint() -> dict[str, Any]:
         return {"ok": False, "error": f"json parse: {exc}"}
 
 
+def _effective_log_since(
+    service: str,
+    minutes: int,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Start at the newer of the rolling window or the current service process.
+
+    A repaired/restarted runtime must not stay yellow because errors from the previous
+    process are still inside the rolling journal window.
+    """
+    local_now = (now or datetime.now()).replace(microsecond=0)
+    window_start = local_now - timedelta(minutes=max(1, minutes))
+    rc, out, _ = run(
+        [
+            "systemctl", "--user", "show", service,
+            "-p", "ExecMainStartTimestamp", "--value",
+        ],
+        timeout=10,
+    )
+    if rc == 0 and out:
+        match = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", out)
+        if match:
+            try:
+                process_start = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+                window_start = max(window_start, process_start)
+            except ValueError:
+                pass
+    return window_start.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def recent_error_summary(minutes: int = 90) -> dict[str, Any]:
     rows: dict[str, Any] = {}
     for service in (GATEWAY_SERVICE, BRIDGE_SERVICE):
+        since = _effective_log_since(service, minutes)
         rc, out, err = run(
             [
                 "journalctl", "--user", "-u", service,
-                "--since", f"{minutes} minutes ago", "--no-pager", "-n", "500",
+                "--since", since, "--no-pager", "-n", "500",
             ],
             timeout=20,
         )
         text = out if rc == 0 else err
         hits = [line[-500:] for line in text.splitlines() if ERROR_PATTERNS.search(line)]
-        rows[service] = {"ok": rc == 0, "error_hits": len(hits), "tail": hits[-8:]}
+        rows[service] = {
+            "ok": rc == 0,
+            "since": since,
+            "error_hits": len(hits),
+            "tail": hits[-8:],
+        }
     return rows
 
 
@@ -476,7 +517,12 @@ def build_signals(
         if (footprint.get("system_bytes") or 0) > 75_000:
             signals.append(Signal("medium", "large_system_prompt", f"{footprint['system_bytes']}B"))
         if (footprint.get("tool_bytes") or 0) > 65_000:
-            signals.append(Signal("medium", "large_tool_schema", f"{footprint['tool_bytes']}B"))
+            # Static schema size alone is not a failure. Response latency is measured
+            # independently below; keep this as an observation so a healthy fast tutor
+            # does not generate a repair ticket just for having a rich tool surface.
+            signals.append(
+                Signal("info", "tool_schema_observation", f"{footprint['tool_bytes']}B")
+            )
     for service, row in logs.items():
         if int(row.get("error_hits") or 0) >= 3:
             signals.append(

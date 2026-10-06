@@ -34,9 +34,39 @@ def test_build_signals_flags_infra_drift_disk_and_prompt():
         "runtime_sha_drift",
         "low_disk_space",
         "large_system_prompt",
-        "large_tool_schema",
         "repeated_recent_errors",
     } <= codes
+    observations = [x for x in mod.build_signals(services, runtime, footprint, logs) if x.code == "tool_schema_observation"]
+    assert len(observations) == 1
+    assert observations[0].severity == "info"
+
+
+def test_effective_log_since_ignores_previous_runtime_errors(monkeypatch):
+    def fake_run(cmd, **_kwargs):
+        assert cmd[:4] == ["systemctl", "--user", "show", mod.BRIDGE_SERVICE]
+        return 0, "Tue 2026-10-06 17:16:10 CST", ""
+
+    monkeypatch.setattr(mod, "run", fake_run)
+    since = mod._effective_log_since(
+        mod.BRIDGE_SERVICE,
+        90,
+        now=mod.datetime(2026, 10, 6, 17, 45, 0),
+    )
+    assert since == "2026-10-06 17:16:10"
+
+
+def test_effective_log_since_keeps_rolling_window_for_old_process(monkeypatch):
+    monkeypatch.setattr(
+        mod,
+        "run",
+        lambda *_a, **_k: (0, "Tue 2026-10-06 10:00:00 CST", ""),
+    )
+    since = mod._effective_log_since(
+        mod.BRIDGE_SERVICE,
+        90,
+        now=mod.datetime(2026, 10, 6, 17, 45, 0),
+    )
+    assert since == "2026-10-06 16:15:00"
 
 
 def test_actionable_ignores_info_and_self_healed():
