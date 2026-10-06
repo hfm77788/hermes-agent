@@ -41,7 +41,7 @@ DEFAULT_CONTEXT_COMPRESS_PCT = 60
 DEFAULT_LATENCY_WARN_MS = 12_000
 DEFAULT_LATENCY_FAIL_MS = 25_000
 ERROR_PATTERNS = re.compile(
-    r"gateway injection unavailable|gateway injection rejected|session_busy|"
+    r"gateway injection unavailable|gateway injection rejected|"
     r"summary timed out|compression .*failed|Traceback|\bERROR\b|no progress|stalled",
     re.IGNORECASE,
 )
@@ -235,9 +235,19 @@ def check_and_compact_contexts(
             "elapsed_ms": before.get("elapsed_ms"),
         }
         if not before.get("accepted"):
-            signals.append(
-                Signal("high", "context_probe_failed", f"route={route_key} reason={before.get('reason')}")
-            )
+            if before.get("reason") == "session_busy":
+                signals.append(
+                    Signal(
+                        "info",
+                        "context_probe_deferred_busy",
+                        f"route={route_key} active lesson/session; no forced compaction",
+                        self_healed=True,
+                    )
+                )
+            else:
+                signals.append(
+                    Signal("high", "context_probe_failed", f"route={route_key} reason={before.get('reason')}")
+                )
             results.append(row)
             continue
         context = parse_context(str(before.get("response") or ""))
@@ -257,7 +267,7 @@ def check_and_compact_contexts(
             results.append(row)
             continue
 
-        comp = inject(route, "/compress", message_id=f"hema-health-context-{stamp}-{idx}-compress")
+        comp = inject(route, "/compress here 6", message_id=f"hema-health-context-{stamp}-{idx}-compress")
         row["compression_accepted"] = bool(comp.get("accepted"))
         row["compression_elapsed_ms"] = comp.get("elapsed_ms")
         if not comp.get("accepted"):
