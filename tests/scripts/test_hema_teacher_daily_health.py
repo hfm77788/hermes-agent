@@ -118,6 +118,29 @@ def test_context_below_threshold_does_not_compress(monkeypatch):
     assert signals == []
 
 
+
+def test_busy_session_is_deferred_without_actionable_incident(monkeypatch):
+    route = {
+        "profile": "hema-teacher",
+        "chat_id": "c",
+        "chat_name": "g",
+        "skill": "huangshang-math-tutor",
+        "user_id": "u",
+        "user_id_alt": "u",
+        "role": "child",
+    }
+    monkeypatch.setattr(
+        mod,
+        "inject",
+        lambda *a, **k: {"accepted": False, "reason": "session_busy"},
+    )
+    rows, signals = mod.check_and_compact_contexts([route], threshold_pct=60)
+    assert rows[0]["reason"] == "session_busy"
+    assert [x.code for x in signals] == ["context_probe_deferred_busy"]
+    assert signals[0].self_healed is True
+    assert mod.actionable(signals) == []
+
+
 def test_incident_body_requires_post_repair_green(tmp_path):
     package = {
         "generated_at": "now",
