@@ -77,10 +77,38 @@ _FAST_TUTORING_TOOLFUL_MARKERS = (
     "搜集", "搜索", "查资料", "查教材", "教材", "题库", "档案",
     "复盘", "总结", "学习计划", "周报",
 )
-_FAST_TUTORING_FINAL_MARKERS = (
-    "q10", "q 10", "第10题", "第 10 题", "e1", "最后一题", "最后一关",
+_FAST_TUTORING_FINAL_STRONG_MARKERS = (
+    "q10", "q 10", "第10题", "第 10 题", "e1",
     "答完这题就交卷", "答完这题交卷",
 )
+_FAST_TUTORING_FINAL_WEAK_MARKERS = ("最后一题", "最后一关")
+_FAST_TUTORING_FINAL_PROMPT_CUES = (
+    "？", "?", "请", "回答", "说说", "解释", "为什么", "多少", "怎么",
+    "计算", "算出", "写出", "选择", "填空", "判断",
+)
+
+
+def _fast_tutoring_history_requires_final_closeout(content: str) -> bool:
+    """Return True only when the latest assistant turn is an actual final prompt.
+
+    ``最后一题`` / ``最后一关`` are weak conversational phrases: a stale progress
+    statement such as ``今晚只剩最后一题`` must not unlock the full tool surface for
+    the child's next correction. Strong structured markers keep their historical
+    behavior, while weak markers must look like a concrete prompt.
+    """
+    lowered = str(content or "").lower()
+    if any(marker in lowered for marker in _FAST_TUTORING_FINAL_STRONG_MARKERS):
+        return True
+    for marker in _FAST_TUTORING_FINAL_WEAK_MARKERS:
+        marker_pos = lowered.find(marker)
+        if marker_pos < 0:
+            continue
+        tail = lowered[marker_pos + len(marker):].lstrip()
+        if any(cue in tail for cue in _FAST_TUTORING_FINAL_PROMPT_CUES):
+            return True
+        if tail.startswith(("：", ":")) and tail.lstrip("：: ").strip():
+            return True
+    return False
 
 
 def _local_inbound_fast_tutoring_no_tools(
@@ -119,7 +147,7 @@ def _local_inbound_fast_tutoring_no_tools(
         if str(item.get("role") or "").lower() != "assistant":
             continue
         content = str(item.get("content") or "").lower()
-        if any(marker in content for marker in _FAST_TUTORING_FINAL_MARKERS):
+        if _fast_tutoring_history_requires_final_closeout(content):
             return False
         break
     return True

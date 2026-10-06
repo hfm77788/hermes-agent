@@ -254,6 +254,18 @@ def test_fast_tutoring_guard_keeps_tools_for_lifecycle_media_and_final_closeout(
     final_history = [{"role": "assistant", "content": "E1（最后一题）：请说说理由。"}]
     assert _local_inbound_fast_tutoring_no_tools(source, "因为单位1变了", final_history) is False
 
+    weak_final_prompt = [{"role": "assistant", "content": "最后一题：3+5="}]
+    assert _local_inbound_fast_tutoring_no_tools(source, "8", weak_final_prompt) is False
+
+
+def test_fast_tutoring_guard_ignores_stale_final_progress_phrase_for_state_correction():
+    from gateway.run_turn import _local_inbound_fast_tutoring_no_tools
+
+    source = _tutor_source()
+    stale_history = [{"role": "assistant", "content": "今晚只剩最后一题，做完就结束。"}]
+
+    assert _local_inbound_fast_tutoring_no_tools(source, "今天还没学啊", stale_history) is True
+
 
 def test_fast_tutoring_guard_is_scoped_to_trusted_learning_group():
     from gateway.run_turn import _local_inbound_fast_tutoring_no_tools
