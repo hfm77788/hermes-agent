@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily health check and self-heal for Hermes hema-teacher
+After=network-online.target hermes-gateway.service hema-dingtalk-free-response-bridge.service
+Wants=network-online.target
+ConditionPathExists=%h/.hermes/learning/edu-agent/config/dingtalk-free-response-bridge.yaml
+
+[Service]
+Type=oneshot
+Environment=HOME=%h
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=%h/.hermes/hermes-agent
+ExecStart=%h/.hermes/hermes-agent/venv/bin/python %h/.hermes/hermes-agent/scripts/ops/hema_teacher_daily_health.py --write-state
+TimeoutStartSec=10min
+Nice=5
