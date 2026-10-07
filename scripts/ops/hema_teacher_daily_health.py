@@ -50,6 +50,25 @@ ERROR_PATTERNS = re.compile(
     r"summary timed out|compression .*failed|Traceback|\bERROR\b|no progress|stalled",
     re.IGNORECASE,
 )
+#: Agent-level chatter that self-corrects inside the conversation and is not
+#: service health: worker tool-call failures (tool_executor warnings, whose
+#: payloads embed Python tracebacks) and auxiliary-client transient retries.
+#: Infrastructure errors (injection rejections, compression failures, real
+#: ERROR log records, stalled loops) stay counted by ERROR_PATTERNS untouched.
+BENIGN_NOISE_PATTERNS = re.compile(
+    r"agent\.tool_executor: tool \S+ (?:returned error|failed)"
+    r"|auxiliary_client: .*transient transport error; retrying",
+    re.IGNORECASE,
+)
+
+
+def error_hit_lines(text: str) -> list[str]:
+    """Journal lines that signal a real service error, benign noise excluded."""
+    return [
+        line[-500:]
+        for line in text.splitlines()
+        if ERROR_PATTERNS.search(line) and not BENIGN_NOISE_PATTERNS.search(line)
+    ]
 _CONTEXT_RE = re.compile(
     r"(?P<used>\d[\d,]*)\s*/\s*(?P<total>\d[\d,]*)[^\n%]*"
     r"(?:\(|\s)(?:~)?(?P<pct>\d{1,3})%"
@@ -190,7 +209,7 @@ def recent_error_summary(minutes: int = 90) -> dict[str, Any]:
             timeout=20,
         )
         text = out if rc == 0 else err
-        hits = [line[-500:] for line in text.splitlines() if ERROR_PATTERNS.search(line)]
+        hits = error_hit_lines(text)
         rows[service] = {
             "ok": rc == 0,
             "since": since,
