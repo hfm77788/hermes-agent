@@ -78,6 +78,39 @@ def test_actionable_ignores_info_and_self_healed():
     assert [x.code for x in mod.actionable(signals)] == ["response_latency_yellow"]
 
 
+def test_error_hit_lines_excludes_agent_tool_noise():
+    text = "\n".join([
+        # worker tool-call failures (self-correct in-conversation, not service health)
+        "Oct 07 14:58:12 python[1]: 2026-10-07 14:58:12,799 WARNING agent.tool_executor: "
+        "Tool execute_code returned error (0.01s): {\"status\": \"error\", \"output\": "
+        "\"Traceback (most recent call last):\"}",
+        "Oct 07 14:58:45 python[1]: WARNING agent.tool_executor: Tool execute_code returned "
+        "error (0.00s): {\"error\": \"execute_code received a 'command' parameter\"}",
+        "Oct 07 15:02:08 python[1]: WARNING agent.tool_executor: Tool skill_view returned "
+        "error (0.15s): {\"success\": false, \"error\": \"Ambiguous skill name\"}",
+        "Oct 07 15:09:39 python[1]: INFO agent.tool_executor: tool skill_view failed "
+        "(1.14s): {\"success\": false, \"error\": \"Ambiguous skill name\"}",
+        # auxiliary transient transport retry on the same provider: self-healed by design
+        "Oct 07 14:52:28 python[1]: INFO agent.auxiliary_client: Auxiliary "
+        "gateway_fast_lane_classifier (async): transient transport error; retrying once "
+        "on the same provider before fallback: Request timed out.",
+    ])
+    assert mod.error_hit_lines(text) == []
+
+
+def test_error_hit_lines_keeps_infrastructure_errors():
+    text = "\n".join([
+        "Oct 07 14:00:00 python[1]: ERROR gateway.run: gateway injection rejected",
+        "Oct 07 14:00:01 python[1]: Traceback (most recent call last):",
+        "  File \"/home/ubuntu/.hermes/hermes-agent/gateway/run.py\", line 1, in <module>",
+        "Oct 07 14:00:02 python[1]: compression summary failed for session abc",
+        "Oct 07 14:00:03 python[1]: WARNING agent.auxiliary_client: Auxiliary x: unrecoverable error",
+    ])
+    hits = mod.error_hit_lines(text)
+    # the 'File ...run.py' traceback continuation line carries no error token
+    assert len(hits) == 4
+
+
 def test_context_pressure_triggers_control_compress_and_verifies(monkeypatch):
     route = {
         "profile": "hema-teacher",
