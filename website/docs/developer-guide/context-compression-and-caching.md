@@ -501,6 +501,7 @@ without `/steer` messages delivered after it) keeps its text results verbatim an
 results intact in the tail, so the model can use the output it requested. A round that alone
 exceeds 20% of the input budget (the context window minus the output reservation) can be
 summarized, and its older images are retired so compaction can still make room.
+This also prevents side-effecting tools from being re-run merely because their unread result was compacted away.
 
 ### Phase 2: Determine Boundaries
 
