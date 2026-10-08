@@ -344,3 +344,53 @@ def test_media_id_download_stays_inside_private_cache(tmp_path, monkeypatch):
     assert "--message-id" in calls[0][0]
     assert "--open-conversation-id" in calls[0][0]
     assert calls[0][1]["cwd"] == str(bridge.media_cache_root)
+
+
+def test_fetch_messages_retries_transient_dws_failure(tmp_path, monkeypatch):
+    # One retryable dws blip must not abort the poll loop with an ERROR.
+    bridge = Bridge(write_cfg(tmp_path))
+    bridge.fetch_attempts = 3
+
+    calls: list[int] = []
+
+    class Fail:
+        returncode = 1
+        stderr = "RuntimeError: chat_messages_incomplete retryable=true"
+        stdout = ""
+
+    class Ok:
+        returncode = 0
+        stderr = ""
+        stdout = json.dumps([{"messageId": "m1", "createTime": "2026-10-08 14:00:00"}])
+
+    def fake_run(cmd, **kwargs):
+        calls.append(1)
+        return Fail() if len(calls) == 1 else Ok()
+
+    monkeypatch.setattr(bridge, "_run", fake_run)
+    monkeypatch.setattr(bridge, "fetch_sleep", lambda *_a: None)
+    rows = bridge._fetch_messages(bridge.groups[0], "2026-10-08 13:00:00")
+    assert [m["messageId"] for m in rows] == ["m1"]
+    assert len(calls) == 2
+
+
+def test_fetch_messages_raises_only_after_all_attempts_fail(tmp_path, monkeypatch):
+    bridge = Bridge(write_cfg(tmp_path))
+    bridge.fetch_attempts = 2
+
+    class Fail:
+        returncode = 1
+        stderr = "dial tcp: i/o timeout"
+        stdout = ""
+
+    calls: list[int] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(1)
+        return Fail()
+
+    monkeypatch.setattr(bridge, "_run", fake_run)
+    monkeypatch.setattr(bridge, "fetch_sleep", lambda *_a: None)
+    with pytest.raises(RuntimeError, match="failed after 2 attempts"):
+        bridge._fetch_messages(bridge.groups[0], "2026-10-08 13:00:00")
+    assert len(calls) == 2

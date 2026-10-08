@@ -171,6 +171,9 @@ class Bridge:
             )
         )
         self.max_attempts = int(self.cfg.get("max_attempts", 3))
+        self.fetch_attempts = max(1, int(self.cfg.get("fetch_attempts", 3)))
+        self.fetch_timeout_seconds = int(self.cfg.get("fetch_timeout_seconds", 30))
+        self.fetch_sleep = time.sleep
         self.hermes_timeout = int(self.cfg.get("hermes_timeout_seconds", 180))
         self.gateway_inject = bool(self.cfg.get("gateway_inject_existing_session", False))
         self.gateway_home = Path(self.cfg.get("gateway_home", "/home/ubuntu/.hermes"))
@@ -380,17 +383,50 @@ class Bridge:
             "--format",
             "json",
         ]
-        proc = self._run(cmd, timeout=30)
-        if proc.returncode != 0:
-            raise RuntimeError(f"dws fetch failed rc={proc.returncode}: {proc.stderr[-500:]}")
-        payload = json.loads(proc.stdout or "{}")
-        if isinstance(payload, dict):
-            rows = payload.get("messages") or payload.get("items") or []
-        elif isinstance(payload, list):
-            rows = payload
-        else:
-            rows = []
-        return [x for x in rows if isinstance(x, dict)]
+        # The dws read path (mcp_gateway -> dingtalk) intermittently answers with
+        # i/o timeouts or partial-page failures it itself marks retryable. One
+        # blip must not kill the whole poll loop with a traceback ERROR: retry a
+        # bounded number of times with a short backoff, and only surface a real
+        # failure once every attempt failed.
+        last_error = ""
+        for attempt in range(1, self.fetch_attempts + 1):
+            if attempt > 1:
+                self.fetch_sleep(min(2.0 ** (attempt - 2), 4.0))
+            try:
+                proc = self._run(cmd, timeout=self.fetch_timeout_seconds)
+            except subprocess.TimeoutExpired:
+                last_error = f"timeout after {self.fetch_timeout_seconds}s"
+                LOG.warning(
+                    "dws fetch timeout group=%s attempt=%s/%s",
+                    group.name, attempt, self.fetch_attempts,
+                )
+                continue
+            if proc.returncode != 0:
+                last_error = f"rc={proc.returncode}: {proc.stderr[-500:]}"
+                LOG.warning(
+                    "dws fetch failed group=%s attempt=%s/%s error=%s",
+                    group.name, attempt, self.fetch_attempts, last_error[:200],
+                )
+                continue
+            try:
+                payload = json.loads(proc.stdout or "{}")
+            except json.JSONDecodeError as exc:
+                last_error = f"invalid json: {exc}"
+                LOG.warning(
+                    "dws fetch returned invalid json group=%s attempt=%s/%s",
+                    group.name, attempt, self.fetch_attempts,
+                )
+                continue
+            if isinstance(payload, dict):
+                rows = payload.get("messages") or payload.get("items") or []
+            elif isinstance(payload, list):
+                rows = payload
+            else:
+                rows = []
+            return [x for x in rows if isinstance(x, dict)]
+        raise RuntimeError(
+            f"dws fetch failed after {self.fetch_attempts} attempts: {last_error}"
+        )
 
     def _session_id(self, group: GroupRoute, member: MemberRoute) -> str:
         sessions = json.loads(self.sessions_json.read_text(encoding="utf-8"))
