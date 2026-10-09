@@ -16,7 +16,6 @@ from typing import Any, Dict, List, Optional
 
 from agent import empty_response_guard as _empty_guard
 from agent.message_metadata import append_message
-from agent.turn_failure_copy import site_copy
 from agent.turn_recovery import interruptible_backoff_sleep
 
 logger = logging.getLogger("agent.conversation_loop")
@@ -95,7 +94,7 @@ def _retry_empty(
 
 def _terminal_empty(agent: Any, assistant_message: Any, finish_reason: str, messages: Any) -> str:
     """Retries and fallback exhausted: persist the ``(empty)`` sentinel row and return the
-    delivery text. Reasoning is surfaced ONLY here, for delivery — the persisted row keeps
+    delivery text. Internal reasoning remains private; the persisted row keeps
     the sentinel so later "continue" turns don't replay it and loop on empties."""
     _streak_cost = _empty_guard.streak_cost_usd(agent)
     if _streak_cost is not None:
@@ -125,14 +124,16 @@ def _terminal_empty(agent: Any, assistant_message: Any, finish_reason: str, mess
         )
         return "(empty)"
 
-    reasoning_preview = reasoning_text[:500] + "..." if len(reasoning_text) > 500 else reasoning_text
+    # Internal reasoning must never be returned in the visible failure copy.
     logger.warning(
-        "Reasoning-only response (no visible content) after exhausting retries and fallback. Reasoning: %s", reasoning_preview,
+        "Reasoning-only recovery exhausted (reasoning_chars=%d model=%s provider=%s)",
+        len(reasoning_text), agent.model, agent.provider,
     )
     agent._emit_diagnostic_status(
-        "⚠️ Model produced reasoning but no visible response after all retries. Returning empty."
+        "⚠️ Model generated reasoning but no visible answer after bounded recovery."
     )
-    return site_copy("reasoning_only", model=agent.model, preview=reasoning_preview)
+    return "模型未能生成可用的回答，请重新发送当前问题。"
+
 
 
 def recover_empty_response(

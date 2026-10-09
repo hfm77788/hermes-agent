@@ -1,20 +1,16 @@
-"""Reasoning promoted on a reasoning-only clean stop is returned, never persisted as a reply.
+"""Regression: provider reasoning must never become an answer or replayable content.
 
-A clean ``stop`` with empty content and reasoning text is promoted to ``final_response`` (the
-vLLM nemotron parser files the whole answer as reasoning; re-running the empty-response ladder
-re-bills the prompt). The promoted text must NOT become the assistant row's ordinary ``content``:
-chain-of-thought stored as content is indistinguishable from a real reply on every history
-surface (#111761). The row keeps ``content`` empty and carries the text as the ``api_content``
-sidecar, so the next request still replays the answer byte-identically.
+Incident: 2026-10-09 22:18, qwen3.8-flash reasoning-only clean stop emitted
+an English internal monologue to a DingTalk student.
 """
 
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
-
 import pytest
 
-REASONING = "嗯，长度合适。Let me check the file first."
+PRIVATE = "The user said R3. Wait, am I the user? Let me reread the conversation."
+PUBLIC = "已收到，你这题答对了。下面做 C1。"
 
 
 @pytest.fixture()
@@ -28,21 +24,21 @@ def loop_agent():
         agent = AIAgent(
             api_key="test-key-1234567890",
             base_url="https://api.deepseek.com/v1",
-            model="deepseek-reasoner",
-            provider="deepseek",
+            model="qwen3.8-flash",
+            provider="custom",
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
         )
         agent.client = MagicMock()
-        agent._cached_system_prompt = "You are helpful."
+        agent._cached_system_prompt = "You are a tutoring assistant."
         agent._use_prompt_caching = False
         agent.compression_enabled = False
         agent.save_trajectories = False
         return agent
 
 
-def _run(agent, responses, user_message="hello", conversation_history=None):
+def _run(agent, responses, user_message="R3 50.24平方厘米", conversation_history=None):
     agent.client.chat.completions.create.side_effect = list(responses)
     with (
         patch.object(agent, "_persist_session"),
@@ -52,126 +48,77 @@ def _run(agent, responses, user_message="hello", conversation_history=None):
         return agent.run_conversation(user_message, conversation_history=conversation_history)
 
 
-def test_promoted_reasoning_is_returned_but_persisted_row_keeps_content_empty(loop_agent):
+def test_reasoning_only_clean_stop_requires_visible_followup(loop_agent):
     from tests.agent.test_run_agent import _mock_response
-
-    result = _run(loop_agent, [_mock_response(content="", finish_reason="stop", reasoning_content=REASONING)])
-
-    # Return contract from the parser-compat fix survives: one call, the reasoning is the answer.
-    assert result["final_response"] == REASONING
-    assert result["api_calls"] == 1
-
-    row = result["messages"][-1]
-    assert row["role"] == "assistant"
-    assert not row.get("content")  # never chain-of-thought as an ordinary reply
-    assert row["reasoning"] == REASONING
-    assert row["api_content"] == REASONING
-
-    # The next request still replays the promoted text as the assistant's own turn.
-    _run(loop_agent, [_mock_response(content="Second answer.", finish_reason="stop")],
-         user_message="next", conversation_history=result["messages"])
-    sent = loop_agent.client.chat.completions.create.call_args.kwargs["messages"]
-    assistant_rows = [m for m in sent if m.get("role") == "assistant"]
-    assert [m["role"] for m in sent] == ["system", "user", "assistant", "user"]
-    assert assistant_rows[0]["content"] == REASONING
-    assert "api_content" not in assistant_rows[0]
-
-
-def test_stall_guard_interim_row_carries_promoted_text_as_sidecar(loop_agent):
-    """Promoted reasoning that tails on an announced next action trips the stall guard; the interim
-    row it appends must follow the same shape as the final row — ``content`` empty, the promoted
-    text in ``api_content`` — so the continuation request replays a real assistant turn, not an
-    empty one (#111761)."""
-    from tests.agent.test_run_agent import _mock_response
-
-    stalled = "The user wants the file contents. Let me now read the file."
-    loop_agent.valid_tool_names = {"read_file"}
-    loop_agent._stall_guards = True
 
     result = _run(loop_agent, [
-        _mock_response(content="", finish_reason="stop", reasoning_content=stalled),
-        _mock_response(content="Here is the file.", finish_reason="stop"),
+        _mock_response(content="", finish_reason="stop", reasoning_content=PRIVATE),
+        _mock_response(content=PUBLIC, finish_reason="stop"),
     ])
 
-    assert result["final_response"] == "Here is the file."
-    interim = [m for m in result["messages"] if m.get("role") == "assistant"][0]
-    assert not interim.get("content")
-    assert interim["reasoning"] == stalled
-    assert interim["api_content"] == stalled
+    assert result["final_response"] == PUBLIC
+    assert result["api_calls"] == 2
+    assert PRIVATE not in result["final_response"]
+    assert all("api_content" not in r for r in result["messages"])
+    assert all(PRIVATE not in str(r.get("content") or "") for r in result["messages"])
 
-    # The continuation request carried the promoted text as the interim assistant turn.
-    second_call = loop_agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
-    interim_wire = [m for m in second_call if m.get("role") == "assistant"][0]
-    assert interim_wire["content"] == stalled
-    assert "api_content" not in interim_wire
-
-
-# ── planning-monologue stall: promoted reasoning must not fake a completion ──────────────────
-
-PLAN_TAILS = [
-    "Let me batch the terminal calls and run them in parallel.",
-    "...Let me load the doctrine skill first, then run checks.",
-    "Attempting to read and process the file. Initial hypothesis: the config is stale. I need to check the log.",
-]
+    # A subsequent student message must not see a false previous assistant reply
+    # made from reasoning_content; only the real visible answer may replay.
+    _run(loop_agent, [_mock_response(content="继续做题。", finish_reason="stop")],
+         user_message="下一题", conversation_history=result["messages"])
+    wire = loop_agent.client.chat.completions.create.call_args.kwargs["messages"]
+    assert all(PRIVATE not in str(r.get("content") or "") for r in wire)
+    assert any(r.get("content") == PUBLIC for r in wire if r.get("role") == "assistant")
 
 
-@pytest.mark.parametrize("tail", PLAN_TAILS)
-def test_planning_tail_reasoning_only_stop_with_tools_runs_continuation_not_completion(loop_agent, tail):
-    """Tools offered, zero tool calls, and the promoted reasoning ENDS on a first-person plan
-    ("Let me batch...", "I need to check...") — the verbatim tails from the #111761 thread. This
-    is a stalled model, not an answer: the stall-guard continuation must run (bounded by the same
-    cap) instead of returning the monologue as a 'complete' final response."""
+def test_reasoning_only_with_tools_recovers_without_exposing_private_text(loop_agent):
     from tests.agent.test_run_agent import _mock_response
-
-    loop_agent.valid_tool_names = {"terminal", "read_file"}
-    loop_agent._stall_guards = True
+    loop_agent.valid_tool_names = {"read_file"}
 
     result = _run(loop_agent, [
-        _mock_response(content="", finish_reason="stop", reasoning_content=tail),
-        _mock_response(content="Ran the checks; all green.", finish_reason="stop"),
+        _mock_response(content="", finish_reason="stop", reasoning_content=PRIVATE),
+        _mock_response(content=PUBLIC, finish_reason="stop"),
     ])
 
     assert result["api_calls"] == 2
-    assert result["final_response"] == "Ran the checks; all green."
-    interim = [m for m in result["messages"] if m.get("role") == "assistant"][0]
-    assert not interim.get("content")
-    assert interim["api_content"] == tail  # interim row keeps the sidecar shape
+    assert result["final_response"] == PUBLIC
+    assert all("api_content" not in r for r in result["messages"])
 
 
-def test_planning_tail_stall_is_bounded_by_the_continuation_cap(loop_agent):
-    """A model that never acts is nudged at most twice; the third planning-only stop is promoted
-    so the turn still ends instead of looping."""
+@pytest.mark.parametrize("reasoning", [
+    "Let me batch the terminal calls and run them in parallel.",
+    "Wait, who was the user? Let me reread the raw conversation order.",
+    "The answer is 42, but this is private reasoning.",
+])
+def test_any_reasoning_only_text_is_private_even_if_answer_like(loop_agent, reasoning):
     from tests.agent.test_run_agent import _mock_response
-
-    loop_agent.valid_tool_names = {"terminal"}
-    loop_agent._stall_guards = True
-    tail = PLAN_TAILS[0]
+    loop_agent.valid_tool_names = {"terminal", "read_file"}
 
     result = _run(loop_agent, [
-        _mock_response(content="", finish_reason="stop", reasoning_content=tail),
-        _mock_response(content="", finish_reason="stop", reasoning_content=tail),
-        _mock_response(content="", finish_reason="stop", reasoning_content=tail),
-        _mock_response(content="NEVER REACHED", finish_reason="stop"),
+        _mock_response(content=None, finish_reason="stop", reasoning_content=reasoning),
+        _mock_response(content=PUBLIC, finish_reason="stop"),
     ])
+    assert result["api_calls"] == 2
+    assert result["final_response"] == PUBLIC
+    assert reasoning not in result["final_response"]
 
-    assert result["api_calls"] == 3
-    assert result["final_response"] == tail
 
-
-def test_genuine_reasoning_only_answer_with_tools_still_promotes_on_first_call(loop_agent):
-    """The parser-compat contract survives: reasoning that states an answer (no trailing plan) is
-    returned on the first call even with tools offered, and mentioning a plan BEFORE the answer
-    does not count as a stall."""
+def test_repeated_reasoning_only_does_not_leak_on_retry_exhaustion(loop_agent):
     from tests.agent.test_run_agent import _mock_response
+    loop_agent.valid_tool_names = {"terminal"}
+    repeating = _mock_response(content="", finish_reason="stop", reasoning_content=PRIVATE)
 
-    loop_agent.valid_tool_names = {"terminal", "read_file"}
-    loop_agent._stall_guards = True
+    result = _run(loop_agent, [repeating] * 16)
+    assert 1 < result["api_calls"] < 16
+    assert PRIVATE not in result["final_response"]
+    assert "api_content" not in str(result["messages"])
+    assert "未能生成可用" in result["final_response"]
 
-    for answer in ("The answer is 42.", "Let me check the arithmetic. 6 times 7 is 42, so the answer is 42."):
-        loop_agent.client.chat.completions.create.reset_mock()
-        result = _run(loop_agent, [
-            _mock_response(content="", finish_reason="stop", reasoning_content=answer),
-            _mock_response(content="NEVER REACHED", finish_reason="stop"),
-        ])
-        assert result["api_calls"] == 1
-        assert result["final_response"] == answer
+
+def test_visible_response_with_separate_reasoning_returns_only_visible(loop_agent):
+    from tests.agent.test_run_agent import _mock_response
+    result = _run(loop_agent, [
+        _mock_response(content=PUBLIC, finish_reason="stop", reasoning_content=PRIVATE),
+    ])
+    assert result["final_response"] == PUBLIC
+    assert result["api_calls"] == 1
