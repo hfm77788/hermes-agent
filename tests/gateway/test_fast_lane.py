@@ -198,12 +198,12 @@ def test_prepare_turn_fast_lane_skips_hygiene_and_preserves_loaded_history_view_
         async_session_store=Store()
         async def _hmwa_open_session(self, *_a): return (False, False)
         def _set_session_env(self, _ctx): return ()
-        def _pinned_session_context_prompt(self, *_a): return ""
+        def _pinned_session_context_prompt(self, *_a, **_kw): return ""
         async def _hmwa_acquire_turn_lease(self, *_a): return None
         async def _mark_durable_active_turn(self, *_a): return True
         async def _hmwa_run_session_hygiene(self, *_a):
             raise AssertionError("hygiene must be skipped")
-        async def _hmwa_first_contact_notes(self, _source, history, _notes):
+        async def _hmwa_first_contact_notes(self, _source, history, _notes, *_a, **_kw):
             seen["first"]=history
         def _voice_channel_sidecar_note(self, *_a): return None
         async def _prepare_profile_scoped_inbound_message_text(self, *, history, **_kw):
@@ -217,7 +217,7 @@ def test_prepare_turn_fast_lane_skips_hygiene_and_preserves_loaded_history_view_
         def _peek_session_state(self, _key): return None
         def _evict_cached_agent(self, key): evicted.append(key)
 
-    entry=SimpleNamespace(session_id="sid", session_key="skey", last_prompt_tokens=60000)
+    entry=SimpleNamespace(session_id="sid", session_key="skey", last_prompt_tokens=60000, yolo=False)
     accepted=FastLaneDecision(True, "self_contained", 60000, len(loaded), 1)
     with (
         patch("gateway.run_turn.build_session_context", return_value=SimpleNamespace()),
@@ -254,12 +254,12 @@ def test_prepare_turn_context_tail_uses_only_recent_history_and_preserves_durabl
         async_session_store=Store()
         async def _hmwa_open_session(self, *_a): return (False, False)
         def _set_session_env(self, _ctx): return ()
-        def _pinned_session_context_prompt(self, *_a): return ""
+        def _pinned_session_context_prompt(self, *_a, **_kw): return ""
         async def _hmwa_acquire_turn_lease(self, *_a): return None
         async def _mark_durable_active_turn(self, *_a): return True
         async def _hmwa_run_session_hygiene(self, *_a):
             raise AssertionError("hygiene must be skipped for bounded context tail")
-        async def _hmwa_first_contact_notes(self, _source, history, _notes):
+        async def _hmwa_first_contact_notes(self, _source, history, _notes, *_a, **_kw):
             seen["first"]=history
         def _voice_channel_sidecar_note(self, *_a): return None
         async def _prepare_profile_scoped_inbound_message_text(self, *, history, **_kw):
@@ -273,7 +273,7 @@ def test_prepare_turn_context_tail_uses_only_recent_history_and_preserves_durabl
         def _peek_session_state(self, _key): return None
         def _evict_cached_agent(self, key): evicted.append(key)
 
-    entry=SimpleNamespace(session_id="sid", session_key="skey", last_prompt_tokens=160000)
+    entry=SimpleNamespace(session_id="sid", session_key="skey", last_prompt_tokens=160000, yolo=False)
     accepted=FastLaneDecision(True, "context_tail", 160000, len(loaded), 1, 0.95, 12)
     with (
         patch("gateway.run_turn.build_session_context", return_value=SimpleNamespace()),
@@ -309,7 +309,7 @@ def test_fast_lane_persistence_uses_durable_history_and_appends_only_current_tur
             return None
 
     prepared=Runner._PreparedTurn(
-        [], "", event.text, event.text, None, None, "sid", "owner", durable, True,
+        [], "", event.text, event.text, None, None, "sid", "owner", None, durable, True,
     )
     current=[
         {"role":"user","content":event.text},

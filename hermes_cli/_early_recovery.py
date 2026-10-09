@@ -943,11 +943,15 @@ def restore_interrupted_pull(project_root: Path | None = None, *, after_failure:
     """
     try:
         root = _project_root() if project_root is None else project_root
+        # Check the test exemption BEFORE computing or stat-ing the marker: in a linked worktree
+        # the marker resolves through the ``.git`` file into the main install's git dir, and the
+        # home-io guard refuses that stat even though nothing would be repaired. Production
+        # launches (no PYTEST_CURRENT_TEST) fall through unchanged.
+        if _pytest_owns_live_checkout(root):
+            return False
         marker = interrupted_pull_marker(root)
         if not marker.is_file() and not (Path(root) / ZIP_SWAP_JOURNAL).is_file():
             return False  # fast path: nothing to repair, no lock taken
-        if _pytest_owns_live_checkout(root):
-            return False
         # A live `hermes update` (or its build/completion/git, after its updater died) owns the
         # checkout: its own transaction settles the tree, and repairing under it races its git.
         busy_note = "⚠ Not repairing the checkout now: {}. Launch again once it finishes."
