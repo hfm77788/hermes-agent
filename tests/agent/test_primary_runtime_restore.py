@@ -686,7 +686,12 @@ class TestRateLimitCooldown:
             fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
         )
         mock_client = _mock_resolve()
-        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
+        # Patch the lazy SDK proxy through the restore too (like every other restore test in this
+        # file): an unpatched restore resolves the real `from openai import OpenAI`, whose import
+        # path scan stats the PM runtime's lib-dynload under the real home and trips the home-io
+        # guard in worktree runs. The restore semantics under test are unchanged.
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)), \
+                patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
             agent._try_activate_fallback(
                 reason=FailoverReason.rate_limit, reset_at=time.time() + 3600,
             )

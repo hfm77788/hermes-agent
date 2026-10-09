@@ -214,10 +214,14 @@ class TestRateLimitBackoffEscalation:
             agent._try_activate_fallback(reason=FailoverReason.rate_limit)
             assert agent._rate_limit_backoff_count == 2
 
-        # Cooldown expired; the primary restores successfully.
+        # Cooldown expired; the primary restores successfully. Patch the lazy SDK proxy through
+        # the restore (the file's construction-time patch is gone by now): an unpatched restore
+        # resolves the real `from openai import OpenAI`, whose import path scan stats the PM
+        # runtime's lib-dynload under the real home and trips the home-io guard in worktree runs.
         agent._fallback_activated = True
         agent._rate_limited_until = 0
-        assert agent._restore_primary_runtime() is True
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
         assert agent._rate_limit_backoff_count == 0
 
         # The next rate-limit is treated as a fresh first failure: 60s.
