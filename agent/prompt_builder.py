@@ -503,13 +503,40 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
 )
 
 
-def execution_guidance_text() -> str:
-    """OPENAI_MODEL_EXECUTION_GUIDANCE as injected into the system prompt.
+def execution_guidance_text(valid_tool_names: Optional[set[str]] = None) -> str:
+    """Execution guidance with no references to tools unavailable to this session.
 
-    The guidance names no web tool (#39797: a hard "use web_search" overrode SOUL.md and dangled in Blank Slate),
-    so the text is toolset-neutral and needs no per-session filtering.
+    Keep the full canonical text when the toolset is unknown (legacy behavior).
+    For known toolsets, omit unsupported tool instructions rather than telling the
+    model to call a phantom tool. This also preserves the established call contract.
     """
-    return OPENAI_MODEL_EXECUTION_GUIDANCE
+    text = OPENAI_MODEL_EXECUTION_GUIDANCE
+    if valid_tool_names is None:
+        return text
+    names = set(valid_tool_names)
+    lines = []
+    for line in text.splitlines(keepends=True):
+        if line.startswith("- Arithmetic, math, calculations"):
+            tools = [tool for tool in ("terminal", "execute_code") if tool in names]
+            if not tools:
+                continue
+            line = line.replace("terminal or execute_code", " or ".join(tools))
+        elif line.startswith("- Hashes, encodings, checksums") or line.startswith("- Current time, date, timezone") or line.startswith("- System state:") or line.startswith("- Git history, branches, diffs"):
+            if "terminal" not in names:
+                continue
+        elif line.startswith("- File contents, sizes, line counts"):
+            tools = [tool for tool in ("read_file", "search_files", "terminal") if tool in names]
+            if not tools:
+                continue
+            line = "- File contents, sizes, line counts → use " + " or ".join(tools) + "\\n"
+        elif line.startswith("- 'What time is it?'") and "terminal" not in names:
+            continue
+        elif line.startswith("- Use the appropriate permitted lookup tool when missing information"):
+            tools = [tool for tool in ("search_files", "read_file") if tool in names]
+            if len(tools) != 2:
+                line = "- Use an available permitted retrieval/search tool when context is missing.\\n"
+        lines.append(line)
+    return "".join(lines)
 
 
 # Gemini/Gemma-specific operational guidance, adapted from OpenCode's gemini.txt.
