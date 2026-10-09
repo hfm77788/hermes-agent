@@ -1,0 +1,748 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import yaml
+
+from gateway.control_socket import inject_gateway_local_inbound
+
+LOG = logging.getLogger("dingtalk_free_response_bridge")
+
+_IMAGE_PLACEHOLDER_RE = re.compile(r"\[图片消息\]\(mediaId=[^)]+\)")
+_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic"}
+
+
+_MATH_PLAIN_TEXT_SKILLS = frozenset({"huangshang-math-tutor", "jiayin-math-tutor"})
+_RAW_MATH_MARKUP_RE = re.compile(r"\\(?:[A-Za-z]+|[\(\)\[\]\{\}])")
+
+
+def _take_braced(value: str, start: int) -> tuple[str, int] | None:
+    if start >= len(value) or value[start] != "{":
+        return None
+    depth = 0
+    for index in range(start, len(value)):
+        char = value[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return value[start + 1 : index], index + 1
+    return None
+
+
+def _replace_fraction_commands(value: str) -> str:
+    for command in (r"\dfrac", r"\frac"):
+        while command in value:
+            start = value.find(command)
+            first = _take_braced(value, start + len(command))
+            if first is None:
+                break
+            numerator, after_first = first
+            second = _take_braced(value, after_first)
+            if second is None:
+                break
+            denominator, after_second = second
+            value = value[:start] + f"({numerator})/({denominator})" + value[after_second:]
+    return value
+
+
+def _replace_sqrt_commands(value: str) -> str:
+    command = r"\sqrt"
+    while command in value:
+        start = value.find(command)
+        item = _take_braced(value, start + len(command))
+        if item is None:
+            break
+        radicand, after = item
+        value = value[:start] + f"√({radicand})" + value[after:]
+    return value
+
+
+def _plain_markdown_tables(value: str) -> str:
+    lines: list[str] = []
+    separator = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
+    for line in value.splitlines():
+        if separator.fullmatch(line):
+            continue
+        line = re.sub(r"^\s{0,3}#{1,6}\s+", "", line)
+        stripped = line.strip()
+        if stripped.startswith("|") and stripped.endswith("|") and line.count("|") >= 2:
+            cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+            lines.append("  ".join(cell for cell in cells if cell))
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _normalize_dingtalk_math_reply(value: str) -> str:
+    """Render model math markup as DingTalk-safe plain text without semantic guessing."""
+    out = str(value or "")
+    out = _replace_fraction_commands(out)
+    out = _replace_sqrt_commands(out)
+    replacements = (
+        (r"\Rightarrow", "⇒"), (r"\rightarrow", "→"), (r"\subseteq", "⊆"),
+        (r"\emptyset", "∅"), (r"\notin", "∉"), (r"\times", "×"),
+        (r"\cdot", "·"), (r"\div", "÷"), (r"\pm", "±"), (r"\neq", "≠"),
+        (r"\geq", "≥"), (r"\leq", "≤"), (r"\cup", "∪"), (r"\cap", "∩"),
+        (r"\iff", "⇔"), (r"\to", "→"), (r"\ne", "≠"), (r"\ge", "≥"),
+        (r"\le", "≤"), (r"\in", "∈"),
+    )
+    for raw, rendered in replacements:
+        out = re.sub(re.escape(raw) + r"(?![A-Za-z])", rendered, out)
+    out = out.replace(r"\left", "").replace(r"\right", "")
+    out = out.replace("$", "").replace("$", "")
+    for delimiter in (r"\(", r"\)", r"\[", r"\]"):
+        out = out.replace(delimiter, "")
+    out = re.sub(r"([A-Za-z0-9\)\]])\^\{?2\}?", r"\1²", out)
+    out = re.sub(r"([A-Za-z0-9\)\]])\^\{?3\}?", r"\1³", out)
+    out = _plain_markdown_tables(out)
+    fence = chr(96) * 3
+    tick = chr(96)
+    out = out.replace(fence, "").replace(tick, "").replace("**", "").strip()
+    if "$" in out or tick in out or "**" in out or _RAW_MATH_MARKUP_RE.search(out):
+        raise ValueError("dingtalk_math_markup_residual")
+    if not out:
+        raise ValueError("dingtalk_math_reply_empty_after_normalization")
+    return out
+
+
+def _prepare_dingtalk_reply(skill: str, value: str) -> str:
+    if skill not in _MATH_PLAIN_TEXT_SKILLS:
+        return value
+    return _normalize_dingtalk_math_reply(value)
+
+
+@dataclass(frozen=True)
+class MemberRoute:
+    open_dingtalk_id: str
+    hermes_session_user_id: str
+    role: str
+
+
+@dataclass(frozen=True)
+class GroupRoute:
+    name: str
+    chat_id: str
+    skill: str
+    allowed_members: dict[str, MemberRoute]
+    ignored_sender_ids: set[str]
+    skip_text_markers: tuple[str, ...]
+    resume_existing_session: bool
+    recent_context_messages: int
+
+
+class Bridge:
+    def __init__(self, config_path: Path):
+        self.config_path = config_path
+        self.cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        self.profile = self.cfg.get("profile", "hema-teacher")
+        self.robot_code = self.cfg["robot_code"]
+        self.bot_title = self.cfg.get("bot_title", "河马老师")
+        self.poll_interval = float(self.cfg.get("poll_interval_seconds", 3))
+        self.timezone = ZoneInfo(self.cfg.get("timezone", "Asia/Shanghai"))
+        self.dws = self.cfg.get("dws_bin", "/home/ubuntu/.local/bin/dws")
+        self.hermes = self.cfg.get("hermes_bin", "/home/ubuntu/.local/bin/hermes")
+        self.sessions_json = Path(
+            self.cfg.get(
+                "sessions_json",
+                f"/home/ubuntu/.hermes/profiles/{self.profile}/sessions/sessions.json",
+            )
+        )
+        self.state_path = Path(
+            self.cfg.get(
+                "state_file",
+                f"/home/ubuntu/.hermes/state/dingtalk-free-response-{self.profile}.json",
+            )
+        )
+        self.max_attempts = int(self.cfg.get("max_attempts", 3))
+        self.fetch_attempts = max(1, int(self.cfg.get("fetch_attempts", 3)))
+        self.fetch_timeout_seconds = int(self.cfg.get("fetch_timeout_seconds", 30))
+        self.fetch_sleep = time.sleep
+        self.hermes_timeout = int(self.cfg.get("hermes_timeout_seconds", 180))
+        self.gateway_inject = bool(self.cfg.get("gateway_inject_existing_session", False))
+        self.gateway_home = Path(self.cfg.get("gateway_home", "/home/ubuntu/.hermes"))
+        self.media_cache_root = Path(
+            self.cfg.get(
+                "media_cache_dir",
+                "/home/ubuntu/.hermes/state/dingtalk-free-response-media",
+            )
+        )
+        self.max_media_attachments = max(1, min(int(self.cfg.get("max_media_attachments", 4)), 8))
+        self.max_media_bytes = max(1, int(self.cfg.get("max_media_bytes", 15 * 1024 * 1024)))
+        self._gateway_inject_bootstrapped: set[str] = set()
+        self.groups = self._parse_groups(self.cfg.get("groups") or [])
+        self._prune_media_cache()
+        self.state = self._load_state()
+
+    @staticmethod
+    def _parse_groups(rows: list[dict[str, Any]]) -> list[GroupRoute]:
+        out: list[GroupRoute] = []
+        for row in rows:
+            members: dict[str, MemberRoute] = {}
+            for member in row.get("allowed_members") or []:
+                route = MemberRoute(
+                    open_dingtalk_id=member["open_dingtalk_id"],
+                    hermes_session_user_id=member["hermes_session_user_id"],
+                    role=member.get("role", "verified_member"),
+                )
+                members[route.open_dingtalk_id] = route
+            out.append(
+                GroupRoute(
+                    name=row.get("name") or row["chat_id"],
+                    chat_id=row["chat_id"],
+                    skill=row["skill"],
+                    allowed_members=members,
+                    ignored_sender_ids=set(row.get("ignored_sender_ids") or []),
+                    skip_text_markers=tuple(row.get("skip_text_markers") or ["@河马老师"]),
+                    resume_existing_session=bool(row.get("resume_existing_session", False)),
+                    recent_context_messages=max(0, int(row.get("recent_context_messages", 6))),
+                )
+            )
+        return out
+
+    def _default_state(self) -> dict[str, Any]:
+        now = datetime.now(self.timezone).strftime("%Y-%m-%d %H:%M:%S")
+        return {
+            "version": 1,
+            "groups": {
+                g.chat_id: {
+                    "cursor_time": now,
+                    "processed_ids": [],
+                    "attempts": {},
+                    "pending": {},
+                }
+                for g in self.groups
+            },
+        }
+
+    def _load_state(self) -> dict[str, Any]:
+        if not self.state_path.exists():
+            state = self._default_state()
+            self._save_state(state)
+            return state
+        try:
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except Exception:
+            LOG.exception("state read failed; refusing to replay history")
+            raise
+        for g in self.groups:
+            state.setdefault("groups", {}).setdefault(
+                g.chat_id,
+                {
+                    "cursor_time": datetime.now(self.timezone).strftime("%Y-%m-%d %H:%M:%S"),
+                    "processed_ids": [],
+                    "attempts": {},
+                    "pending": {},
+                },
+            )
+        return state
+
+    def _save_state(self, state: dict[str, Any] | None = None) -> None:
+        state = state or self.state
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=self.state_path.name + ".", dir=str(self.state_path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(state, fh, ensure_ascii=False, indent=2, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.state_path)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+
+    @staticmethod
+    def _run(cmd: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+            env={**os.environ, "HOME": "/home/ubuntu"},
+        )
+
+    def _prune_media_cache(self, *, max_age_seconds: int = 86400) -> None:
+        if not self.media_cache_root.exists():
+            return
+        cutoff = time.time() - max_age_seconds
+        for child in self.media_cache_root.iterdir():
+            try:
+                if child.stat().st_mtime < cutoff:
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink(missing_ok=True)
+            except OSError:
+                LOG.warning("failed pruning stale media cache path=%s", child)
+
+    @staticmethod
+    def _clean_image_text(text: str) -> str:
+        cleaned = _IMAGE_PLACEHOLDER_RE.sub("", text or "").strip()
+        return cleaned or "请结合图片内容和当前课堂上下文回答。"
+
+    def _download_image_media(
+        self, group: GroupRoute, msg: dict[str, Any]
+    ) -> list[str]:
+        refs = list(msg.get("resourceRefs") or [])
+        if not refs:
+            return []
+        message_id = str(msg.get("messageId") or "")
+        if not message_id:
+            return []
+        job_dir = self.media_cache_root / hashlib.sha256(
+            message_id.encode("utf-8")
+        ).hexdigest()[:24]
+        job_dir.mkdir(parents=True, exist_ok=True)
+        out: list[str] = []
+        for ref in refs[: self.max_media_attachments]:
+            if not isinstance(ref, dict) or str(ref.get("type") or "") != "mediaId":
+                continue
+            dl = ref.get("download") or {}
+            args = dl.get("arguments") or {}
+            if dl.get("ready") is False or dl.get("missing"):
+                continue
+            resource_id = str(args.get("resource-id") or ref.get("resourceId") or "")
+            if not resource_id:
+                continue
+            proc = subprocess.run(
+                [
+                    self.dws, "chat", "+messages-resource-download",
+                    "--resource-id", resource_id,
+                    "--message-id", message_id,
+                    "--open-conversation-id", group.chat_id,
+                    "--type", "mediaId",
+                    "--output", f"./{job_dir.name}/",
+                    "--overwrite", "-y", "--format", "json",
+                ],
+                cwd=str(self.media_cache_root),
+                text=True,
+                capture_output=True,
+                timeout=45,
+                check=False,
+                env={**os.environ, "HOME": "/home/ubuntu"},
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"dws media download failed rc={proc.returncode}: {proc.stderr[-500:]}"
+                )
+            payload = json.loads(proc.stdout or "{}")
+            local = str(payload.get("localPath") or "")
+            path = (self.media_cache_root / local).resolve()
+            root = self.media_cache_root.resolve()
+            if not path.is_relative_to(root) or not path.is_file():
+                raise RuntimeError("dws media download returned invalid local path")
+            size = int(payload.get("sizeBytes") or path.stat().st_size)
+            if size > self.max_media_bytes:
+                path.unlink(missing_ok=True)
+                raise RuntimeError(f"image attachment too large: {size} bytes")
+            if path.suffix.lower() not in _IMAGE_SUFFIXES:
+                path.unlink(missing_ok=True)
+                continue
+            out.append(str(path))
+        return out
+
+    def _cleanup_message_media(self, message_id: str) -> None:
+        job_dir = self.media_cache_root / hashlib.sha256(
+            message_id.encode("utf-8")
+        ).hexdigest()[:24]
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+    def _fetch_messages(self, group: GroupRoute, cursor_time: str) -> list[dict[str, Any]]:
+        cmd = [
+            self.dws,
+            "chat",
+            "+chat-messages",
+            "--group",
+            group.chat_id,
+            "--start",
+            cursor_time,
+            "--order",
+            "asc",
+            "--page-all",
+            "--page-limit",
+            "2",
+            "--max-items",
+            "100",
+            "--format",
+            "json",
+        ]
+        # The dws read path (mcp_gateway -> dingtalk) intermittently answers with
+        # i/o timeouts or partial-page failures it itself marks retryable. One
+        # blip must not kill the whole poll loop with a traceback ERROR: retry a
+        # bounded number of times with a short backoff, and only surface a real
+        # failure once every attempt failed.
+        last_error = ""
+        for attempt in range(1, self.fetch_attempts + 1):
+            if attempt > 1:
+                self.fetch_sleep(min(2.0 ** (attempt - 2), 4.0))
+            try:
+                proc = self._run(cmd, timeout=self.fetch_timeout_seconds)
+            except subprocess.TimeoutExpired:
+                last_error = f"timeout after {self.fetch_timeout_seconds}s"
+                LOG.warning(
+                    "dws fetch timeout group=%s attempt=%s/%s",
+                    group.name, attempt, self.fetch_attempts,
+                )
+                continue
+            if proc.returncode != 0:
+                last_error = f"rc={proc.returncode}: {proc.stderr[-500:]}"
+                LOG.warning(
+                    "dws fetch failed group=%s attempt=%s/%s error=%s",
+                    group.name, attempt, self.fetch_attempts, last_error[:200],
+                )
+                continue
+            try:
+                payload = json.loads(proc.stdout or "{}")
+            except json.JSONDecodeError as exc:
+                last_error = f"invalid json: {exc}"
+                LOG.warning(
+                    "dws fetch returned invalid json group=%s attempt=%s/%s",
+                    group.name, attempt, self.fetch_attempts,
+                )
+                continue
+            if isinstance(payload, dict):
+                rows = payload.get("messages") or payload.get("items") or []
+            elif isinstance(payload, list):
+                rows = payload
+            else:
+                rows = []
+            return [x for x in rows if isinstance(x, dict)]
+        raise RuntimeError(
+            f"dws fetch failed after {self.fetch_attempts} attempts: {last_error}"
+        )
+
+    def _session_id(self, group: GroupRoute, member: MemberRoute) -> str:
+        sessions = json.loads(self.sessions_json.read_text(encoding="utf-8"))
+        key = (
+            f"agent:main:dingtalk:group:{group.chat_id}:"
+            f"{member.hermes_session_user_id}"
+        )
+        row = sessions.get(key)
+        if not row or not row.get("session_id"):
+            raise RuntimeError(f"missing Hermes session binding for {group.name} / {member.role}")
+        return row["session_id"]
+
+    def _recent_context(self, group: GroupRoute, created_time: str) -> str:
+        if not created_time or group.recent_context_messages <= 0:
+            return ""
+        proc = self._run(
+            [
+                self.dws,
+                "chat",
+                "+chat-messages",
+                "--group",
+                group.chat_id,
+                "--time",
+                created_time,
+                "--direction",
+                "older",
+                "--limit",
+                str(group.recent_context_messages),
+                "--format",
+                "json",
+            ],
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            LOG.warning("recent context fetch failed group=%s rc=%s", group.name, proc.returncode)
+            return ""
+        try:
+            payload = json.loads(proc.stdout or "{}")
+        except json.JSONDecodeError:
+            LOG.warning("recent context parse failed group=%s", group.name)
+            return ""
+        if isinstance(payload, dict):
+            rows = payload.get("messages") or payload.get("items") or []
+        elif isinstance(payload, list):
+            rows = payload
+        else:
+            rows = []
+        lines: list[str] = []
+        for row in sorted(
+            (x for x in rows if isinstance(x, dict)),
+            key=lambda x: str(x.get("createTime") or ""),
+        ):
+            body = str(row.get("text") or "").strip()
+            if not body:
+                continue
+            sender = str(row.get("sender") or "成员")
+            lines.append(f"{sender}: {body[:800]}")
+        return "\n".join(lines[-group.recent_context_messages :])
+
+    def _generate_reply(
+        self,
+        group: GroupRoute,
+        member: MemberRoute,
+        text: str,
+        created_time: str,
+        message_id: str = "",
+        media_urls: list[str] | None = None,
+    ) -> str:
+        if self.gateway_inject:
+            force_context = group.chat_id not in self._gateway_inject_bootstrapped
+            recent_context = self._recent_context(group, created_time) if force_context else ""
+            injected = inject_gateway_local_inbound(
+                self.gateway_home,
+                {
+                    "profile": self.profile,
+                    "platform": "dingtalk",
+                    "chat_id": group.chat_id,
+                    "chat_name": group.name,
+                    "chat_type": "group",
+                    "user_id": member.open_dingtalk_id,
+                    "user_id_alt": member.hermes_session_user_id,
+                    "user_name": member.role,
+                    "message_id": message_id,
+                    "text": text,
+                    "media_urls": list(media_urls or []),
+                    "media_types": ["image"] * len(media_urls or []),
+                    "skill": group.skill,
+                    "recent_context": recent_context,
+                    "force_context": force_context,
+                    "wait_for_idle_seconds": min(self.hermes_timeout, 120),
+                    "timeout_seconds": self.hermes_timeout + 5,
+                },
+                timeout=self.hermes_timeout + 10,
+            )
+            if injected is None:
+                raise RuntimeError(
+                    "gateway injection unavailable; refusing isolated CLI fallback")
+            if not injected.get("accepted"):
+                raise RuntimeError(
+                    f"gateway injection rejected: {injected.get('reason', 'unknown')}")
+            reply = str(injected.get("response") or "").strip()
+            if not reply:
+                raise RuntimeError("gateway injection returned empty reply")
+            self._gateway_inject_bootstrapped.add(group.chat_id)
+            return reply
+
+        if media_urls:
+            raise RuntimeError(
+                "image bridge requires gateway injection; refusing isolated CLI fallback"
+            )
+
+        recent = self._recent_context(group, created_time)
+        context_block = (
+            f"最近群聊上下文（按时间顺序，仅用于衔接当前对话）：\n{recent}\n"
+            if recent
+            else ""
+        )
+        prompt = (
+            "【DingTalk免@桥接入站】这条消息已由受信任的免@监听桥读取并通过硬身份校验，"
+            "等价于正常课堂入站；不要要求用户再次@河马老师，也不要解释技术机制。"
+            f"来源群={group.name}；发送者角色={member.role}。\n"
+            f"{context_block}"
+            f"当前原始消息：{text}\n"
+            "请按当前课堂Skill、持久学习状态和以上最近上下文直接回应，只输出用户可见正文。"
+        )
+        cmd = [self.hermes, "-p", self.profile]
+        if group.resume_existing_session:
+            cmd.extend(["--resume", self._session_id(group, member)])
+        cmd.extend(
+            [
+                "-z",
+                prompt,
+                "--skills",
+                f"{group.skill},dingtalk-inbound-identity",
+            ]
+        )
+        proc = self._run(
+            cmd,
+            timeout=self.hermes_timeout,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Hermes generation failed rc={proc.returncode}: {proc.stderr[-800:]}"
+            )
+        reply = (proc.stdout or "").strip()
+        if not reply:
+            raise RuntimeError("Hermes returned empty reply")
+        return reply
+
+    def _send_reply(self, group: GroupRoute, reply: str) -> None:
+        try:
+            reply = _prepare_dingtalk_reply(group.skill, reply)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"DingTalk math outbound blocked before send: {exc}"
+            ) from exc
+        proc = self._run(
+            [
+                self.dws,
+                "chat",
+                "+messages-send-by-bot",
+                "--robot-code",
+                self.robot_code,
+                "--group",
+                group.chat_id,
+                "--title",
+                self.bot_title,
+                "--content",
+                reply,
+                "--format",
+                "json",
+                "--yes",
+            ],
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"dws send failed rc={proc.returncode}: {proc.stderr[-500:]}")
+        payload = json.loads(proc.stdout or "{}")
+        success = payload.get("success")
+        if success is False:
+            raise RuntimeError(f"dws send returned failure: {payload}")
+
+    def _mark_processed(self, gs: dict[str, Any], message_id: str) -> None:
+        ids = list(gs.get("processed_ids") or [])
+        ids.append(message_id)
+        gs["processed_ids"] = ids[-500:]
+        gs.get("attempts", {}).pop(message_id, None)
+        gs.get("pending", {}).pop(message_id, None)
+
+    def _process_message(self, group: GroupRoute, msg: dict[str, Any]) -> bool:
+        gs = self.state["groups"][group.chat_id]
+        message_id = str(msg.get("messageId") or "")
+        if not message_id or message_id in set(gs.get("processed_ids") or []):
+            return True
+
+        sender_id = str(msg.get("senderId") or "")
+        text = str(msg.get("text") or "").strip()
+
+        if sender_id in group.ignored_sender_ids:
+            self._mark_processed(gs, message_id)
+            return True
+
+        if any(marker and marker in text for marker in group.skip_text_markers):
+            self._mark_processed(gs, message_id)
+            return True
+
+        member = group.allowed_members.get(sender_id)
+        if member is None:
+            LOG.warning("ignored unverified sender group=%s sender_id=%s", group.name, sender_id)
+            self._mark_processed(gs, message_id)
+            return True
+
+        image_refs = [
+            ref
+            for ref in (msg.get("resourceRefs") or [])
+            if isinstance(ref, dict) and str(ref.get("type") or "") == "mediaId"
+        ]
+        if not text and not image_refs:
+            LOG.info("ignored unsupported non-text message group=%s id=%s", group.name, message_id)
+            self._mark_processed(gs, message_id)
+            return True
+
+        pending = gs.setdefault("pending", {})
+        reply = pending.get(message_id)
+        if not reply:
+            media_urls: list[str] = []
+            if image_refs:
+                media_urls = self._download_image_media(group, msg)
+                if not media_urls:
+                    raise RuntimeError("image message had no downloadable image attachment")
+                text = self._clean_image_text(text)
+            reply = self._generate_reply(
+                group,
+                member,
+                text,
+                str(msg.get("createTime") or ""),
+                message_id,
+                media_urls=media_urls,
+            )
+            pending[message_id] = reply
+            self._save_state()
+
+        self._send_reply(group, reply)
+        self._cleanup_message_media(message_id)
+        self._mark_processed(gs, message_id)
+        LOG.info("replied group=%s message_id=%s role=%s", group.name, message_id, member.role)
+        return True
+
+    def poll_once(self) -> None:
+        changed = False
+        for group in self.groups:
+            gs = self.state["groups"][group.chat_id]
+            rows = self._fetch_messages(group, gs["cursor_time"])
+            for msg in rows:
+                created = str(msg.get("createTime") or "")
+                if created and created > gs.get("cursor_time", ""):
+                    gs["cursor_time"] = created
+                    changed = True
+                message_id = str(msg.get("messageId") or "")
+                if not message_id:
+                    continue
+                if message_id in set(gs.get("processed_ids") or []):
+                    continue
+                try:
+                    self._process_message(group, msg)
+                    changed = True
+                except Exception:
+                    attempts = gs.setdefault("attempts", {})
+                    attempts[message_id] = int(attempts.get(message_id, 0)) + 1
+                    LOG.exception(
+                        "message processing failed group=%s id=%s attempt=%s",
+                        group.name,
+                        message_id,
+                        attempts[message_id],
+                    )
+                    if attempts[message_id] >= self.max_attempts:
+                        LOG.error(
+                            "dead-letter group=%s id=%s after %s attempts",
+                            group.name,
+                            message_id,
+                            attempts[message_id],
+                        )
+                        self._mark_processed(gs, message_id)
+                    changed = True
+            if changed:
+                self._save_state()
+        if changed:
+            self._save_state()
+
+    def run_forever(self) -> None:
+        LOG.info("bridge started profile=%s groups=%s", self.profile, [g.name for g in self.groups])
+        while True:
+            try:
+                self.poll_once()
+            except Exception:
+                LOG.exception("poll loop failed")
+            time.sleep(self.poll_interval)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--log-level", default="INFO")
+    args = ap.parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    bridge = Bridge(Path(args.config))
+    if args.once:
+        bridge.poll_once()
+    else:
+        bridge.run_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

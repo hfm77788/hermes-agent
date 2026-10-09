@@ -1565,8 +1565,24 @@ class GatewayStartupMixin:
         "_handoff_watcher", "_async_delegation_watcher", "_loop_wakeup_watcher", "_profile_reconcile_watcher",
     )
 
+    async def _warm_lazy_session_db_after_startup(self) -> None:
+        """Open the full SessionDB off-loop after platforms are already serving."""
+        if not getattr(self.config, "session_store_lazy_open", False):
+            return
+        try:
+            await asyncio.to_thread(self.session_store._open_session_db_for_active_scope)
+            logger.info("Lazy SessionDB warmup completed after platform startup")
+        except Exception as exc:
+            logger.warning("Lazy SessionDB warmup failed; first durable turn will retry: %s", exc)
+
     def _start_spawn_background_watchers(self) -> None:
         """Spawn the long-lived supervised background watchers."""
+        if getattr(self.config, "session_store_lazy_open", False):
+            self._spawn_supervised(
+                self._warm_lazy_session_db_after_startup,
+                "lazy_session_db_warmup",
+                restart=False,
+            )
         for method in self._PRE_RECONNECT_WATCHERS:
             self._spawn_supervised(getattr(self, method), method[1:])
         if self._failed_platforms:

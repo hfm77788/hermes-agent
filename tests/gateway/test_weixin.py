@@ -272,10 +272,10 @@ class TestWeixinChunkDelivery:
         assert "cooldown" in (first.error or "")
         assert second.success is False
         assert "cooldown" in (second.error or "")
-        # The first rate-limit response is retried once. The second response
-        # crosses the sliding-window threshold, opens the breaker, and both the
-        # rest of the current chunk and follow-up sends fail fast.
-        assert send_message_mock.await_count == 2
+        # The first rate-limit response probes once without the context token,
+        # then the real retry reaches the sliding-window threshold and opens
+        # the breaker; follow-up sends fail fast.
+        assert send_message_mock.await_count == 3
         assert sleep_mock.await_count == 1
 
     @pytest.mark.parametrize("error_field", ["ret", "errcode"])

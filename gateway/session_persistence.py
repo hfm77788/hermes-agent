@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import json
+import sqlite3
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
@@ -234,9 +235,50 @@ class SessionPersistenceMixin:
         method = getattr(self._routing_db or None, name, None)
         return method if callable(method) else None
 
+    def _load_routing_rows_read_only_locked(self) -> bool:
+        """Load only the tiny routing table without opening the full writable SessionDB.
+
+        Used by ``session_store_lazy_open`` so multi-GB transcript/FTS stores stay cold during
+        Gateway startup. A later transcript/search/write opens the normal SessionDB and performs
+        the existing schema/FTS reconciliation. Lock held.
+        """
+        home = getattr(self, "_routing_home", None)
+        if home is None:
+            return False
+        db_path = Path(home) / "state.db"
+        if not db_path.exists():
+            return False
+        conn = None
+        try:
+            conn = sqlite3.connect(
+                f"file:{db_path.as_posix()}?mode=ro",
+                uri=True,
+                timeout=1.0,
+                isolation_level=None,
+            )
+            conn.execute("PRAGMA query_only=ON")
+            rows = conn.execute(
+                "SELECT session_key, entry_json FROM gateway_routing WHERE scope = ?",
+                (self._routing_scope(),),
+            ).fetchall()
+            for key, entry_json in rows:
+                entry = self._routing_entry_from_json(key, entry_json)
+                if entry is not None:
+                    self._entries[key] = entry
+            return True
+        except (sqlite3.Error, OSError) as exc:
+            logger.warning("gateway.session: lightweight routing load failed: %s", exc)
+            return False
+        finally:
+            if conn is not None:
+                with contextlib.suppress(Exception):
+                    conn.close()
+
     def _load_routing_rows_locked(self) -> bool:
         """Load state.db routing entries into ``_entries``; False when there is no loader or the
         load failed (warned). Lock held."""
+        if getattr(self.config, "session_store_lazy_open", False):
+            return self._load_routing_rows_read_only_locked()
         loader = self._routing_db_method("load_gateway_routing_entries")
         if loader is None:
             return False
@@ -281,7 +323,11 @@ class SessionPersistenceMixin:
         self._routing_db_loaded = db_load_succeeded
         self._routing_fallback_baseline = None if db_load_succeeded else self._entries_as_dicts()
         # A hard crash skips graceful shutdown and leaves sessions.json pointing at ended sessions.
-        self._prune_stale_sessions_locked()
+        # In lazy-open mode, per-entry stale probing would immediately open the full multi-GB
+        # SessionDB and erase the startup benefit. On-demand recovery already validates a route
+        # before use; the normal hourly age-prune keeps the in-memory index bounded.
+        if not getattr(self.config, "session_store_lazy_open", False):
+            self._prune_stale_sessions_locked()
 
     def _import_legacy_sessions_json(self, db_had_entries: bool) -> None:
         """Legacy import: sessions.json fills only keys the DB lacks. Lock held."""

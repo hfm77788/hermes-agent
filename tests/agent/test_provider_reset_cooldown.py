@@ -30,8 +30,8 @@ def _fallback_client():
 @pytest.mark.parametrize(
     ("reset_at", "expected_seconds"),
     [
-        (1_700_000_090.2, 91),
-        (1_700_274_291, 274_291),
+        (1_700_000_090.2, 93),
+        (1_700_274_291, 274_293),
         (None, 60),
         ("not-a-timestamp", 60),
         (1_699_999_999, 60),

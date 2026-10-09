@@ -670,6 +670,21 @@ _GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
     + ")",
     re.IGNORECASE)
 
+_GATEWAY_INTERNAL_FAILURE_SHAPE_RE = re.compile(
+    r"^\s*(?:model generated invalid tool call:|traceback \(most recent call last\):|"
+    r"tool call validation failed|invalid tool call arguments|invalid function_call arguments)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_gateway_internal_failure(text: str) -> bool:
+    """True only for terminal internal diagnostics on failed/partial turns.
+
+    The caller supplies the failed/partial verdict; this shape check deliberately does not
+    sanitize ordinary successful replies that happen to discuss a traceback or tool error.
+    """
+    return bool(text and _GATEWAY_INTERNAL_FAILURE_SHAPE_RE.search(str(text).strip()))
+
 
 def _looks_like_gateway_provider_error(text: str) -> bool:
     """True when text is a provider failure envelope, not normal content.
@@ -3096,6 +3111,24 @@ def _normalize_empty_agent_response(
     generic provider-failed reply and the user never sees /compact. Curated agent text survives.
     """
     is_overflow = is_context_overflow_failure_result(agent_result, history_len)
+    failure_reason = str(agent_result.get("failure_reason") or "")
+    if response and (agent_result.get("failed") or agent_result.get("partial")):
+        if _looks_like_gateway_internal_failure(response):
+            logger.warning(
+                "Agent turn ended with internal diagnostic; reply sanitized for chat. Detail: %s",
+                str(response)[:500],
+            )
+            if (
+                failure_reason == "invalid_tool_call"
+                or str(response).lstrip().lower().startswith("model generated invalid tool call:")
+            ):
+                from agent.turn_failure_copy import site_copy
+                safe = site_copy("invalid_tool_call")
+                return safe if safe.startswith("⚠️") else f"⚠️ {safe}"
+            return (
+                "⚠️ Something went wrong internally and I couldn't finish this reply safely. "
+                "Please send your message again. Technical details were kept in the gateway log."
+            )
     if response and not (is_overflow and _looks_like_gateway_provider_error(response)):
         return response
     if agent_result.get("failed"):
@@ -3103,7 +3136,6 @@ def _normalize_empty_agent_response(
         error_detail = agent_result.get("error") or t("gateway.shared.unknown_error")
         error_str = str(error_detail).lower()
         # Persistence failures: suggesting /reset would destroy context without fixing storage.
-        failure_reason = str(agent_result.get("failure_reason") or "")
         if failure_reason.startswith("session_persistence_failed") or "session storage" in error_str:
             if failure_reason.endswith(":disk") or "disk" in error_str:
                 return t("gateway.errors.session_storage_unavailable_disk")
@@ -3142,11 +3174,21 @@ def _normalize_empty_agent_response(
             # ``error`` mirrors the loop's own final text (curated, e.g. "Response truncated due to
             # output length limit") and is kept; a raw provider envelope goes to the log instead.
             err = str(agent_result.get("error") or t("gateway.errors.processing_incomplete"))
+            # local: ``error`` is diagnostic metadata and is not always safe chat copy. Invalid-tool
+            # exhaustion historically put the rejected tool name here verbatim; keep that detail
+            # in logs while rendering a stable user-facing failure category.
+            from agent.turn_failure_copy import SITE_FAILURE_CODES, site_copy
+            if (
+                failure_reason == "invalid_tool_call"
+                or err.lstrip().lower().startswith("model generated invalid tool call:")
+            ):
+                logger.warning("Agent turn ended on invalid tool call; internal detail kept in log: %s", err[:500])
+                safe = site_copy("invalid_tool_call")
+                return safe if safe.startswith("⚠️") else f"⚠️ {safe}"
             # A loop site code (truncated, context_overflow, ...) already wrote the full
             # what-happened / what-to-do sentence: deliver it verbatim. Wrapping it would cut it
             # mid-sentence at 200 chars and append a second, conflicting set of instructions.
-            from agent.turn_failure_copy import SITE_FAILURE_CODES
-            if (str(agent_result.get("failure_reason") or "") in SITE_FAILURE_CODES
+            if (failure_reason in SITE_FAILURE_CODES
                     and err.strip() and not _looks_like_gateway_provider_error(err)):
                 return err if err.startswith("⚠️") else f"⚠️ {err}"
             if _looks_like_gateway_provider_error(err):
@@ -4666,7 +4708,11 @@ def _housekeeping_state_db_maintenance(launch: Optional[Tuple[Path, Path]] = Non
     from hermes_cli.config import load_config as _load_full_config
     from hermes_state_registry import acquire, release_or_close
     _sess_cfg = (_load_full_config().get("sessions") or {})
-    if not (_sess_cfg.get("auto_archive", False) or _sess_cfg.get("auto_prune", False)):
+    if not (
+        _sess_cfg.get("auto_archive", False)
+        or _sess_cfg.get("auto_cold_archive", False)
+        or _sess_cfg.get("auto_prune", False)
+    ):
         return
     _adb = acquire()
     try:
@@ -4674,6 +4720,13 @@ def _housekeeping_state_db_maintenance(launch: Optional[Tuple[Path, Path]] = Non
             _adb.maybe_auto_archive(
                 idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
                 min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)))
+        if _sess_cfg.get("auto_cold_archive", False):
+            _adb.maybe_auto_cold_archive(
+                older_than_days=int(_sess_cfg.get("cold_archive_days", 90)),
+                min_interval_hours=int(_sess_cfg.get("cold_archive_min_interval_hours", 24)),
+                sessions_dir=_profile_sessions_dir(launch),
+                vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
+                min_vacuum_interval_days=int(_sess_cfg.get("min_vacuum_interval_days", 30)))
         if _sess_cfg.get("auto_prune", False):
             _adb.maybe_auto_prune_and_vacuum(
                 retention_days=int(_sess_cfg.get("retention_days", 90)),
@@ -5555,6 +5608,7 @@ async def _start_gateway_start_control_socket(runner):
             unserve_profile_verb, serve_profile_verb,
         )
         from gateway.run_plugin_rewire import reload_plugins_verb
+        from gateway.run_local_inbound import local_inbound_verb, local_session_health_verb
         # pause-for-update: the updater asks us to drain + exit (freeing venv handles) vs. a tree-kill
         # (same path as SIGUSR1). Handler runs on the socket executor thread, so marshal onto the loop.
         # pause-for-update (#92091 step 2): the updater asks this gateway to drain in-flight turns and exit
@@ -5607,6 +5661,8 @@ async def _start_gateway_start_control_socket(runner):
                            "serve-profile": serve_profile_verb(runner),
                            "migrate-profile-identity": migrate_profile_identity_verb(runner),
                            "purge-profile-identity": purge_profile_identity_verb(runner),
+                           "inject-local-inbound": local_inbound_verb(runner, _main_loop),
+                           "local-session-health": local_session_health_verb(runner, _main_loop),
                            # A plugin installed/enabled by another process loads now and re-wires the
                            # live adapters' handlers (#87770); tools/prompt still wait for the next session.
                            "reload-plugins": reload_plugins_verb(runner, _main_loop)})

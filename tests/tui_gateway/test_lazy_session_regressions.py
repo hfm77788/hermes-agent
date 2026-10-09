@@ -200,8 +200,28 @@ class TestGatewaySurfacesNullResponse:
         )
 
         assert response != "", "Null response with api_calls>0 must be surfaced"
-        assert "nonexistent_tool" in response
+        assert "nonexistent_tool" not in response
+        assert "invalid tool call" not in response.lower()
+        assert "unavailable" in response.lower()
 
+
+
+    def test_partial_internal_traceback_is_sanitized(self):
+        from gateway.run import _normalize_empty_agent_response
+
+        agent_result = {
+            "final_response": "Traceback (most recent call last):\n  File \"secret.py\", line 1",
+            "api_calls": 2,
+            "partial": True,
+            "error": "internal",
+        }
+        response = _normalize_empty_agent_response(
+            agent_result, agent_result["final_response"], history_len=5,
+        )
+
+        assert "traceback" not in response.lower()
+        assert "secret.py" not in response
+        assert "couldn't finish" in response
 
 
     def test_failed_generic_error(self):

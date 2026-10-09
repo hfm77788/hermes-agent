@@ -397,6 +397,10 @@ class AIAgent(
         # The workspace snapshot is pinned per session (agent/system_prompt.py::_coding_parts); a
         # /new, /resume or /branch on the same agent must re-snapshot at its own session start.
         self._frozen_workspace_snapshot = None
+        # Retrieval metadata is also session-scoped because project-local/platform-visible
+        # skills can change across /new, /resume, or /branch while the AIAgent object is reused.
+        # The first turn reconstructs it through the prompt-builder visibility path.
+        self._skill_retrieval_catalog = []
 
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0

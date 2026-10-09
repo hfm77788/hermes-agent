@@ -17,8 +17,8 @@ from hermes_constants import display_hermes_home
 
 # Failure codes minted by loop sites that are not provider verdicts (see module docstring).
 SITE_FAILURE_CODES = frozenset({
-    "context_overflow", "truncated", "invalid_response", "empty_response", "loop_error",
-    "interpreter_shutdown", "session_busy",
+    "context_overflow", "truncated", "invalid_response", "invalid_tool_call",
+    "empty_response", "loop_error", "interpreter_shutdown", "session_busy",
 })
 
 
@@ -283,6 +283,11 @@ _FAILURE_CODE_COPY: Dict[str, str] = {
     "invalid_response": (
         "{label} sent back an empty or broken reply {attempts} times — it is probably overloaded "
         "or rate-limiting you. " + _NEXT_STEPS_RETRY + "\n\nDetails: {detail}"
+    ),
+    "invalid_tool_call": (
+        "I couldn't finish that reply safely because the model kept trying to use a tool "
+        "that is unavailable for this turn. The unavailable tool was blocked. Please send "
+        "your message again; if it repeats, switch models with /model."
     ),
     "loop_error": (
         "Hermes hit repeated errors and stopped this turn so it wouldn't keep retrying. "

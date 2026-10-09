@@ -199,6 +199,25 @@ def test_empty_tool_name_gets_terse_error_no_catalog(agent_env, blank):
 
 
 
+def test_tool_free_turn_invalid_call_gets_plain_text_recovery_instruction(agent_env):
+    """A deliberately zero-tool turn must steer a hallucinated tool call back to text."""
+    agent, handler = agent_env
+    agent.valid_tool_names = set()
+    agent.tools = []
+    handler.response_queue.append(_tc_resp("terminal", "{}"))
+    handler.response_queue.append(_text_resp("答对了。第2题继续。"))
+
+    result = agent.run_conversation("第一题答案是4", conversation_history=[], task_id="t")
+
+    assert result.get("final_response") == "答对了。第2题继续。"
+    assert not result.get("partial", False)
+    joined = " ".join(_tool_results(handler))
+    assert "No tools are available for this turn" in joined
+    assert "Answer the user's request directly in plain text" in joined
+    assert "Available tools:" not in joined
+
+
+
 
 # ── Mixed batches: valid calls execute, invalid calls get error results ──
 #
@@ -260,8 +279,13 @@ def test_invalid_tool_exhaustion_closes_tool_tail(agent_env):
     result = agent.run_conversation("degenerate", conversation_history=[], task_id="t")
 
     assert result.get("partial", False)
+    assert result.get("failure_reason") == "invalid_tool_call"
+    assert "invalid tool call" not in (result.get("final_response") or "").lower()
+    assert "frobnicate_xyz" not in (result.get("final_response") or "")
+    assert "Model generated invalid tool call: frobnicate_xyz" == result.get("error")
     msgs = result.get("messages") or []
     assert msgs, "expected persisted conversation messages"
     assert msgs[-1].get("role") == "assistant"
-    assert "invalid tool call" in (msgs[-1].get("content") or "").lower()
+    assert "invalid tool call" not in (msgs[-1].get("content") or "").lower()
+    assert "frobnicate_xyz" not in (msgs[-1].get("content") or "")
 

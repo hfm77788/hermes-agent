@@ -43,35 +43,47 @@ def switch_deferred_by_reset(agent, reason: "FailoverReason | None", reset_at) -
 
 
 def _arm_rate_limit_cooldown(
-    agent, reason: "FailoverReason | None", reset_at=None,
+    agent, reason: "FailoverReason | None", *, reset_at=None,
 ) -> int | None:
-    """Arm the primary cooldown until the provider reset, or use exponential backoff.
+    """Arm the primary cooldown, honoring a provider-declared reset when present.
 
-    ``reset_at`` is an absolute wall-clock timestamp while ``_rate_limited_until`` is monotonic;
-    convert through a duration so wall-clock epoch values never enter the monotonic comparison.
-    Missing, invalid, or expired provider resets retain the 60s → 2m → ... → 4h fallback.
-    Only arm when leaving the primary: chain-switching from an active fallback means the primary
-    was not the failing source. Return the armed cooldown in seconds, or None when not armed.
+    Fork circuit semantics: cooldown is the MAX of exponential backoff and the provider
+    reset window, and never shrinks an existing longer cooldown (open-circuit monotonic).
     """
     if reason not in _RATE_LIMIT_FAILOVER_REASONS:
         return None
     current_provider = (getattr(agent, "provider", "") or "").strip().lower()
     primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
-    if getattr(agent, "_fallback_activated", False) and not (primary_provider and current_provider == primary_provider):
+    if getattr(agent, "_fallback_activated", False) and not (
+        primary_provider and current_provider == primary_provider
+    ):
         return None
+
     backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
     agent._rate_limit_backoff_count = backoff_count + 1
-    provider_delay = _provider_reset_delay(reset_at)
-    if provider_delay is not None:
-        backoff_seconds = math.ceil(provider_delay)
-        source = "provider reset"
-    else:
-        backoff_seconds = min(60 * (2 ** backoff_count), 14400)
-        source = "exponential fallback"
-    agent._rate_limited_until = time.monotonic() + backoff_seconds
-    logging.info(
-        "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d, %s)",
-        backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1, source,
+    generic_seconds = min(60 * (2 ** backoff_count), 14400)
+    backoff_seconds = generic_seconds
+
+    if reset_at is not None:
+        try:
+            from agent.retry_utils import reset_at_delay_seconds
+            reset_delay = reset_at_delay_seconds(reset_at)
+        except Exception:
+            reset_delay = None
+        if reset_delay is None:
+            reset_delay = _provider_reset_delay(reset_at)
+        if reset_delay is not None and 0 <= reset_delay <= 32 * 24 * 3600:
+            backoff_seconds = max(backoff_seconds, int(math.ceil(reset_delay)) + 2)
+
+    now_mono = time.monotonic()
+    existing_remaining = max(
+        0, int(math.ceil((getattr(agent, "_rate_limited_until", 0) or 0) - now_mono))
+    )
+    backoff_seconds = max(backoff_seconds, existing_remaining)
+    agent._rate_limited_until = now_mono + backoff_seconds
+    logger.info(
+        "Rate-limit circuit open: cooldown %d s (generic=%d s, backoff#%d, reset_signal=%s)",
+        backoff_seconds, generic_seconds, backoff_count + 1, reset_at is not None,
     )
     return backoff_seconds
 

@@ -30,6 +30,44 @@ EXCLUDED_SKILL_DIRS = frozenset((
 # via skill_view(skill, file_path=...), never scanned as standalone skills.
 SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
 
+# Org mirrors live under skills/_org/<org_id>/ and are TOKEN-GATED: the sync
+# client writes the marker after verifying the token; no marker => no org skills
+# load. The marker persists offline so already-pulled org skills keep working.
+ORG_MIRROR_DIR_NAME = "_org"
+ORG_ACTIVE_MARKER = ".active_org"
+ORG_PROVENANCE_FILE = ".org-provenance.json"
+ORG_BASELINE_FILE = ".org-baseline.json"  # upstream fingerprint; detects local edits
+
+
+def read_active_org_id(skills_dir: Path) -> Optional[str]:
+    """The org id whose mirror may resolve, or None (no org skills load)."""
+    marker = skills_dir / ORG_MIRROR_DIR_NAME / ORG_ACTIVE_MARKER
+    try:
+        return (marker.read_text(encoding="utf-8").strip() or None) if marker.exists() else None
+    except OSError:
+        return None
+
+
+def _org_rel_parts(path, skills_dir: Path) -> Tuple[str, ...]:
+    """Path parts of *path* relative to *skills_dir* if it is under ``_org/``, else ``()``."""
+    try:
+        parts = Path(path).resolve().relative_to(Path(skills_dir).resolve()).parts
+    except (OSError, ValueError):
+        return ()
+    return parts if parts and parts[0] == ORG_MIRROR_DIR_NAME else ()
+
+
+def is_org_mirror_path(path, skills_dir: Path) -> bool:
+    """True when *path* is inside the org mirror (``_org/``)."""
+    return bool(_org_rel_parts(path, skills_dir))
+
+
+def org_id_of_path(path, skills_dir: Path) -> Optional[str]:
+    """The ``<org_id>`` segment for a path under ``_org/<org_id>/...``."""
+    parts = _org_rel_parts(path, skills_dir)
+    return parts[1] if len(parts) >= 2 else None
+
+
 def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
     """True if *path* should be skipped by skill scanners (VCS/dependency/cache
     dirs + support packages). Apply to every SKILL.md from a direct ``rglob``."""
@@ -271,6 +309,27 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     if platform_disabled is not None:
         disabled |= _normalize_string_set(platform_disabled)
     return disabled - ESSENTIAL_SKILLS
+
+
+def get_compact_skill_categories(platform: str | None = None) -> Set[str]:
+    """Skill categories rendered as names-only in the prompt.
+
+    This is a footprint control, not an ability gate: skills remain discoverable and
+    loadable with ``skill_view``. Global ``skills.compact_categories`` is unioned
+    with ``skills.platform_compact_categories.<platform>`` so messaging profiles can
+    keep role capabilities without paying every skill description on every turn.
+    """
+    skills_cfg = _skills_cfg()
+    if skills_cfg is None:
+        return set()
+    from gateway.session_context import get_session_env
+    resolved_platform = platform or os.getenv("HERMES_PLATFORM") or get_session_env("HERMES_SESSION_PLATFORM")
+    compact = _normalize_string_set(skills_cfg.get("compact_categories"))
+    platform_map = skills_cfg.get("platform_compact_categories")
+    platform_compact = platform_map.get(resolved_platform) if isinstance(platform_map, dict) and resolved_platform else None
+    if platform_compact is not None:
+        compact |= _normalize_string_set(platform_compact)
+    return compact
 
 
 def parse_config_string_list(value) -> List[str]:
@@ -841,10 +900,19 @@ def is_skill_description_truncated_for_prompt(frontmatter: Dict[str, Any]) -> bo
 
 def iter_skill_index_files(skills_dir: Path, filename: str):
     """Walk skills_dir yielding sorted paths matching *filename*; prunes
-    EXCLUDED_SKILL_DIRS and support dirs of skill roots."""
+    EXCLUDED_SKILL_DIRS and support dirs of skill roots. Org mirrors are
+    TOKEN-GATED: only the active org's subdir is walked, so leaving an org
+    stops its skills resolving without manual cleanup."""
+    skills_dir_str = str(skills_dir)
+    active_org = read_active_org_id(skills_dir)
+    org_root = os.path.join(skills_dir_str, ORG_MIRROR_DIR_NAME)
     matches: list[str] = []
-    for root, dirs, files in os.walk(str(skills_dir), followlinks=True):
+    for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
         has_skill_md = "SKILL.md" in files
+        if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
+            dirs.remove(ORG_MIRROR_DIR_NAME)
+        elif root == org_root:
+            dirs[:] = [d for d in dirs if d == active_org]
         dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
         if filename in files:
             matches.append(os.path.join(root, filename))

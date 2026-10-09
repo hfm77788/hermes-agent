@@ -33,14 +33,19 @@ concurrency:
 
 jobs:
   test:
-    # Two 32-core slices instead of one box: on one runner the suite is ~10 min of
-    # nearly fully packed work, and a single bigger runner (96-core) scaled ~1.8x for
-    # 3x the price because files contend for the shared machine. Separate machines
-    # scale linearly. run_tests_parallel.py partitions from the checkout alone, so
-    # both slices agree on the split without a planning job.
+    # Upstream v0.21.6: two 32-core slices instead of one box: on one runner the
+    # suite is ~10 min of nearly fully packed work, and a single bigger runner
+    # (96-core) scaled ~1.8x for 3x the price because files contend for the
+    # shared machine. Separate machines scale linearly. run_tests_parallel.py
+    # partitions from the checkout alone, so both slices agree on the split
+    # without a planning job.
+    #
+    # Fork guard: PRs use the always-available standard runner; main keeps the
+    # sliced 32-core lane for fast post-merge validation. Larger-runner capacity
+    # can queue indefinitely, so it must not be a merge-path dependency.
     name: Run tests (${{ matrix.slice }}/2)
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 30
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'ubuntu-latest-32-core' }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -107,8 +112,19 @@ jobs:
           scripts/run_tests.sh
         env:
           HERMES_TEST_SLICE: ${{ matrix.slice }}/2
-          HERMES_TEST_WORKERS: 32
           HERMES_TEST_FILE_TIMEOUT: 600
+          # This is the maximum number of test FILES that run together.
+          # run_tests_parallel.py starts one pytest subprocess for each file
+          # from a single ThreadPoolExecutor, so this value IS the limit.
+          #
+          # One worker per core wins (measured on the 96-core runner: 96
+          # workers -> 126s mean vs 138s at 0.5x and 142s at 3x; the curve is
+          # shallow and workers above the core count only add contention).
+          # Each slice runs on a 32-core runner on main, hence 32. Match
+          # concurrency to the runner class: standard PR runners have far
+          # fewer cores; keeping 32 workers there creates contention and
+          # false timeouts without increasing coverage.
+          HERMES_TEST_WORKERS: ${{ github.event_name == 'pull_request' && '4' || '32' }}
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
@@ -129,8 +145,8 @@ jobs:
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
     # writer processes per test; a 4-vCPU runner serialises them into timeouts.
     if: inputs.e2e
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 30
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'ubuntu-latest-32-core' }}
+    timeout-minutes: 90
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -194,12 +210,14 @@ jobs:
           # ready frames (empty stderr, still alive) and hit 60–120s deadlines
           # across unrelated SQLite, tenancy, provider and terminal suites.
           # Bound the trees, not the child readiness/turn timeouts. At 4 the
-          # PTY turn and serve-SIGTERM deadlines still starved intermittently.
-          HERMES_TEST_WORKERS: "3"
+          # PTY turn and serve-SIGTERM deadlines still starved intermittently
+          # on the 32-core runner, hence 3 there; PRs use the standard runner
+          # and drop to 2.
+          HERMES_TEST_WORKERS: ${{ github.event_name == 'pull_request' && '2' || '3' }}
           # Multi-process episodes (torture chamber, compaction kill -9,
           # gateway liveness, delivery exactly-once through a real gateway,
           # the cron virtual-clock soak) legitimately run past the 300 s default.
-          HERMES_TEST_FILE_TIMEOUT: "900"
+          HERMES_TEST_FILE_TIMEOUT: ${{ github.event_name == 'pull_request' && '1800' || '900' }}
           # No automatic re-run of a failed file: the torture chamber and the
           # exactly-once/compaction suites are race detectors, and a rare
           # corruption that passes on retry is still a corruption.
@@ -250,8 +268,8 @@ jobs:
     # runs ~5-15 min. Sharded by suite directory (see e2e-upgrade-plan).
     name: e2e-upgrade (${{ matrix.shard }})
     needs: e2e-upgrade-plan
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 60
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'ubuntu-latest-32-core' }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -263,6 +281,13 @@ jobs:
           # N-1 = `git describe --tags --abbrev=0 HEAD~1`.
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Fetch upstream release tags for real N-1
+        run: |
+          git fetch --force --no-tags --no-recurse-submodules \
+            https://github.com/NousResearch/hermes-agent.git \
+            '+refs/tags/v*:refs/tags/v*'
+          echo "Upgrade base: $(git describe --tags --abbrev=0 HEAD~1)"
 
       - name: Set up Node
         # `hermes update` builds the web UI / TUI workspaces.
@@ -291,10 +316,12 @@ jobs:
           # fetching a manifest from raw.githubusercontent.com on EVERY job —
           # a transient fetch failure fails the whole job (2026-07-28 slice-5
           # incident). Pinned, the binary downloads directly; no manifest hop.
-          # Newer than the unit job's pin on purpose: 0.9.28 only knows CPython
-          # 3.11.14, whose bundled SQLite has the WAL-reset bug, so Hermes runs
-          # state.db in DELETE mode and the WAL torture chamber would skip.
-          version: "0.12.13"
+          # Upgrade E2E must install both HEAD and release N-1 from their
+          # committed lockfiles. uv 0.12.13 rejects v2026.9.24's otherwise
+          # valid lock as needing an update; 0.11.24 accepts both N-1 and HEAD.
+          # Python stays explicitly pinned to 3.11.15 below, so this does not
+          # reintroduce the old 3.11.14 / SQLite WAL-reset gap.
+          version: "0.11.24"
           # Persist uv's download/wheel cache (~/.cache/uv) across runs.
           # Keyed on the dependency manifests, so the cache is reused until
           # pyproject.toml or uv.lock changes. `uv sync` still runs every
@@ -360,9 +387,10 @@ jobs:
           HERMES_E2E_STRICT_ACCEPTANCE: ${{ inputs.strict_acceptance }}
           # Each file drives real installs/updaters (process trees plus uv and
           # git I/O); cpu_count of them at once starves their deadlines. A
-          # shard holds at most ~7 files, so this runs each shard in one wave.
-          HERMES_TEST_WORKERS: "6"
-          HERMES_TEST_FILE_TIMEOUT: "3000"
+          # shard holds at most ~7 files, so 6 runs each shard in one wave on
+          # the 32-core runner; PRs use the standard runner and drop to 2.
+          HERMES_TEST_WORKERS: ${{ github.event_name == 'pull_request' && '2' || '6' }}
+          HERMES_TEST_FILE_TIMEOUT: ${{ github.event_name == 'pull_request' && '3600' || '3000' }}
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""

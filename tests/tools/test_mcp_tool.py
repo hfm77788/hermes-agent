@@ -3129,3 +3129,37 @@ class TestRedirectHeaderStripper:
             location="https://origin.example.test/other")
         assert next_request.headers["authorization"] == "Bearer x"
         assert next_request.headers["x-tenant"] == "t"
+
+
+def test_read_only_hint_is_parallel_safe_without_server_wide_opt_in():
+    """A readOnlyHint tool from a mixed server is parallel-safe; its write sibling is not."""
+    import tools.mcp_tool as mcp_tool
+    from tools import mcp_tool_discovery as discovery
+    from tools import mcp_tool_registration as registration
+    from tools.mcp_tool_schema import mcp_prefixed_tool_name
+    from tools.mcp_tool_scope import _server_key
+
+    read_tool = mcp_prefixed_tool_name("mixed", "search")
+    write_tool = mcp_prefixed_tool_name("mixed", "create")
+    key = _server_key("mixed")
+    with mcp_tool._lock:
+        saved_map = dict(mcp_tool._mcp_tool_server_names)
+        saved_hints = {k: dict(v) for k, v in mcp_tool._tool_read_only_hints.items()}
+        saved_parallel = set(mcp_tool._parallel_safe_servers)
+        mcp_tool._mcp_tool_server_names.clear()
+        mcp_tool._tool_read_only_hints.clear()
+        mcp_tool._parallel_safe_servers.clear()
+        mcp_tool._tool_read_only_hints[key] = {"search": True, "create": False}
+    try:
+        registration._track_mcp_tool_server(read_tool, "mixed")
+        registration._track_mcp_tool_server(write_tool, "mixed")
+        assert discovery.is_mcp_tool_parallel_safe(read_tool) is True
+        assert discovery.is_mcp_tool_parallel_safe(write_tool) is False
+    finally:
+        with mcp_tool._lock:
+            mcp_tool._mcp_tool_server_names.clear()
+            mcp_tool._mcp_tool_server_names.update(saved_map)
+            mcp_tool._tool_read_only_hints.clear()
+            mcp_tool._tool_read_only_hints.update(saved_hints)
+            mcp_tool._parallel_safe_servers.clear()
+            mcp_tool._parallel_safe_servers.update(saved_parallel)

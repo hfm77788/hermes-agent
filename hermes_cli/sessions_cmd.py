@@ -882,6 +882,92 @@ def _cmd_browse(db, args):
     relaunch(["--resume", selected_id])  # won't return after execvp
 
 
+
+def _cmd_cold_archive(db, args):
+    days = float(getattr(args, "older_than", 90.0))
+    limit = getattr(args, "limit", None)
+    preview = db.cold_archive(older_than_days=days, dry_run=True, limit=limit)
+    count = int(preview.get("candidates") or 0)
+    if not count:
+        print("No safe cold-archive candidates.")
+        return
+    print(
+        f"{count} ended, archived, unpinned standalone session(s) are inactive >= {days:g} days."
+    )
+    if getattr(args, "dry_run", False):
+        print("Dry run — no archive files written and no hot rows deleted.")
+        return
+    if not getattr(args, "yes", False) and not _confirm_prompt(
+        f"Cold-archive and remove these {count} session(s) from the hot store? [y/N] "
+    ):
+        print("Cancelled.")
+        return
+    from hermes_constants import get_hermes_home
+    result = db.cold_archive(
+        older_than_days=days,
+        sessions_dir=get_hermes_home() / "sessions",
+        limit=limit,
+    )
+    print(
+        f"Cold-archived {result.get('archived', 0)} session(s) into "
+        f"{len(result.get('bundles') or [])} new bundle(s); "
+        f"deleted {result.get('deleted', 0)} verified hot row(s)."
+    )
+    skipped = result.get("skipped") or []
+    if skipped:
+        print(f"Skipped {len(skipped)} session(s) fail-closed; no unverified copy was deleted.")
+    return 0 if result.get("ok", True) else 1
+
+
+def _cmd_cold_list(db, args):
+    rows = db.cold_list(limit=max(0, int(getattr(args, "limit", 100) or 0)))
+    if getattr(args, "json", False):
+        print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+        return
+    if not rows:
+        print("No cold-archived sessions.")
+        return
+    for row in rows:
+        title = (row.get("title") or "")[:48]
+        print(
+            f"{row.get('session_id')}  {row.get('message_count', 0):>5} live / "
+            f"{row.get('history_message_count', 0):>5} all  {title}"
+        )
+
+
+def _cmd_cold_search(db, args):
+    rows = db.cold_search(
+        args.query,
+        max_bundles=max(0, int(getattr(args, "max_bundles", 50) or 0)),
+        match_limit=max(0, int(getattr(args, "limit", 50) or 0)),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+        return
+    if not rows:
+        print("No cold-history matches.")
+        return
+    for row in rows:
+        snippet = " ".join(str(row.get("snippet") or "").splitlines())
+        print(f"{row.get('session_id')}  {(row.get('title') or '')[:40]}")
+        print(f"  {snippet[:220]}")
+
+
+def _cmd_cold_restore(db, args):
+    sid = str(args.session_id)
+    if not getattr(args, "yes", False) and not _confirm_prompt(
+        f"Restore cold session {sid!r} into the hot session store? [y/N] "
+    ):
+        print("Cancelled.")
+        return
+    result = db.cold_restore(sid)
+    if result.get("ok"):
+        print(f"Restored session {sid}. Full audit history remains preserved in cold storage.")
+        return
+    print(f"Restore refused: {result.get('error', 'unknown_error')}")
+    return 1
+
+
 # -- storage maintenance -----------------------------------------------------
 
 def _print_size_change(db, before_mb, prefix=""):
@@ -1190,13 +1276,15 @@ _PRE_DB_HANDLERS = {
     "repair-profiles": _cmd_repair_profiles,  # opens every profile's store itself
     "set-journal-mode": _cmd_set_journal_mode,  # offline: must not open the store it converts
 }
-_OBSERVATIONAL_DB_ACTIONS = frozenset({"list", "stats", "pinned"})
+_OBSERVATIONAL_DB_ACTIONS = frozenset({"list", "stats", "pinned", "cold-list", "cold-search"})
 _DB_HANDLERS = {
     "list": _cmd_list, "export": _cmd_export, "delete": _cmd_delete, "rename": _cmd_rename, "pinned": _cmd_pinned,
     "prune": partial(_cmd_prune_or_archive, action="prune"), "pin": partial(_cmd_pin, pinning=True),
     "archive": partial(_cmd_prune_or_archive, action="archive"), "unpin": partial(_cmd_pin, pinning=False),
     "retitle-skills": _cmd_retitle_skills, "browse": _cmd_browse, "optimize": _cmd_optimize,
     "clean-markers": _cmd_clean_markers, "optimize-storage": _cmd_optimize_storage,
+    "cold-archive": _cmd_cold_archive, "cold-list": _cmd_cold_list,
+    "cold-search": _cmd_cold_search, "cold-restore": _cmd_cold_restore,
     "repair-routing": _cmd_repair_routing, "repair-prompts": _cmd_repair_prompts, "stats": _cmd_stats,
 }
 
@@ -1213,7 +1301,7 @@ def _print_empty_store(action: str, args) -> None:
 
 # VACUUM, the FTS-layout rebuild and bulk deletes rewrite the store; underneath a live gateway/Desktop/cron
 # writer that is the second-writer class behind the retired-WAL refusal (#110054). `--force` is the override.
-_HELD_STORE_ACTIONS = frozenset({"optimize", "optimize-storage", "prune"})
+_HELD_STORE_ACTIONS = frozenset({"optimize", "optimize-storage", "prune", "cold-archive"})
 
 
 def cmd_sessions(args, sessions_parser=None):

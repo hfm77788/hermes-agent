@@ -1052,7 +1052,17 @@ def _canonicalize_api_tool_calls(api_messages) -> None:
 def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
     """Error content for an unknown tool name. A blank name is a model echoing tool-call
     syntax seen in data (#47967) — dumping the catalog feeds that loop, so it gets a terse
-    error; a nonempty wrong name still gets the catalog to self-correct."""
+    error; a nonempty wrong name still gets the catalog to self-correct.
+
+    A deliberately tool-free turn is different: an empty catalog means *no* tool is valid.
+    Say that explicitly so a model that hallucinated ``terminal``/``write_file`` can recover
+    on the next API call by answering in text instead of repeating another bogus tool call.
+    """
+    if not valid_tool_names:
+        return (
+            "No tools are available for this turn. Do not call any tool. "
+            "Answer the user's request directly in plain text."
+        )
     if not (name or "").strip():
         return (
             "Tool call rejected: the tool name was empty. If tool-call XML or JSON appeared in file "
@@ -1529,8 +1539,13 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
 def _codex_app_server_turn(agent: Any, s: Any) -> Optional[Dict[str, Any]]:
     """The codex app-server's result for this turn, or None when its failure activated a fallback and the
     generic loop retries the same user turn."""
+    from agent.turn_context import compose_user_api_content
+
+    codex_user_message = compose_user_api_content(
+        s.user_message, s._ext_prefetch_cache, s._plugin_user_context
+    ) or s.user_message
     codex_result = agent._run_codex_app_server_turn(
-        user_message=s.user_message, original_user_message=s.original_user_message,
+        user_message=codex_user_message, original_user_message=s.original_user_message,
         messages=s.messages, effective_task_id=s.effective_task_id,
         should_review_memory=s._should_review_memory,
     )

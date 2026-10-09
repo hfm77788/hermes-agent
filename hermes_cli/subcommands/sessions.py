@@ -127,6 +127,38 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
         sessions_archive, "Only archive sessions older than AGE (duration like '5h'/'2d', "
         "bare number of days, or ISO timestamp)")
 
+
+    sessions_cold_archive = sessions_subparsers.add_parser(
+        "cold-archive",
+        help="Move old archived standalone sessions into verified compressed cold storage")
+    sessions_cold_archive.add_argument(
+        "--older-than", type=float, default=90.0, metavar="DAYS",
+        help="Only move sessions inactive for at least DAYS (default: 90)")
+    sessions_cold_archive.add_argument(
+        "--limit", type=int, default=None, help="Maximum sessions to process in this run")
+    _flag(sessions_cold_archive, "--dry-run", help="Show candidates without writing or deleting")
+    _flag(sessions_cold_archive, "--force",
+        help="Run even while another Hermes process holds state.db (not recommended)")
+    add_yes_flag(sessions_cold_archive, "Skip confirmation")
+
+    sessions_cold_list = sessions_subparsers.add_parser(
+        "cold-list", help="List sessions preserved in cold storage")
+    sessions_cold_list.add_argument("--limit", type=int, default=100, help="Max sessions to show")
+    add_json_flag(sessions_cold_list, "Emit JSON")
+
+    sessions_cold_search = sessions_subparsers.add_parser(
+        "cold-search", help="Search titles and complete message history in cold storage")
+    sessions_cold_search.add_argument("query", help="Case-insensitive text to find")
+    sessions_cold_search.add_argument("--limit", type=int, default=50, help="Max matches")
+    sessions_cold_search.add_argument(
+        "--max-bundles", type=int, default=50, help="Max newest archive bundles to scan")
+    add_json_flag(sessions_cold_search, "Emit JSON")
+
+    sessions_cold_restore = sessions_subparsers.add_parser(
+        "cold-restore", help="Restore one cold session's canonical live context")
+    sessions_cold_restore.add_argument("session_id", help="Exact session ID to restore")
+    add_yes_flag(sessions_cold_restore, "Skip confirmation")
+
     sessions_optimize = sessions_subparsers.add_parser(
         "optimize", help="Reclaim disk space: merge FTS5 segments + VACUUM (no data change)")
     _flag(sessions_optimize, "--force",

@@ -18,6 +18,7 @@ from agent.conversation_compression import (
     PRE_API_COMPRESSION_STATUS_TEMPLATE, _reset_read_dedup_caches, compression_blocked_transiently,
     compression_skipped_due_to_lock, context_compression_timed_out,
     conversation_history_after_compression, ensure_compression_feasibility_checked,
+    reset_context_compression_timeout_outcome,
 )
 from agent.turn_context import _review_fork_first_request_pending
 from agent.turn_context_compaction import (
@@ -146,17 +147,30 @@ def run_preflight_compression(
         _pre_api_input = v.messages
         v.messages, v.active_system_prompt = agent._compress_context(
             v.messages, system_message, approx_tokens=request_pressure_tokens,
-            task_id=effective_task_id,
+            task_id=effective_task_id, foreground_turn=True,
         )
         if context_compression_timed_out(agent):
-            # Progress-aware timeout: never reached the provider — refund the
-            # call/budget and stop; an overflow retry would only re-compress.
-            v.api_call_count = _refund_api_call(agent, v.api_call_count)
-            v.final_response = _COMPRESSION_TIMEOUT_FINAL_RESPONSE
-            v.failed = True
-            v._compression_timeout_exhausted = True
-            v._turn_exit_reason = "context_compression_timeout"
-            return _done("break")
+            # A foreground hold deadline may fail open only when this exact request is known to fit.
+            # The slow summary worker is already fenced from late commit; its cooldown prevents immediate
+            # re-entry after tool output.
+            from agent.turn_context import PreflightCompressionTimedOut, _fail_closed_after_preflight_timeout
+            try:
+                _fail_closed_after_preflight_timeout(agent, request_pressure_tokens)
+            except PreflightCompressionTimedOut:
+                v.api_call_count = _refund_api_call(agent, v.api_call_count)
+                v.final_response = _COMPRESSION_TIMEOUT_FINAL_RESPONSE
+                v.failed = True
+                v._compression_timeout_exhausted = True
+                v._turn_exit_reason = "context_compression_timeout"
+                return _done("break")
+            reset_context_compression_timeout_outcome(agent)
+            v._last_preflight_pressure = None
+            # The prepared request was built before the compression attempt. Even though the
+            # transcript stayed unchanged, the active system prompt may have been rebuilt while
+            # unwinding the timed-out compressor, so force the provider request to be rebuilt.
+            if v.pending_moa_prepared_request is moa_prepared_request:
+                v.pending_moa_prepared_request = None
+            return _done("fallthrough")
         if v.messages is _pre_api_input and (
             compression_skipped_due_to_lock(agent) or compression_blocked_transiently(agent)
         ):
@@ -313,8 +327,17 @@ def compress_after_tool_results(
         # Pass overhead-aware _real_tokens, not last_prompt_tokens (0 in the
         # no-usage fallback), so the overflow guard sees the true size.
         messages, active_system_prompt = agent._compress_context(
-            messages, system_message, approx_tokens=_real_tokens, task_id=effective_task_id
+            messages, system_message, approx_tokens=_real_tokens, task_id=effective_task_id,
+            foreground_turn=True,
         )
+        if context_compression_timed_out(agent):
+            # Same foreground contract as pre-API compression: this short hold budget is installed
+            # only for a request proven to fit the model window, so keep the current tool turn moving
+            # on the unchanged transcript instead of treating the latency cap as a terminal turn error.
+            from agent.conversation_compression import request_exceeds_model_window
+            if request_exceeds_model_window(agent, _real_tokens) is False:
+                reset_context_compression_timeout_outcome(agent)
+                return _verdict(False)
         if messages is _post_tool_input and compression_skipped_due_to_lock(agent):
             # Lock-skip no-op is a temporary defer, not evidence about compressibility:
             # refund so a lock-loser loop doesn't burn the budget toward exhausted.

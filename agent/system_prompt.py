@@ -307,11 +307,22 @@ def _skills_prompt(agent: Any) -> str:
     avail_toolsets = {model_tools.get_toolset_for_tool(tool_name) for tool_name in agent.valid_tool_names} - {None, ""}
     try:
         from agent.coding_context import coding_compact_skill_categories
-        _compact_cats = coding_compact_skill_categories(platform=agent.platform, cwd=resolve_context_cwd())
+        from agent.skill_utils import get_compact_skill_categories
+        _compact_cats = frozenset(coding_compact_skill_categories(platform=agent.platform, cwd=resolve_context_cwd()))
+        # Pass the agent platform explicitly. Messaging gateway turns bind a session-platform
+        # ContextVar, but offline diagnostics and bare-thread prompt builds do not; relying only
+        # on ambient context made ``prompt-size --platform`` disagree with production behavior.
+        _compact_cats |= frozenset(get_compact_skill_categories(getattr(agent, "platform", None)))
     except Exception:
         _compact_cats = frozenset()
-    return _pb.build_skills_system_prompt(available_tools=agent.valid_tool_names, available_toolsets=avail_toolsets,
-                                         compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent))
+    catalog: list[dict[str, Any]] = []
+    prompt = _pb.build_skills_system_prompt(
+        available_tools=agent.valid_tool_names, available_toolsets=avail_toolsets,
+        compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent),
+        names_only_all=True, catalog_out=catalog,
+    )
+    agent._skill_retrieval_catalog = catalog
+    return prompt
 
 
 def _auto_load_parts(agent: Any) -> List[str]:
@@ -753,7 +764,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     skills_prompt = _skills_prompt(agent)
     # Skill-pointer variant requires BOTH skill_view AND the hermes-agent skill
     # in the rendered index (pure string check — inherits the index's stability).
-    if "skill_view" in (agent.valid_tool_names or set()) and "- hermes-agent:" in skills_prompt:
+    if "skill_view" in (agent.valid_tool_names or set()) and any(
+        str(entry.get("name") or "") == "hermes-agent"
+        for entry in (getattr(agent, "_skill_retrieval_catalog", None) or [])
+    ):
         stable_parts[_help_guidance_slot] = HERMES_AGENT_HELP_GUIDANCE
     stable_parts.extend(_alibaba_identity_part(agent))
     # Pinned skills are per-agent constants (resolved once), so they live in the stable prefix.

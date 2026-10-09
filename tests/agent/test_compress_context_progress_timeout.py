@@ -22,6 +22,7 @@ from agent.conversation_compression import (
     mark_context_compression_timed_out,
     reset_context_compression_timeout_outcome,
     resolve_context_compression_timeouts,
+    resolve_context_compression_turn_hold_seconds,
     run_compress_context_with_progress_timeout,
 )
 
@@ -150,6 +151,12 @@ class TestResolveContextCompressionTimeouts:
         )
         assert idle == 90.0
         assert ceiling == 90.0
+
+
+def test_foreground_turn_hold_resolver_defaults_to_30_seconds():
+    assert resolve_context_compression_turn_hold_seconds({}) == 30.0
+    assert resolve_context_compression_turn_hold_seconds({"context_max_turn_hold_seconds": 0}) == 0.0
+    assert resolve_context_compression_turn_hold_seconds({"context_max_turn_hold_seconds": 12.5}) == 12.5
 
 
 class TestRunCompressContextWithProgressTimeout:
@@ -743,3 +750,157 @@ class TestCompressContextForwarderOwnsTimeout:
         assert agent._last_compression_timed_out is False
         assert prompt == "sys"
         assert msgs[0]["content"] == "ok"
+
+
+def test_facade_foreground_turn_uses_short_hold_budget(monkeypatch):
+    """The public _compress_context foreground flag must wire the configured turn-hold cap."""
+    from run_agent import AIAgent
+    from agent.context_compressor import ContextCompressor
+
+    agent = object.__new__(AIAgent)
+    agent.session_id = "s1"
+    agent._cached_system_prompt = "sys"
+    agent._emit_warning = MagicMock()
+    agent._touch_activity = MagicMock()
+    agent._build_system_prompt = MagicMock(return_value="sys")
+    agent._conversation_root_id = MagicMock(return_value=None)
+    agent.context_compressor = MagicMock()
+    agent.context_compressor.context_length = 1_000
+    agent.context_compressor._consecutive_timeout_failures = 0
+    agent.context_compressor.record_timeout_failure = (
+        ContextCompressor.record_timeout_failure.__get__(agent.context_compressor, MagicMock)
+    )
+    agent.context_compressor._record_compression_failure_cooldown = MagicMock()
+
+    release = threading.Event()
+
+    def streaming_compress(agent_obj, messages, system_message, **kwargs):
+        fence = kwargs["commit_fence"]
+        while not fence.deadline_exceeded:
+            fence.touch_progress()
+            time.sleep(0.002)
+        release.wait(timeout=1)
+        return messages, "sys"
+
+    monkeypatch.setattr("agent.conversation_compression.compress_context", streaming_compress)
+    monkeypatch.setattr(
+        "agent.conversation_compression.resolve_context_compression_timeouts",
+        lambda compression_cfg=None: (0.30, 0.60),
+    )
+    monkeypatch.setattr(
+        "agent.conversation_compression.resolve_context_compression_turn_hold_seconds",
+        lambda compression_cfg=None: 0.05,
+    )
+    monkeypatch.setattr("agent.portal_tags.get_conversation_context", lambda: object())
+
+    original = [{"role": "user", "content": "stay"}]
+    started = time.monotonic()
+    try:
+        out_msgs, out_prompt = AIAgent._compress_context(
+            agent, original, "sys", approx_tokens=100, foreground_turn=True
+        )
+    finally:
+        release.set()
+
+    assert time.monotonic() - started < 0.20
+    assert out_msgs is original
+    assert out_prompt == "sys"
+    assert agent._last_compression_timed_out is True
+
+
+def test_foreground_turn_hold_caps_streaming_fit_request(monkeypatch):
+    """A healthy-but-slow trickle must not hold an arriving user turn to the generic 600s ceiling."""
+    import threading
+    import time
+
+    original = [{"role": "user", "content": "keep-me"}]
+    release = threading.Event()
+    seen = {"timeout": 0}
+
+    def worker(fence):
+        while not fence.deadline_exceeded:
+            fence.touch_progress()
+            time.sleep(0.002)
+        release.wait(timeout=1)
+        return original, "sys"
+
+    monkeypatch.setattr(
+        cc, "_join_cancelled_worker",
+        MagicMock(side_effect=AssertionError("foreground hold must not add teardown grace")),
+    )
+    started = time.monotonic()
+    try:
+        out_messages, out_prompt = run_compress_context_with_progress_timeout(
+            worker=worker,
+            messages=original,
+            system_prompt_fallback="sys",
+            idle_timeout_seconds=0.30,
+            total_ceiling_seconds=0.60,
+            max_wait_seconds=0.05,
+            stall_fallback=False,
+            on_timeout=lambda *_args: seen.__setitem__("timeout", seen["timeout"] + 1),
+        )
+    finally:
+        release.set()
+
+    assert time.monotonic() - started < 0.20
+    assert out_messages is original
+    assert out_prompt == "sys"
+    assert seen["timeout"] == 1
+
+
+def test_foreground_hold_never_shortens_over_window_recovery():
+    original = [{"role": "user", "content": "too-large"}]
+
+    def worker(fence):
+        fence.touch_progress()
+        time.sleep(0.03)
+        return ([{"role": "assistant", "content": "compressed"}], "sys")
+
+    out_messages, out_prompt = run_compress_context_with_progress_timeout(
+        worker=worker,
+        messages=original,
+        system_prompt_fallback="sys",
+        idle_timeout_seconds=0.50,
+        total_ceiling_seconds=0.60,
+        max_wait_seconds=0.01,
+        request_exceeds_window=True,
+        stall_fallback=False,
+    )
+
+    assert out_messages[0]["content"] == "compressed"
+    assert out_prompt == "sys"
+
+
+def test_foreground_hold_above_generic_ceiling_does_not_change_timeout_semantics(monkeypatch):
+    original = [{"role": "user", "content": "keep"}]
+    release = threading.Event()
+    joined = {"called": False}
+
+    def worker(fence):
+        while not fence.deadline_exceeded:
+            fence.touch_progress()
+            time.sleep(0.002)
+        release.wait(timeout=1)
+        return original, "sys"
+
+    def fake_join(_future, _grace):
+        joined["called"] = True
+        return False
+
+    monkeypatch.setattr(cc, "_join_cancelled_worker", fake_join)
+    try:
+        out_messages, _ = run_compress_context_with_progress_timeout(
+            worker=worker,
+            messages=original,
+            system_prompt_fallback="sys",
+            idle_timeout_seconds=0.05,
+            total_ceiling_seconds=0.08,
+            max_wait_seconds=1.0,
+            stall_fallback=False,
+        )
+    finally:
+        release.set()
+
+    assert out_messages is original
+    assert joined["called"] is True

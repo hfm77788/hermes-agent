@@ -24,6 +24,11 @@ async def test_enrich_message_with_vision_merges_analysis_without_output_cap():
 
     assert "A cat on a chair." in result
     assert "What is happening here?" in result
+    prompt = mock_vision.await_args.kwargs["user_prompt"]
+    assert "What is happening here?" in prompt
+    assert "without a second vision pass" in prompt
+    assert "Use vision_analyze again" in result
+    assert "only if a specific required detail is missing" in result
     # No output cap is forwarded: per the max-tokens-knob policy the aux
     # client decides token handling; conciseness comes from the prompt.
     assert "max_tokens" not in mock_vision.await_args.kwargs

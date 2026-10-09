@@ -204,7 +204,10 @@ class TestSendDingtalk:
             extra = {"webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=abc"}
             result = asyncio.run(_send_dingtalk(extra, "ignored", "hello dingtalk"))
 
-        assert result == {"success": True, "platform": "dingtalk", "chat_id": "ignored"}
+        assert result["success"] is True
+        assert result["platform"] == "dingtalk"
+        assert result["chat_id"] == "ignored"
+        assert result["message_id"]
         client.post.assert_awaited_once()
         call_kwargs = client.post.await_args
         assert call_kwargs[0][0] == "https://oapi.dingtalk.com/robot/send?access_token=abc"

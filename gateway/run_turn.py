@@ -48,6 +48,126 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+
+def _turn_presentation_muted(display_metadata, platform, user_config, source) -> bool:
+    """Mute a trusted local sidecar turn while preserving it as normal human input."""
+    return (
+        diagnostic_turn_muted(display_metadata, platform, user_config)
+        or bool(getattr(source, "_suppress_presentation", False))
+    )
+
+
+def _publish_local_inbound_response(source, response) -> None:
+    """Return the authoritative final text to a trusted local sidecar, if one is waiting.
+
+    Local inbound bridges bypass the gateway's later final-send normalization, so this is
+    a security/reliability boundary: failed/partial turns must never hand raw tool/provider
+    diagnostics to DingTalk (or another chat sidecar).
+    """
+    future = getattr(source, "_local_inbound_response_future", None)
+    if not isinstance(future, asyncio.Future) or future.done():
+        return
+    final = response.get("final_response", "") if isinstance(response, dict) else ""
+    final = str(final or "")
+    # Reuse the normal chat boundary for partial/failed turn copy, provider envelopes, secret
+    # redaction and transport sentinels. Import lazily because gateway.run imports this mixin.
+    from gateway.run import _normalize_empty_agent_response, _sanitize_gateway_final_response
+    if isinstance(response, dict):
+        final = _normalize_empty_agent_response(response, final, history_len=0)
+    final = _sanitize_gateway_final_response(source.platform, final)
+    future.set_result(final)
+
+
+_FAST_TUTORING_SKILLS = frozenset({
+    "huangshang-math-tutor",
+    "huangshang-english-tutor",
+    "jiayin-math-tutor",
+    "jiayin-physics-tutor",
+})
+_FAST_TUTORING_TOOLFUL_PREFIXES = (
+    "开始", "开练", "数学练习", "英语练习", "对勾打团来", "兑勾打团来",
+)
+_FAST_TUTORING_TOOLFUL_MARKERS = (
+    "结束", "收工", "暂停", "不练", "交卷", "保存", "记录",
+    "搜集", "搜索", "查资料", "查教材", "教材", "题库", "档案",
+    "复盘", "总结", "学习计划", "周报",
+)
+_FAST_TUTORING_FINAL_STRONG_MARKERS = (
+    "q10", "q 10", "第10题", "第 10 题", "e1",
+    "答完这题就交卷", "答完这题交卷",
+)
+_FAST_TUTORING_FINAL_WEAK_MARKERS = ("最后一题", "最后一关")
+_FAST_TUTORING_FINAL_PROMPT_CUES = (
+    "？", "?", "请", "回答", "说说", "解释", "为什么", "多少", "怎么",
+    "计算", "算出", "写出", "选择", "填空", "判断",
+)
+
+
+def _fast_tutoring_history_requires_final_closeout(content: str) -> bool:
+    """Return True only when the latest assistant turn is an actual final prompt.
+
+    ``最后一题`` / ``最后一关`` are weak conversational phrases: a stale progress
+    statement such as ``今晚只剩最后一题`` must not unlock the full tool surface for
+    the child's next correction. Strong structured markers keep their historical
+    behavior, while weak markers must look like a concrete prompt.
+    """
+    lowered = str(content or "").lower()
+    if any(marker in lowered for marker in _FAST_TUTORING_FINAL_STRONG_MARKERS):
+        return True
+    for marker in _FAST_TUTORING_FINAL_WEAK_MARKERS:
+        marker_pos = lowered.find(marker)
+        if marker_pos < 0:
+            continue
+        tail = lowered[marker_pos + len(marker):].lstrip()
+        if any(cue in tail for cue in _FAST_TUTORING_FINAL_PROMPT_CUES):
+            return True
+        if tail.startswith(("：", ":")) and tail.lstrip("：: ").strip():
+            return True
+    return False
+
+
+def _local_inbound_fast_tutoring_no_tools(
+    source: "SessionSource", message: str, history: List[Dict[str, Any]],
+) -> bool:
+    """Return True for ordinary in-flight tutoring replies that must stay tool-free.
+
+    Only trusted local DingTalk group injections carrying one of the education
+    tutor skills qualify. Lifecycle, retrieval, media and final-question turns
+    retain the normal tool surface.
+    """
+    if (
+        source.platform != Platform.DINGTALK
+        or str(getattr(source, "chat_type", "") or "").lower() != "group"
+        or not getattr(source, "_trusted_context_tail", False)
+    ):
+        return False
+    if getattr(source, "_local_inbound_has_media", False):
+        return False
+    if str(getattr(source, "_local_inbound_skill", "") or "") not in _FAST_TUTORING_SKILLS:
+        return False
+
+    text = str(message or "").strip()
+    if not text or len(text) > 600:
+        return False
+    lowered = text.lower()
+    if any(lowered.startswith(marker.lower()) for marker in _FAST_TUTORING_TOOLFUL_PREFIXES):
+        return False
+    if any(marker.lower() in lowered for marker in _FAST_TUTORING_TOOLFUL_MARKERS):
+        return False
+
+    # The answer to the explicitly final question may need the closeout/write
+    # path. Detect it from the latest assistant turn instead of guessing from
+    # the child's short answer text.
+    for item in reversed(history or []):
+        if str(item.get("role") or "").lower() != "assistant":
+            continue
+        content = str(item.get("content") or "").lower()
+        if _fast_tutoring_history_requires_final_closeout(content):
+            return False
+        break
+    return True
+
+
 _tool_call_logger_lock = threading.Lock()
 
 
@@ -1831,7 +1951,11 @@ class GatewayTurnMixin:
         ts = time.time()  # Unix epoch float — consistent with DB storage
         store = self.async_session_store
         sid = session_entry.session_id
-        history = prepared.history
+        history = (
+            prepared.durable_history
+            if prepared.durable_history is not None
+            else prepared.history
+        )
         # The agent already persisted this turn's rows (codex app-server reports agent_persisted=True
         # too); skip the DB write. Default = a session DB exists; non-persisting runtimes pass False.
         # The agent already persisted these messages to SQLite via _flush_messages_to_session_db(), so skip
@@ -2042,6 +2166,9 @@ class GatewayTurnMixin:
         persistence_session_id: Optional[str] = None
         persistence_owner: Optional[str] = None
         title_user_message: Optional[str] = None
+        # Full durable transcript; history may be a reduced model-only view for fast lane.
+        durable_history: Any = None
+        fast_lane: bool = False
 
     async def _hmwa_prepare_turn(self, event, source, session_entry, session_key, _quick_key, run_generation):
         """Everything between session resolution and the agent run: session open, task-local env,
@@ -2058,8 +2185,10 @@ class GatewayTurnMixin:
         # Self-injected turns (internal=True) persist with a DB-only display_kind: timeline notices, not user bubbles.
         persist_user_display_kind = display_kind_for_event(event)
         _redact_pii = False  # privacy.redact_pii, re-read per message
+        _turn_config: Optional[dict[str, Any]] = None
         with suppress(Exception):
-            _redact_pii = bool((_load_gateway_config().get("privacy") or {}).get("redact_pii", False))
+            _turn_config = _load_gateway_config()
+            _redact_pii = bool((_turn_config.get("privacy") or {}).get("redact_pii", False))
 
         # The context prompt render is pinned per session, keyed by a hash of the renderer inputs, so
         # the system prompt cannot drift turn-over-turn; a miss (thread rename, /sethome) re-renders.
@@ -2093,15 +2222,48 @@ class GatewayTurnMixin:
         # An unreadable store is not an empty conversation: stop before the agent invents continuity
         # from []. Restore task-local context here (before the broad cleanup finally).
         try:
-            history = await self.async_session_store.load_transcript(session_entry.session_id)
-            history = await self._hmwa_run_session_hygiene(
-                event, source, session_entry, session_key, history, _quick_key, run_generation,
+            durable_history = await self.async_session_store.load_transcript(session_entry.session_id)
+            _pending_state = self._peek_session_state(session_key) if session_key else None
+            _pending_sidecar = bool(
+                getattr(getattr(_pending_state, "conversation", None), "sidecar_notes", None)
             )
+            for _notes_attr in ("_pending_model_notes", "_pending_skills_reload_notes"):
+                _notes_map = getattr(self, _notes_attr, None)
+                if isinstance(_notes_map, dict) and session_key in _notes_map:
+                    _pending_sidecar = True
+                    break
+            from gateway.fast_lane import decide_fast_lane
+            _fast_lane = await decide_fast_lane(
+                event=event,
+                source=source,
+                history=durable_history,
+                session_entry=session_entry,
+                config=_turn_config,
+                was_auto_reset=_was_auto_reset,
+                is_new_session=_is_new_session,
+                pending_sidecar=_pending_sidecar,
+            )
+            if _fast_lane.use_fast_lane:
+                self._evict_cached_agent(session_key)
+                if _fast_lane.history_tail_rows > 0:
+                    _tail_start = max(0, len(durable_history) - _fast_lane.history_tail_rows)
+                    agent_history = durable_history[_tail_start:]
+                    # Never begin a bounded replay on an orphan tool result.
+                    while (agent_history and isinstance(agent_history[0], dict)
+                           and agent_history[0].get("role") == "tool"):
+                        agent_history = agent_history[1:]
+                else:
+                    agent_history = []
+            else:
+                durable_history = await self._hmwa_run_session_hygiene(
+                    event, source, session_entry, session_key, durable_history, _quick_key, run_generation,
+                )
+                agent_history = durable_history
         except TranscriptReadError:
             self._clear_session_env(_session_env_tokens)
             return t("gateway.errors.history_unavailable"), _session_env_tokens
 
-        await self._hmwa_first_contact_notes(source, history, turn_sidecar_notes, event.text, internal=event.internal)
+        await self._hmwa_first_contact_notes(source, durable_history, turn_sidecar_notes, event.text, internal=event.internal)
 
         # Voice channel state rides the user message ONLY when changed (in the system prompt it
         # forced a rebuild + prompt-cache re-key per message).
@@ -2111,7 +2273,7 @@ class GatewayTurnMixin:
 
         # Auto-analyze user images so the model gets a description plus the local path.
         message_text = await self._prepare_profile_scoped_inbound_message_text(
-            event=event, source=source, history=history, session_key=session_key,
+            event=event, source=source, history=durable_history, session_key=session_key,
         )
         if message_text is None:
             return None, _session_env_tokens
@@ -2136,9 +2298,11 @@ class GatewayTurnMixin:
         owner = (str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(namespace)))
                  if event.message_id else str(uuid.uuid4()))
         return self._PreparedTurn(
-            history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
+            agent_history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
             persist_user_display_kind, session_entry.session_id, owner,
             title_user_message=title_user_message,
+            durable_history=durable_history,
+            fast_lane=bool(_fast_lane.use_fast_lane),
         ), _session_env_tokens
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
@@ -3100,8 +3264,8 @@ class GatewayTurnMixin:
             **{name: getattr(disp, name) for name in self._DISPLAY_TO_TURN_CTX}, **turn_params,
         )
         turn_runner = TurnRunner(self, turn_ctx)
-        turn_ctx.mute_notification_reply = diagnostic_turn_muted(
-            turn_ctx.persist_user_display_metadata, source.platform, turn_ctx.user_config)
+        turn_ctx.mute_notification_reply = _turn_presentation_muted(
+            turn_ctx.persist_user_display_metadata, source.platform, turn_ctx.user_config, source)
         # Agent tool-lifecycle callbacks live on the runner (bound methods, same signatures).
         turn_ctx.progress_callback = turn_runner.progress_callback
         turn_ctx.voice_ack_callback = turn_runner.voice_ack_callback
@@ -4199,6 +4363,7 @@ class GatewayTurnMixin:
         from gateway.run import _float_env, _interim_metadata, _non_conversational_metadata
         _notify_start = time.time()
         _NOTIFY_INTERVAL = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
+        _FIRST_ACK_DELAY = max(0.0, _float_env("HERMES_AGENT_FIRST_ACK_DELAY", 3))
         _long_running_mode = disp._display_surface_mode("long_running_notifications", default=True, allow_generic=True)
         if _NOTIFY_INTERVAL <= 0 or _long_running_mode == "off":
             return
@@ -4208,8 +4373,49 @@ class GatewayTurnMixin:
         if not _notify_adapter:
             return
         _heartbeat_msg_id: Optional[str] = None
+        _first_periodic_delay = _NOTIFY_INTERVAL
+        if 0 < _FIRST_ACK_DELAY < _NOTIFY_INTERVAL:
+            await asyncio.sleep(_FIRST_ACK_DELAY)
+            if not self._should_emit_long_running_notification(
+                session_key, agent_holder[0], _executor_task_holder[0]
+            ):
+                return
+            _agent = agent_holder[0]
+            _tier = getattr(_agent, "_adaptive_turn_budget_tier", None)
+            _stream = turn_ctx.stream_consumer_holder[0] if turn_ctx.stream_consumer_holder else None
+            _stream_already_visible = bool(
+                _stream is not None and (
+                    getattr(_stream, "message_id", None)
+                    or getattr(_stream, "final_content_delivered", False)
+                )
+            )
+            if _tier in {"long", "research"} and not _stream_already_visible:
+                _first_text = (
+                    disp._generic_status_phrase("status")
+                    if _long_running_mode == "generic"
+                    else "⏳ Working — started"
+                )
+                try:
+                    _notify_res = await _notify_adapter.send(
+                        source.chat_id, _first_text,
+                        metadata=_interim_metadata(
+                            _non_conversational_metadata(
+                                _status_thread_metadata, platform=source.platform
+                            )
+                        ),
+                    )
+                    if getattr(_notify_res, "success", False) and getattr(_notify_res, "message_id", None):
+                        _heartbeat_msg_id = str(_notify_res.message_id)
+                        if turn_ctx._cleanup_progress:
+                            turn_ctx._cleanup_msg_ids.append(_heartbeat_msg_id)
+                except Exception as _ne:
+                    logger.debug("Fast first acknowledgement error: %s", _ne)
+            _first_periodic_delay = max(0.0, _NOTIFY_INTERVAL - _FIRST_ACK_DELAY)
+
+        _next_notify_delay = _first_periodic_delay
         while True:
-            await asyncio.sleep(_NOTIFY_INTERVAL)
+            await asyncio.sleep(_next_notify_delay)
+            _next_notify_delay = _NOTIFY_INTERVAL
             if not self._should_emit_long_running_notification(
                 session_key, agent_holder[0], _executor_task_holder[0]
             ):
@@ -4288,6 +4494,16 @@ class GatewayTurnMixin:
         from run_agent import AIAgent
 
         disp = self._run_agent_display_settings(source)
+        if _local_inbound_fast_tutoring_no_tools(source, message, history):
+            # A non-empty zero-tool toolset is deliberate: an empty selection is
+            # treated as unconfigured/default in several tool-resolution paths.
+            disp = dataclasses.replace(disp, enabled_toolsets=["bot_room"])
+            logger.info(
+                "fast tutoring guard: tool-free turn platform=%s chat=%s skill=%s",
+                getattr(source.platform, "value", source.platform),
+                source.chat_id,
+                getattr(source, "_local_inbound_skill", ""),
+            )
         if scheduled_heartbeat:
             # A heartbeat is proactive work: tool chrome, drafts, thinking and periodic
             # liveness notices would create a user-visible ping before its final result is known.
@@ -4344,6 +4560,7 @@ class GatewayTurnMixin:
             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
             _executor_task_holder[0] = worker.executor_task  # read late by _notify_long_running
             response = await self._run_agent_await_turn_worker(worker, turn_ctx, _interrupt_detected, interrupt_monitor)
+            _publish_local_inbound_response(source, response)
             if isinstance(response, dict):
                 response["_notification_reply_muted"] = turn_ctx.mute_notification_reply
             self._run_agent_evict_on_fallback(turn_ctx)

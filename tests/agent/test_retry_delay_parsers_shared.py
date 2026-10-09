@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.retry_utils import parse_retry_after_seconds, reset_delay_from_message
+from agent.retry_utils import parse_retry_after_seconds, reset_at_delay_seconds, reset_delay_from_message
 
 
 def _http_date(seconds_ahead: int) -> str:
@@ -76,3 +76,34 @@ class TestResetDelayOneTable:
 
         assert reset_delay_from_message("resets in the future, maybe") is None
         assert "reset_at" not in _normalize_error_context({"message": "resets in the future, maybe"})
+
+
+class TestAbsoluteQuotaReset:
+    def test_aliyun_yearless_utc_reset(self):
+        now = datetime(2026, 9, 20, 10, 0, 0, tzinfo=timezone.utc)
+        message = (
+            "Your token-plan 1-week quota has been exhausted. "
+            "The quota will reset at 09-20 11:07:00 UTC."
+        )
+        assert reset_delay_from_message(message, now=now) == pytest.approx(67 * 60)
+
+    def test_yearless_reset_rolls_across_new_year(self):
+        now = datetime(2026, 12, 31, 23, 0, 0, tzinfo=timezone.utc)
+        assert reset_delay_from_message(
+            "quota will reset at 01-01 01:00:00 UTC", now=now
+        ) == pytest.approx(2 * 3600)
+
+    def test_structured_reset_at_wall_clock_to_delay(self):
+        now_epoch = datetime(2026, 9, 20, 10, 0, tzinfo=timezone.utc).timestamp()
+        reset_epoch = datetime(2026, 9, 20, 11, 7, tzinfo=timezone.utc).timestamp()
+        assert reset_at_delay_seconds(reset_epoch, now_epoch=now_epoch) == pytest.approx(67 * 60)
+        assert reset_at_delay_seconds(120, now_epoch=now_epoch) == pytest.approx(120)
+
+    def test_body_reset_at_precedes_retry_after(self):
+        import time
+        from agent.agent_runtime_helpers import extract_api_error_context
+        future = time.time() + 3600
+        err = Exception("quota exhausted")
+        err.body = {"error": {"reset_at": future, "retry_after": 10, "message": "quota exhausted"}}
+        ctx = extract_api_error_context(err)
+        assert ctx["reset_at"] == future

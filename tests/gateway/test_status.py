@@ -1380,7 +1380,7 @@ class TestReadProcessCmdlinePsFallback:
             status.subprocess, "run",
             lambda args, **kwargs: SimpleNamespace(returncode=0, stdout="/usr/libexec/bluetoothuserd\n"),
         )
-        result = status._read_process_cmdline(873)
+        result = status._read_process_cmdline(99_999_999)
         assert result == "/usr/libexec/bluetoothuserd"
 
 

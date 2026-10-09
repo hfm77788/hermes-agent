@@ -1693,12 +1693,16 @@ class SessionSessionsMixin:
         expected_display_messages: Optional[Dict[str, List[Dict[str, Any]]]] = None,
         exclude_active_write_guards: bool = False,
         include_compression_chain: bool = False,
+        reject_active_write_guards: bool = False,
     ) -> bool:
         """Delete a session and its messages; delegate children cascade, branch/compression children
         are orphaned. Optional expected ids fence delegate drift; expected display snapshots fence
         transcript drift. Both checks run inside the same write transaction as deletion.
         With ``exclude_active_write_guards``, raises :class:`SessionActiveWriteGuardError` if the row
-        is protected by an active turn lease or compression lock.
+        is protected by an active turn lease or compression lock. With ``reject_active_write_guards``,
+        a live turn/compression holder instead makes the delete silently return False (cold-archive
+        fails closed without surfacing an error).
+        Every enabled check runs inside the same write transaction as deletion.
 
         With ``include_compression_chain=True`` the whole compression chain the session belongs to
         is deleted with it (root and every continuation) — the dashboard delete endpoints use this
@@ -1708,6 +1712,7 @@ class SessionSessionsMixin:
         through :meth:`delete_sessions` keeps the chain-aware guard/counting semantics in one
         place; its return value counts the *requested* ids that existed, so ``> 0`` is exactly
         "the session was found"."""
+
         if include_compression_chain:
             return self.delete_sessions(
                 [session_id], sessions_dir=sessions_dir,
@@ -1721,13 +1726,18 @@ class SessionSessionsMixin:
                 return False
             target_ids = (
                 [session_id, *_collect_delegate_child_ids(conn, [session_id])]
-                if exclude_active_write_guards or expected_ids is not None else None
+                if exclude_active_write_guards or reject_active_write_guards or expected_ids is not None
+                else None
             )
             if exclude_active_write_guards and self._guarded_ids(conn, target_ids):
                 # Delegate children cascade with the root, so a guard on any of them refuses too.
                 raise SessionActiveWriteGuardError(
                     f"session '{session_id}' (or a delegate child) has an active turn lease or compression lock"
                 )
+            if reject_active_write_guards and self._write_guards_reject(
+                conn, session_id, allow_closed_compression_parent=True
+            ):
+                return False
             if expected_ids is not None and expected_ids != set(target_ids):
                 return False
             if expected_display_messages is not None and any(

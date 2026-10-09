@@ -76,8 +76,10 @@ jobs:
     # takes minutes and not seconds when the cache misses. `nix flake check`
     # builds 21 checks, and --max-jobs defaults to the core count. It uses the
     # wider runner with no more configuration.
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 60
+    # PR correctness must not depend on scarce larger-runner capacity.
+    # Main retains the wider runner so the cache-producing path stays fast.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'ubuntu-latest-32-core' }}
+    timeout-minutes: 120
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1

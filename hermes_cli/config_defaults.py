@@ -654,6 +654,10 @@ DEFAULT_CONFIG = {
         # commit is never abandoned: past the ceiling it is logged (WARNING, then ERROR) and
         # surfaced on the warning channel while the host keeps waiting.
         "context_total_ceiling_seconds": 600,
+        # Max pre-commit wall-clock an arriving foreground turn waits on automatic preflight compression when
+        # the request still fits the model window. 0 disables this extra cap. Manual /compress and
+        # over-window recovery keep the full context timeout/ceiling contract.
+        "context_max_turn_hold_seconds": 30,
         # Non-system head messages always kept verbatim, in ADDITION to the (always protected)
         # system prompt. 0 = pin nothing but system prompt + summary + tail.
         "protect_first_n": 3,
@@ -2284,6 +2288,15 @@ DEFAULT_CONFIG = {
         # List delegate_task subagent runs in session lists (desktop sidebar, dashboard, session.list),
         # nested under their parent. Off by default: they are machinery, not conversations.
         "show_subagents": False,
+        # Move old standalone archived sessions into checksummed compressed cold bundles before
+        # removing them from the hot SQLite store. Conservative upstream default is OFF; enabling
+        # this preserves canonical restore payload + full audit history under session-archive/.
+        "auto_cold_archive": False,
+        # Inactivity threshold for cold storage. v1 only moves ended, archived, unpinned,
+        # standalone sessions (no parent/children) and fails closed on live write guards.
+        "cold_archive_days": 90,
+        # Independent throttle for cold storage, so it is not coupled to prune cadence.
+        "cold_archive_min_interval_hours": 24,
         # VACUUM after a prune that deleted rows (SQLite never reclaims disk on DELETE). VACUUM
         # blocks writes (~seconds per 100MB), so it runs only at startup, only when ≥1 session was
         # deleted AND freelist/page_count > 25%.

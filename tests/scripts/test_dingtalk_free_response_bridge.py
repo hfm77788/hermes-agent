@@ -1,0 +1,396 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+
+import pytest
+import yaml
+
+from scripts.dingtalk_free_response_bridge import Bridge
+
+
+def write_cfg(tmp_path: Path) -> Path:
+    cfg = {
+        "profile": "hema-teacher",
+        "robot_code": "robot-code",
+        "state_file": str(tmp_path / "state.json"),
+        "sessions_json": str(tmp_path / "sessions.json"),
+        "media_cache_dir": str(tmp_path / "media"),
+        "groups": [
+            {
+                "name": "Math",
+                "chat_id": "cid-math",
+                "skill": "math-skill",
+                "ignored_sender_ids": ["bot-id"],
+                "skip_text_markers": ["@河马老师"],
+                "allowed_members": [
+                    {
+                        "open_dingtalk_id": "child-id",
+                        "hermes_session_user_id": "hard-child-key",
+                        "role": "learner",
+                    }
+                ],
+            }
+        ],
+    }
+    p = tmp_path / "cfg.yaml"
+    p.write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
+    return p
+
+
+def test_first_start_initializes_cursor_without_replay(tmp_path):
+    bridge = Bridge(write_cfg(tmp_path))
+    gs = bridge.state["groups"]["cid-math"]
+    assert gs["cursor_time"]
+    assert gs["processed_ids"] == []
+
+
+def test_session_resolution_uses_exact_chat_and_hard_user_key(tmp_path):
+    cfg = write_cfg(tmp_path)
+    sessions = {
+        "agent:main:dingtalk:group:cid-math:hard-child-key": {
+            "session_id": "sid-123"
+        }
+    }
+    (tmp_path / "sessions.json").write_text(json.dumps(sessions), encoding="utf-8")
+    bridge = Bridge(cfg)
+    group = bridge.groups[0]
+    member = group.allowed_members["child-id"]
+    assert bridge._session_id(group, member) == "sid-123"
+
+
+def test_bot_and_mentioned_messages_are_skipped(tmp_path, monkeypatch):
+    bridge = Bridge(write_cfg(tmp_path))
+    group = bridge.groups[0]
+    monkeypatch.setattr(bridge, "_generate_reply", lambda *a, **k: pytest.fail("should not generate"))
+    assert bridge._process_message(group, {"messageId": "m1", "senderId": "bot-id", "text": "x"})
+    assert bridge._process_message(group, {"messageId": "m2", "senderId": "child-id", "text": "hi @河马老师"})
+
+
+def test_unverified_sender_is_fail_closed(tmp_path, monkeypatch):
+    bridge = Bridge(write_cfg(tmp_path))
+    group = bridge.groups[0]
+    monkeypatch.setattr(bridge, "_generate_reply", lambda *a, **k: pytest.fail("should not generate"))
+    assert bridge._process_message(group, {"messageId": "m3", "senderId": "stranger", "text": "hello"})
+    assert "m3" in bridge.state["groups"]["cid-math"]["processed_ids"]
+
+
+def test_pending_reply_prevents_duplicate_generation_on_send_retry(tmp_path, monkeypatch):
+    bridge = Bridge(write_cfg(tmp_path))
+    group = bridge.groups[0]
+    calls = {"generate": 0, "send": 0}
+
+    def generate(*_a, **_k):
+        calls["generate"] += 1
+        return "reply"
+
+    def send(*_a, **_k):
+        calls["send"] += 1
+        if calls["send"] == 1:
+            raise RuntimeError("temporary send failure")
+
+    monkeypatch.setattr(bridge, "_generate_reply", generate)
+    monkeypatch.setattr(bridge, "_send_reply", send)
+
+    msg = {"messageId": "m4", "senderId": "child-id", "text": "hello"}
+    with pytest.raises(RuntimeError):
+        bridge._process_message(group, msg)
+    assert bridge.state["groups"]["cid-math"]["pending"]["m4"] == "reply"
+
+    assert bridge._process_message(group, msg)
+    assert calls["generate"] == 1
+    assert calls["send"] == 2
+    assert "m4" in bridge.state["groups"]["cid-math"]["processed_ids"]
+
+
+def test_recent_context_is_chronological(tmp_path, monkeypatch):
+    bridge = Bridge(write_cfg(tmp_path))
+    group = bridge.groups[0]
+
+    class Proc:
+        returncode = 0
+        stderr = ""
+        stdout = json.dumps(
+            {
+                "messages": [
+                    {"createTime": "2026-09-26 20:00:02", "sender": "Moon", "text": "40"},
+                    {"createTime": "2026-09-26 20:00:01", "sender": "河马老师", "text": "Q1"},
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(bridge, "_run", lambda *a, **k: Proc())
+    assert bridge._recent_context(group, "2026-09-26 20:00:03") == "河马老师: Q1\nMoon: 40"
+
+
+def test_fresh_generation_avoids_heavy_session_resume(tmp_path, monkeypatch):
+    bridge = Bridge(write_cfg(tmp_path))
+    group = bridge.groups[0]
+    member = group.allowed_members["child-id"]
+    assert group.resume_existing_session is False
+
+    monkeypatch.setattr(
+        bridge,
+        "_recent_context",
+        lambda *_a, **_k: "河马老师: Q1\nMoon: 40",
+    )
+    captured = {}
+
+    class Proc:
+        returncode = 0
+        stderr = ""
+        stdout = "继续下一题"
+
+    def fake_run(cmd, *, timeout):
+        captured["cmd"] = cmd
+        captured["timeout"] = timeout
+        return Proc()
+
+    monkeypatch.setattr(bridge, "_run", fake_run)
+    reply = bridge._generate_reply(
+        group,
+        member,
+        "继续",
+        "2026-09-26 20:00:03",
+    )
+    assert reply == "继续下一题"
+    assert "--resume" not in captured["cmd"]
+    prompt = captured["cmd"][captured["cmd"].index("-z") + 1]
+    assert "河马老师: Q1" in prompt
+    assert "Moon: 40" in prompt
+    assert "当前原始消息：继续" in prompt
+
+
+
+def test_gateway_injection_reuses_dual_identity_and_bootstraps_context_once(tmp_path, monkeypatch):
+    cfg_path = write_cfg(tmp_path)
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    cfg["gateway_inject_existing_session"] = True
+    cfg_path.write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
+
+    bridge = Bridge(cfg_path)
+    group = bridge.groups[0]
+    member = group.allowed_members["child-id"]
+    calls = []
+    context_calls = {"n": 0}
+
+    def recent(*_a, **_k):
+        context_calls["n"] += 1
+        return "河马老师: R2 求多少米？"
+
+    def inject(_home, params, *, timeout):
+        calls.append((dict(params), timeout))
+        return {"accepted": True, "response": "答对了。下一题"}
+
+    monkeypatch.setattr(bridge, "_recent_context", recent)
+    monkeypatch.setattr(
+        "scripts.dingtalk_free_response_bridge.inject_gateway_local_inbound", inject)
+
+    assert bridge._generate_reply(
+        group, member, "4000米", "2026-09-26 21:20:42", "m1") == "答对了。下一题"
+    assert calls[0][0]["user_id"] == "child-id"
+    assert calls[0][0]["user_id_alt"] == "hard-child-key"
+    assert calls[0][0]["skill"] == "math-skill"
+    assert calls[0][0]["force_context"] is True
+    assert calls[0][0]["recent_context"] == "河马老师: R2 求多少米？"
+
+    assert bridge._generate_reply(
+        group, member, "31.4", "2026-09-26 21:22:00", "m2") == "答对了。下一题"
+    assert calls[1][0]["force_context"] is False
+    assert calls[1][0]["recent_context"] == ""
+    assert context_calls["n"] == 1
+
+
+def test_gateway_injection_mode_never_falls_back_to_isolated_cli(tmp_path, monkeypatch):
+    cfg_path = write_cfg(tmp_path)
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    cfg["gateway_inject_existing_session"] = True
+    cfg_path.write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
+    bridge = Bridge(cfg_path)
+    group = bridge.groups[0]
+    member = group.allowed_members["child-id"]
+
+    monkeypatch.setattr(
+        "scripts.dingtalk_free_response_bridge.inject_gateway_local_inbound",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(bridge, "_recent_context", lambda *_a, **_k: "")
+    original_run = bridge._run
+
+    def guarded_run(cmd, **kwargs):
+        if cmd and str(cmd[0]).endswith("/hermes"):
+            pytest.fail("isolated CLI fallback must not run")
+        return original_run(cmd, **kwargs)
+
+    monkeypatch.setattr(bridge, "_run", guarded_run)
+
+    with pytest.raises(RuntimeError, match="refusing isolated CLI fallback"):
+        bridge._generate_reply(
+            group, member, "4000米", "2026-09-26 22:30:00", "m-no-fallback")
+
+
+
+def test_image_message_passes_downloaded_media_to_gateway_and_cleans_cache(tmp_path, monkeypatch):
+    cfg_path = write_cfg(tmp_path)
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    cfg["gateway_inject_existing_session"] = True
+    cfg["media_cache_dir"] = str(tmp_path / "media")
+    cfg_path.write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
+
+    bridge = Bridge(cfg_path)
+    group = bridge.groups[0]
+    job = hashlib.sha256(b"img-bridge-1").hexdigest()[:24]
+    image = tmp_path / "media" / job / "page.jpg"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"jpeg-bytes")
+    captured = {}
+
+    monkeypatch.setattr(bridge, "_recent_context", lambda *_a, **_k: "")
+    monkeypatch.setattr(bridge, "_download_image_media", lambda *_a, **_k: [str(image)])
+    monkeypatch.setattr(bridge, "_send_reply", lambda *_a, **_k: None)
+
+    def inject(_home, params, *, timeout):
+        captured.update(params)
+        return {"accepted": True, "response": "我看到了图片。"}
+
+    monkeypatch.setattr(
+        "scripts.dingtalk_free_response_bridge.inject_gateway_local_inbound", inject)
+
+    msg = {
+        "messageId": "img-bridge-1",
+        "senderId": "child-id",
+        "text": "[图片消息](mediaId=@abc)请讲第二题",
+        "resourceRefs": [
+            {
+                "type": "mediaId",
+                "resourceId": "@abc",
+                "download": {"ready": True, "missing": [], "arguments": {"resource-id": "@abc"}},
+            }
+        ],
+    }
+    assert bridge._process_message(group, msg)
+    assert captured["text"] == "请讲第二题"
+    assert captured["media_urls"] == [str(image)]
+    assert captured["media_types"] == ["image"]
+    assert not image.exists()
+    assert "img-bridge-1" in bridge.state["groups"]["cid-math"]["processed_ids"]
+
+
+def test_image_bridge_refuses_isolated_cli_fallback(tmp_path):
+    cfg_path = write_cfg(tmp_path)
+    bridge = Bridge(cfg_path)
+    group = bridge.groups[0]
+    member = group.allowed_members["child-id"]
+
+    with pytest.raises(RuntimeError, match="image bridge requires gateway injection"):
+        bridge._generate_reply(
+            group,
+            member,
+            "讲第二题",
+            "2026-09-26 22:50:00",
+            "img-no-fallback",
+            media_urls=["/tmp/page.jpg"],
+        )
+
+
+
+def test_media_id_download_stays_inside_private_cache(tmp_path, monkeypatch):
+    bridge = Bridge(write_cfg(tmp_path))
+    group = bridge.groups[0]
+    calls = []
+
+    class Proc:
+        returncode = 0
+        stderr = ""
+        stdout = ""
+
+    def fake_run(cmd, **kwargs):
+        calls.append((list(cmd), dict(kwargs)))
+        rel_dir = cmd[cmd.index("--output") + 1].strip("./")
+        out_dir = Path(kwargs["cwd"]) / rel_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        image = out_dir / "page.jpg"
+        image.write_bytes(b"jpeg-bytes")
+        proc = Proc()
+        proc.stdout = json.dumps({
+            "localPath": f"{rel_dir}/page.jpg",
+            "sizeBytes": image.stat().st_size,
+        })
+        return proc
+
+
+    monkeypatch.setattr(
+        "scripts.dingtalk_free_response_bridge.subprocess.run", fake_run)
+
+    msg = {
+        "messageId": "img-download-1",
+        "resourceRefs": [{
+            "type": "mediaId",
+            "resourceId": "@abc",
+            "download": {
+                "ready": True,
+                "missing": [],
+                "arguments": {"resource-id": "@abc"},
+            },
+        }],
+    }
+    paths = bridge._download_image_media(group, msg)
+    assert len(paths) == 1
+    image = Path(paths[0])
+    assert image.is_file()
+    assert image.resolve().is_relative_to(bridge.media_cache_root.resolve())
+    assert "--message-id" in calls[0][0]
+    assert "--open-conversation-id" in calls[0][0]
+    assert calls[0][1]["cwd"] == str(bridge.media_cache_root)
+
+
+def test_fetch_messages_retries_transient_dws_failure(tmp_path, monkeypatch):
+    # One retryable dws blip must not abort the poll loop with an ERROR.
+    bridge = Bridge(write_cfg(tmp_path))
+    bridge.fetch_attempts = 3
+
+    calls: list[int] = []
+
+    class Fail:
+        returncode = 1
+        stderr = "RuntimeError: chat_messages_incomplete retryable=true"
+        stdout = ""
+
+    class Ok:
+        returncode = 0
+        stderr = ""
+        stdout = json.dumps([{"messageId": "m1", "createTime": "2026-10-08 14:00:00"}])
+
+    def fake_run(cmd, **kwargs):
+        calls.append(1)
+        return Fail() if len(calls) == 1 else Ok()
+
+    monkeypatch.setattr(bridge, "_run", fake_run)
+    monkeypatch.setattr(bridge, "fetch_sleep", lambda *_a: None)
+    rows = bridge._fetch_messages(bridge.groups[0], "2026-10-08 13:00:00")
+    assert [m["messageId"] for m in rows] == ["m1"]
+    assert len(calls) == 2
+
+
+def test_fetch_messages_raises_only_after_all_attempts_fail(tmp_path, monkeypatch):
+    bridge = Bridge(write_cfg(tmp_path))
+    bridge.fetch_attempts = 2
+
+    class Fail:
+        returncode = 1
+        stderr = "dial tcp: i/o timeout"
+        stdout = ""
+
+    calls: list[int] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(1)
+        return Fail()
+
+    monkeypatch.setattr(bridge, "_run", fake_run)
+    monkeypatch.setattr(bridge, "fetch_sleep", lambda *_a: None)
+    with pytest.raises(RuntimeError, match="failed after 2 attempts"):
+        bridge._fetch_messages(bridge.groups[0], "2026-10-08 13:00:00")
+    assert len(calls) == 2

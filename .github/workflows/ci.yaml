@@ -156,6 +156,11 @@ jobs:
       e2e_upgrade: ${{ needs.detect.outputs.e2e_upgrade == 'true' }}
       strict_acceptance: ${{ inputs.strict_acceptance || '' }}
 
+  local-capability-preservation:
+    name: Local capability preservation
+    needs: detect
+    uses: ./.github/workflows/local-capability-preservation.yml
+
   lint:
     name: Python lints
     needs: detect
@@ -335,6 +340,7 @@ jobs:
       - detect
       - tests
       - tests-os
+      - local-capability-preservation
       - lint
       - js-tests
       - rust-tests

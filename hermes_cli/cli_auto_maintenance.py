@@ -53,6 +53,17 @@ def _run_state_db_auto_maintenance(session_db) -> None:
                 min_interval_hours=int(cfg.get("min_interval_hours", 24)),
             )
 
+        # Cold storage is independent of destructive prune and runs first. It writes a
+        # checksummed restorable bundle before any hot-row delete and never blocks startup.
+        if cfg.get("auto_cold_archive", False):
+            session_db.maybe_auto_cold_archive(
+                older_than_days=int(cfg.get("cold_archive_days", 90)),
+                min_interval_hours=int(cfg.get("cold_archive_min_interval_hours", 24)),
+                sessions_dir=_hermes_home_maint / "sessions",
+                vacuum=bool(cfg.get("vacuum_after_prune", True)),
+                min_vacuum_interval_days=int(cfg.get("min_vacuum_interval_days", 30)),
+            )
+
         if not cfg.get("auto_prune", False):
             return
         session_db.maybe_auto_prune_and_vacuum(

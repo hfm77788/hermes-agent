@@ -666,6 +666,7 @@ class CompressionCommitFence:
 # Defaults for the in-agent progress-aware wrap; mirror hermes_cli.config.DEFAULT_CONFIG["compression"] keys.
 DEFAULT_CONTEXT_TIMEOUT_SECONDS = 120.0
 DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS = 600.0
+DEFAULT_CONTEXT_MAX_TURN_HOLD_SECONDS = 30.0
 
 # Unlike explicit_interrupt, a /stop after the stall window arms the durable backoff (no automatic re-entry).
 # Distinct from ``explicit_interrupt``: a /stop that arrived after the summary stream had already crossed
@@ -796,6 +797,25 @@ def resolve_context_compression_timeouts(compression_cfg: Optional[dict] = None)
                 ceiling = _aux_budget
             idle = max(idle, min(_aux_budget, ceiling))
     return idle, ceiling
+
+
+def resolve_context_compression_turn_hold_seconds(compression_cfg: Optional[dict] = None) -> float:
+    # Max wall-clock an arriving foreground turn waits on opportunistic compression.
+    # 0 disables the extra foreground cap. Manual compression and over-window recovery
+    # intentionally do not use this budget.
+    hold = DEFAULT_CONTEXT_MAX_TURN_HOLD_SECONDS
+    cfg = compression_cfg
+    if cfg is None:
+        cfg = {}
+        with contextlib.suppress(Exception):
+            from hermes_cli.config import load_config
+            raw = load_config()
+            maybe = raw.get("compression", {}) if isinstance(raw, dict) else {}
+            cfg = maybe if isinstance(maybe, dict) else {}
+    if isinstance(cfg, dict) and cfg.get("context_max_turn_hold_seconds") is not None:
+        with contextlib.suppress(TypeError, ValueError):
+            hold = float(cfg["context_max_turn_hold_seconds"])
+    return max(0.0, hold)
 
 
 def compression_attempt_stalled(
@@ -1170,7 +1190,7 @@ def run_compress_context_with_progress_timeout(
     fence: Optional[CompressionCommitFence] = None, telemetry_agent: Any = None, stall_fallback: bool = True,
     new_fence: Optional[Callable[[], CompressionCommitFence]] = None,
     fallback_worker: Optional[Callable[[CompressionCommitFence], Tuple[list, str]]] = None,
-    request_exceeds_window: bool = False,
+    request_exceeds_window: bool = False, max_wait_seconds: Optional[float] = None,
 ) -> Tuple[list, str]:
     """Run ``worker(fence)`` under a sync progress-aware (idle + ceiling) timeout.
     Budgets bound the PRE-commit phase only: an admitted commit always completes (overrun logged, surfaced
@@ -1190,6 +1210,15 @@ def run_compress_context_with_progress_timeout(
 
     ceiling = max(float(total_ceiling_seconds), float(idle_timeout_seconds))
     idle = float(idle_timeout_seconds)
+    # A fitting foreground request may stop waiting before the provider's own idle budget.
+    # This is a user-latency deadline, not evidence that the summary provider is unhealthy.
+    foreground_hold_active = False
+    if not request_exceeds_window and max_wait_seconds is not None:
+        with contextlib.suppress(TypeError, ValueError):
+            _max_wait = float(max_wait_seconds)
+            if 0 < _max_wait < ceiling:
+                ceiling = _max_wait
+                foreground_hold_active = True
     # An over-window request cannot be sent uncompressed, so a summary that keeps streaming while
     # reclaiming nothing must not hold the host (and the Desktop UI) to the full ceiling: bound the
     # pre-commit wait to one inactivity budget (``compression.context_timeout_seconds``) and let the
@@ -1308,6 +1337,7 @@ def run_compress_context_with_progress_timeout(
         # cancel() is a no-op for a running worker (fence handles that path).
         future.cancel()
         total_exhausted = time.monotonic() - wait_started >= ceiling or fence.deadline_exceeded
+        foreground_hold_exhausted = total_exhausted and foreground_hold_active
         # #97488 teardown (total-ceiling path only): give the cancelled worker a bounded grace to actually
         # exit before this host moves on. The worker checks the poison fence between provider phases, so a
         # cooperative worker exits quickly; an uninterruptible provider call is orphaned behind the fence
@@ -1316,9 +1346,10 @@ def run_compress_context_with_progress_timeout(
         # stall-fallback retry below needs a prompt host return (pinned by the #76354 S3 latency contract),
         # and the fence poison + attempt-generation supersession already protect state against its late
         # unwind.
-        if total_exhausted:
-            # A total-ceiling candidate may be unwinding a healthy provider call; keep its
-            # lease until it exits so no other attempt overlaps the unchanged source.
+        if total_exhausted and not foreground_hold_exhausted:
+            # A generic total-ceiling candidate may be unwinding a healthy provider call; keep its
+            # lease until it exits so no other attempt overlaps the unchanged source. A foreground
+            # turn-hold deadline behaves like an idle stall instead: poison the fence and return promptly.
             fence.retain_compression_lock_until_worker_done()
         if on_timeout_cause is not None:
             with _swallow('compress_context timeout-cause callback failed', exc_info=True):
@@ -1340,7 +1371,9 @@ def run_compress_context_with_progress_timeout(
         # Idle-timeout: cancel won pre-commit. Also free the worker's durable lease via
         # the holder-qualified hook so a NEW compressor can acquire at once (no ABA).
         handled_exit = True
-        _release_cancelled_worker(future, fence, total_exhausted=total_exhausted, ceiling=ceiling)
+        _release_cancelled_worker(
+            future, fence, total_exhausted=total_exhausted and not foreground_hold_exhausted, ceiling=ceiling
+        )
         # Leave the future on the shared pool: fence cancel won, so a late
         # commit cannot land (same detachment model as gateway hygiene).
         return _recover_from_stall()

@@ -390,6 +390,16 @@ def _select_new_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
                 _core._parallel_safe_servers.add(own_key)
             else:
                 _core._parallel_safe_servers.discard(own_key)
+            explicit = srv_cfg.get("parallel_readonly_tools")
+            names = {
+                str(item).strip()
+                for item in explicit
+                if isinstance(item, str) and str(item).strip()
+            } if isinstance(explicit, (list, tuple, set)) else set()
+            if names:
+                _core._parallel_explicit_readonly_tools[own_key] = names
+            else:
+                _core._parallel_explicit_readonly_tools.pop(own_key, None)
     for srv in stale_cached:
         _loop._signal_reconnect(srv)
     return new_servers
@@ -718,13 +728,34 @@ def _forget_lazy_server(key) -> None:
 
 
 def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
-    """True when the tool's server opted into ``supports_parallel_tool_calls`` (provenance
-    captured at registration, never the ambiguous ``mcp__{server}__{tool}`` shape)."""
+    """Whether an MCP tool is safe to execute concurrently.
+
+    A whole server may opt in with ``supports_parallel_tool_calls``. Independently, a
+    specific tool is safe when discovery captured the MCP ``readOnlyHint=True`` annotation.
+    Missing or malformed annotations fail closed, so write-capable tools remain sequential even
+    when sibling read tools from the same mixed server run in parallel.
+    """
     if not tool_name.startswith(MCP_TOOL_NAME_PREFIX):
         return False
     with _core._lock:
         server_name = _core._mcp_tool_server_names.get(tool_name)
-        return bool(server_name and _server_key(server_name) in _core._parallel_safe_servers)
+        if not server_name:
+            return False
+        key = _server_key(server_name)
+        if key in _core._parallel_safe_servers:
+            return True
+        explicit = set(_core._parallel_explicit_readonly_tools.get(key, set()))
+        hints = dict(_core._tool_read_only_hints.get(key, {}))
+    from tools.mcp_tool_schema import mcp_prefixed_tool_name
+    if any(
+        mcp_prefixed_tool_name(server_name, raw_name) == tool_name
+        for raw_name in explicit
+    ):
+        return True
+    return any(
+        is_read_only and mcp_prefixed_tool_name(server_name, raw_name) == tool_name
+        for raw_name, is_read_only in hints.items()
+    )
 
 
 def get_mcp_status(configured: Optional[Dict[str, dict]] = None, *, include_runtime: bool = True) -> List[dict]:

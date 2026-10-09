@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from agent.conversation_compression import recover_rotated_compression_session
-from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.memory_provider import is_trivial_prompt
 from agent.message_content import flatten_message_text
@@ -610,7 +609,7 @@ _PER_TURN_RESET_STATE: Tuple[Tuple[str, Any], ...] = (
 )
 
 
-def _reset_per_turn_agent_state(agent: Any) -> None:
+def _reset_per_turn_agent_state(agent: Any, user_message: Any = None) -> None:
     """Reset retry counters, guardrails, iteration and run budgets at turn start."""
     for name, value in _PER_TURN_RESET_STATE:
         setattr(agent, name, value)
@@ -642,7 +641,16 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
     if getattr(agent, "_pending_startup_notices", None):  # gateway: init ran before its callbacks
         agent._replay_startup_warnings()
 
-    agent.iteration_budget = IterationBudget(agent.max_iterations)
+    from agent.adaptive_turn_budget import apply_adaptive_turn_budget
+    _adaptive_budget = apply_adaptive_turn_budget(agent, user_message)
+    logger.info(
+        "adaptive_turn_budget tier=%s iterations=%d tool_calls=%s reason=%s configured_max=%d",
+        _adaptive_budget.tier,
+        _adaptive_budget.iterations,
+        _adaptive_budget.tool_calls,
+        _adaptive_budget.reason,
+        agent.max_iterations,
+    )
     # Wall-clock run budget: stamped only when configured (one wrap-up notice per run).
     agent._run_budget_started_at = (
         time.time() if getattr(agent, "run_budget_seconds", None) else None
@@ -892,6 +900,33 @@ def _memory_query_text(original_user_message: Any) -> str:
     return ""
 
 
+def _skill_turn_retrieval(agent: Any, original_user_message: Any) -> str:
+    """Retrieve a bounded Skill shortlist for this turn without mutating the system prompt."""
+    query = _memory_query_text(original_user_message).strip()
+    catalog = getattr(agent, "_skill_retrieval_catalog", None) or []
+    if not catalog:
+        # A resumed session may restore the persisted system-prompt bytes without
+        # re-running _skills_prompt(). Reconstruct only the local retrieval catalog;
+        # the restored system prompt itself stays byte-exact for prefix caching.
+        try:
+            from agent.system_prompt import _skills_prompt
+
+            _skills_prompt(agent)
+            catalog = getattr(agent, "_skill_retrieval_catalog", None) or []
+        except Exception:
+            logger.debug("skill retrieval catalog reconstruction skipped", exc_info=True)
+            catalog = []
+    if not query or not catalog or is_trivial_prompt(query):
+        return ""
+    try:
+        from agent.skill_retrieval import build_skill_retrieval_context
+
+        return build_skill_retrieval_context(query, catalog, top_k=8)
+    except Exception:
+        logger.debug("skill retrieval skipped", exc_info=True)
+        return ""
+
+
 def _memory_turn_start_and_prefetch(
     agent: Any, original_user_message: Any, turn_author: Optional[Dict[str, Any]] = None,
 ) -> str:
@@ -1075,7 +1110,7 @@ def build_turn_context(
         agent, task_id, stream_callback, persist_user_message,
         persist_user_timestamp, persist_user_platform_id,
     )
-    _reset_per_turn_agent_state(agent)
+    _reset_per_turn_agent_state(agent, user_message)
 
     _preview_text = summarize_user_message_for_log(user_message)
     _msg_preview = _preview_text[:80] + ("..." if len(_preview_text) > 80 else "")
@@ -1167,6 +1202,11 @@ def build_turn_context(
         original_user_message=original_user_message, messages=messages,
         conversation_history=conversation_history,
     )
+    skill_user_context = _skill_turn_retrieval(agent, original_user_message)
+    if skill_user_context:
+        plugin_user_context = (
+            plugin_user_context + "\n\n" + skill_user_context if plugin_user_context else skill_user_context
+        )
     plugin_user_context = _merge_gateway_notes(
         agent, messages, current_turn_user_idx, plugin_user_context
     )

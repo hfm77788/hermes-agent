@@ -1,0 +1,9 @@
+name: jev-aliyun-qwen-router
+version: "1.1.0"
+description: "Per-turn Jev routing for Alibaba Cloud Qwen3.8 with centralized profile policy, dynamic reasoning effort, and conservative Flash-to-Max escalation."
+author: hfm77788
+requires_hermes: ">=0.21.4"
+requires_env:
+  - TYPESAFE_API_KEY
+provides_middleware:
+  - llm_request

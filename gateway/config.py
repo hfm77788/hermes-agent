@@ -640,13 +640,16 @@ class GatewayConfig:
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
     # Prune SessionEntry records older than this (a resumed chat gets a fresh session). 0 = off.
     session_store_max_age_days: int = 90
+    # When enabled, startup restores only the tiny gateway_routing index through a read-only
+    # SQLite connection; the full SessionDB schema/FTS writer opens on first transcript/search/write.
+    session_store_lazy_open: bool = False
     profile_routes: list = field(default_factory=list)  # gateway/profile_routing.py
 
     # Scalar fields serialized verbatim by ``to_dict`` (in output order).
     _SCALAR_DICT_FIELDS = (
         "write_sessions_json", "always_log_local", "filter_silence_narration", "stt_enabled",
         "stt_echo_transcripts", "group_sessions_per_user", "thread_sessions_per_user",
-        "max_concurrent_sessions", "multiplex_profiles",
+        "max_concurrent_sessions", "multiplex_profiles", "session_store_lazy_open",
         "on_all_adapters_down",
         "room_link_url", "systemd_watchdog_seconds", "loop_watchdog",
         "loop_watchdog_probe_interval_s", "loop_watchdog_probe_timeout_s",
@@ -812,6 +815,7 @@ class GatewayConfig:
             unauthorized_dm_decline_message=str(data.get("unauthorized_dm_decline_message") or "").strip(),
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
+            session_store_lazy_open=_coerce_bool(pick("session_store_lazy_open"), False),
             profile_routes=parse_profile_routes(data.get("profile_routes") or []),
         )
 

@@ -1,0 +1,12 @@
+[Unit]
+Description=Run hema-teacher health check every day at 15:00 Asia/Shanghai
+
+[Timer]
+OnCalendar=*-*-* 15:00:00 Asia/Shanghai
+Persistent=true
+AccuracySec=1min
+RandomizedDelaySec=0
+Unit=hema-teacher-daily-health.service
+
+[Install]
+WantedBy=timers.target

@@ -181,7 +181,7 @@ class TestBusySessionAck:
         if not content and call_kwargs.args:
             # positional args
             content = str(call_kwargs)
-        assert "Interrupting" in content or "respond" in content
+        assert "中断" in content or "interrupted" in content.lower()
         assert "/stop" not in content  # no need — we ARE interrupting
 
         # Verify agent interrupt was called
@@ -265,8 +265,8 @@ class TestBusySessionAck:
         agent.interrupt.assert_not_called()
         assert sk not in adapter._pending_messages
         content = adapter._send_with_retry.call_args.kwargs["content"]
-        assert "Steered" in content
-        assert "Queued" not in content
+        assert "并入当前任务" in content or "steered" in content.lower()
+        assert "消息已排队" not in content and "queued" not in content.lower()
 
 
     @pytest.mark.asyncio
@@ -296,8 +296,8 @@ class TestBusySessionAck:
         # Ack uses queue-mode wording (not steer, not interrupt)
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
-        assert "Queued for the next turn" in content
-        assert "Steered" not in content
+        assert "消息已排队" in content or "queued" in content.lower()
+        assert "并入当前任务" not in content and "steered" not in content.lower()
 
     @pytest.mark.asyncio
     async def test_steer_mode_falls_back_to_queue_when_agent_pending(self):
@@ -320,7 +320,7 @@ class TestBusySessionAck:
 
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
-        assert "Queued for the next turn" in content
+        assert "消息已排队" in content or "queued" in content.lower()
 
     @pytest.mark.asyncio
     async def test_interrupt_mode_text_followups_fifo_not_merged(self):
@@ -449,8 +449,8 @@ class TestBusySessionOnboardingHint:
         adapter._send_with_retry.assert_called_once()
 
         # The flag is now persisted to tmp_path/config.yaml
-        import hermes_yaml as yaml
-        cfg = yaml.safe_load((tmp_path / "config.yaml").read_text())
+        import yaml
+        cfg = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
         assert cfg["onboarding"]["seen"]["busy_input_prompt"] is True
 
 
@@ -525,3 +525,67 @@ class TestLongRunningNotificationOwnership:
         assert runner._should_emit_long_running_notification("sess", agent, executor_task=None) is False
 
 
+
+
+@pytest.mark.asyncio
+async def test_long_research_turn_gets_fast_first_ack_but_streamed_turn_does_not(monkeypatch):
+    """Long/research turns get a quick status unless visible streaming already started."""
+    import asyncio
+    from types import SimpleNamespace
+    from gateway.run import GatewayRunner
+    from gateway.turn_context import TurnContext
+
+    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0.06")
+    monkeypatch.setenv("HERMES_AGENT_FIRST_ACK_DELAY", "0.01")
+
+    runner = object.__new__(GatewayRunner)
+    runner._running_agents = {}
+    runner._draining = runner._restart_requested = False
+    adapter = MagicMock()
+    adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="ack-1"))
+    adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True, message_id="ack-1"))
+    runner._delivery_adapter_for = lambda source: adapter
+    runner._agent_activity_summary = staticmethod(lambda agent: {
+        "api_call_count": 1,
+        "max_iterations": 90,
+        "current_tool": None,
+        "last_activity_desc": "research",
+    })
+
+    agent = MagicMock()
+    agent._adaptive_turn_budget_tier = "research"
+    runner._running_agents["sess"] = agent
+    disp = MagicMock()
+    disp._display_surface_mode.return_value = "on"
+    disp.resolve_display_setting.return_value = False
+    ctx = TurnContext(
+        source=SimpleNamespace(chat_id="c", platform=Platform.FEISHU),
+        session_key="sess",
+    )
+    ctx.agent_holder[0] = agent
+
+    task = asyncio.create_task(runner._run_agent_notify_long_running(disp, ctx, [None]))
+    await asyncio.sleep(0.025)
+    runner._running_agents["sess"] = MagicMock()
+    await asyncio.wait_for(task, 1)
+    adapter.send.assert_awaited_once()
+    assert "Working — started" in adapter.send.await_args.args[1]
+
+    agent2 = MagicMock()
+    agent2._adaptive_turn_budget_tier = "long"
+    runner._running_agents["sess2"] = agent2
+    ctx2 = TurnContext(
+        source=SimpleNamespace(chat_id="c2", platform=Platform.FEISHU),
+        session_key="sess2",
+    )
+    ctx2.agent_holder[0] = agent2
+    ctx2.stream_consumer_holder[0] = SimpleNamespace(
+        message_id="stream-1", final_content_delivered=False
+    )
+    adapter.send.reset_mock()
+
+    task2 = asyncio.create_task(runner._run_agent_notify_long_running(disp, ctx2, [None]))
+    await asyncio.sleep(0.025)
+    runner._running_agents["sess2"] = MagicMock()
+    await asyncio.wait_for(task2, 1)
+    adapter.send.assert_not_awaited()

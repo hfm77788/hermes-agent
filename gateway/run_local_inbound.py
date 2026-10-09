@@ -1,0 +1,385 @@
+"""Trusted local sidecar -> live Gateway inbound injection.
+
+Used when a sidecar can observe platform traffic the native bot transport does not
+receive (DingTalk non-mention group messages). The turn runs in the live profile
+session; presentation stays muted so the sidecar remains the single delivery path.
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import time
+from pathlib import Path
+from typing import Any
+
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.session import Platform
+
+
+_MAX_TEXT_CHARS = 8000
+_MAX_CONTEXT_CHARS = 12000
+_MAX_ID_CHARS = 1024
+_RESULT_CACHE_MAX = 500
+_MEDIA_MAX_ATTACHMENTS = 8
+_IMAGE_MIME_BY_SUFFIX = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".heic": "image/heic",
+}
+
+
+def _clean(value: Any, *, limit: int = _MAX_ID_CHARS) -> str:
+    return str(value or "").strip()[:limit]
+
+
+def _profile_adapter(runner, profile: str, platform: Platform):
+    primary = getattr(runner, "_primary_profile_name", None) or "default"
+    if profile in {"default", primary}:
+        return (getattr(runner, "adapters", None) or {}).get(platform)
+    return ((getattr(runner, "_profile_adapters", None) or {}).get(profile) or {}).get(platform)
+
+
+async def _wait_until_idle(runner, adapter, session_key: str, wait_seconds: float) -> bool:
+    deadline = asyncio.get_running_loop().time() + wait_seconds
+    while True:
+        adapter_busy = session_key in getattr(adapter, "_active_sessions", {})
+        runner_busy = bool(
+            callable(getattr(runner, "_is_session_running", None))
+            and runner._is_session_running(session_key)
+        )
+        if not adapter_busy and not runner_busy:
+            return True
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+        await asyncio.sleep(0.1)
+async def _execute_local_inbound(runner, params: dict[str, Any]) -> dict[str, Any]:
+    profile = _clean(params.get("profile")) or "default"
+    if _clean(params.get("platform")).lower() != "dingtalk":
+        return {"accepted": False, "reason": "unsupported_platform"}
+
+    text = _clean(params.get("text"), limit=_MAX_TEXT_CHARS)
+    raw_media = list(params.get("media_urls") or [])[:_MEDIA_MAX_ATTACHMENTS]
+    raw_types = list(params.get("media_types") or [])[: len(raw_media)]
+    media_root = (
+        Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+        / "state"
+        / "dingtalk-free-response-media"
+    ).resolve()
+    media_urls: list[str] = []
+    media_types: list[str] = []
+    for index, value in enumerate(raw_media):
+        path = Path(_clean(value, limit=4096)).expanduser().resolve()
+        if not path.is_relative_to(media_root) or not path.is_file():
+            return {"accepted": False, "reason": "invalid_media_path"}
+        media_type = _clean(
+            raw_types[index] if index < len(raw_types) else "image",
+            limit=64,
+        ).lower()
+        if media_type in {"", "image"}:
+            media_type = _IMAGE_MIME_BY_SUFFIX.get(path.suffix.lower(), "")
+        if not media_type.startswith("image/"):
+            return {"accepted": False, "reason": "unsupported_media_type"}
+        media_urls.append(str(path))
+        media_types.append(media_type)
+    if media_urls and not text:
+        text = "请结合图片内容和当前课堂上下文回答。"
+
+    chat_id = _clean(params.get("chat_id"))
+    user_id = _clean(params.get("user_id"))
+    user_id_alt = _clean(params.get("user_id_alt"))
+    message_id = _clean(params.get("message_id"))
+    if not ((text or media_urls) and chat_id and user_id and message_id):
+        return {"accepted": False, "reason": "missing_required_field"}
+
+    adapter = _profile_adapter(runner, profile, Platform.DINGTALK)
+    if adapter is None:
+        return {"accepted": False, "reason": "adapter_unavailable"}
+
+    source = adapter.build_source(
+        chat_id=chat_id,
+        chat_name=_clean(params.get("chat_name")) or None,
+        chat_type=_clean(params.get("chat_type")) or "group",
+        user_id=user_id,
+        user_name=_clean(params.get("user_name")) or user_id,
+        user_id_alt=user_id_alt or None,
+        message_id=message_id,
+    )
+    # Process-local trust markers. They never serialize into SessionSource.
+    source._suppress_presentation = True
+    source._trusted_context_tail = True
+    response_future = asyncio.get_running_loop().create_future()
+    source._local_inbound_response_future = response_future
+
+    skill = _clean(params.get("skill"))
+    # Keep the trusted sidecar's explicit tutoring identity process-local. The
+    # gateway uses it only to apply the fast-tutoring runtime guard; it is never
+    # persisted into SessionSource or accepted from public platform payloads.
+    source._local_inbound_skill = skill
+    source._local_inbound_has_media = bool(media_urls)
+    auto_skill = [skill] if skill else (
+        adapter._resolve_channel_skills(chat_id)
+        if hasattr(adapter, "_resolve_channel_skills") else None
+    )
+    event = MessageEvent(
+        text=text,
+        message_type=MessageType.PHOTO if media_urls else MessageType.TEXT,
+        user_id=source.user_id,
+        user_name=source.user_name,
+        source=source,
+        message_id=message_id,
+        media_urls=media_urls,
+        media_types=media_types,
+        auto_skill=auto_skill,
+        channel_prompt=(
+            adapter._resolve_channel_prompt(chat_id)
+            if hasattr(adapter, "_resolve_channel_prompt") else None
+        ),
+        allow_gateway_control=False,
+    )
+
+    recent_context = _clean(params.get("recent_context"), limit=_MAX_CONTEXT_CHARS)
+    if bool(params.get("force_context")) and recent_context:
+        event.channel_context = recent_context
+    # Derive through the live adapter so profile namespace/user isolation match native ingress.
+    session_key = adapter._event_session_key(event)
+    try:
+        wait_seconds = float(params.get("wait_for_idle_seconds") or 120.0)
+    except (TypeError, ValueError):
+        wait_seconds = 120.0
+    wait_seconds = min(max(wait_seconds, 0.0), 180.0)
+    if not await _wait_until_idle(runner, adapter, session_key, wait_seconds):
+        return {"accepted": False, "reason": "session_busy", "session_key": session_key}
+
+    started = time.monotonic()
+    await runner._handle_message(event)
+    response = response_future.result() if response_future.done() else ""
+    final_entry = (
+        getattr(getattr(runner, "session_store", None), "_entries", None) or {}
+    ).get(session_key)
+    return {
+        "accepted": True,
+        "session_key": session_key,
+        "session_id": str(getattr(final_entry, "session_id", "") or ""),
+        "response": str(response or "").strip(),
+        "elapsed_ms": round((time.monotonic() - started) * 1000),
+    }
+
+
+async def inject_local_inbound(runner, params: dict[str, Any]) -> dict[str, Any]:
+    """Idempotently execute/join one sidecar-observed message by platform message id."""
+    message_id = _clean(params.get("message_id"))
+    cache = getattr(runner, "_local_inbound_result_cache", None)
+    if not isinstance(cache, dict):
+        cache = runner._local_inbound_result_cache = {}
+    if message_id and message_id in cache:
+        return dict(cache[message_id])
+
+    inflight = getattr(runner, "_local_inbound_inflight", None)
+    if not isinstance(inflight, dict):
+        inflight = runner._local_inbound_inflight = {}
+    if message_id and message_id in inflight:
+        return await asyncio.shield(inflight[message_id])
+
+    task = asyncio.create_task(_execute_local_inbound(runner, params))
+    if message_id:
+        inflight[message_id] = task
+    try:
+        result = await asyncio.shield(task)
+        if message_id:
+            cache[message_id] = dict(result)
+            while len(cache) > _RESULT_CACHE_MAX:
+                cache.pop(next(iter(cache)))
+        return result
+    finally:
+        if message_id and inflight.get(message_id) is task:
+            inflight.pop(message_id, None)
+def local_inbound_verb(runner, loop):
+    """Control-socket handler factory; control handlers execute on a worker thread."""
+    def handler(params: dict[str, Any]) -> dict[str, Any]:
+        future = asyncio.run_coroutine_threadsafe(
+            inject_local_inbound(runner, params), loop
+        )
+        try:
+            timeout = float(params.get("timeout_seconds") or 185.0)
+        except (TypeError, ValueError):
+            timeout = 185.0
+        timeout = min(max(timeout, 1.0), 190.0)
+        return future.result(timeout=timeout)
+
+    return handler
+
+async def _local_session_health(runner, params: dict[str, Any]) -> dict[str, Any]:
+    """Inspect or maintain one existing local session without creating a user turn."""
+    profile = _clean(params.get("profile")) or "default"
+    if _clean(params.get("platform")).lower() != "dingtalk":
+        return {"accepted": False, "reason": "unsupported_platform"}
+
+    chat_id = _clean(params.get("chat_id"))
+    user_id = _clean(params.get("user_id"))
+    user_id_alt = _clean(params.get("user_id_alt"))
+    if not (chat_id and user_id):
+        return {"accepted": False, "reason": "missing_required_field"}
+
+    adapter = _profile_adapter(runner, profile, Platform.DINGTALK)
+    if adapter is None:
+        return {"accepted": False, "reason": "adapter_unavailable"}
+    source = adapter.build_source(
+        chat_id=chat_id,
+        chat_name=_clean(params.get("chat_name")) or None,
+        chat_type=_clean(params.get("chat_type")) or "group",
+        user_id=user_id,
+        user_name=_clean(params.get("user_name")) or user_id,
+        user_id_alt=user_id_alt or None,
+        message_id=None,
+    )
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.TEXT,
+        user_id=source.user_id,
+        user_name=source.user_name,
+        source=source,
+    )
+    session_key = adapter._event_session_key(event)
+    entries = getattr(getattr(runner, "session_store", None), "_entries", None) or {}
+    entry = entries.get(session_key)
+    if entry is None:
+        return {"accepted": True, "found": False, "session_key": session_key}
+
+    adapter_busy = session_key in getattr(adapter, "_active_sessions", {})
+    runner_busy = bool(
+        callable(getattr(runner, "_is_session_running", None))
+        and runner._is_session_running(session_key)
+    )
+    busy = bool(adapter_busy or runner_busy)
+    resident = (
+        runner._resident_agent_for(session_key)
+        if callable(getattr(runner, "_resident_agent_for", None))
+        else None
+    )
+    ctx = getattr(resident, "context_compressor", None) if resident is not None else None
+    resolver = getattr(runner, "_resolve_context_figures", None)
+    if callable(resolver):
+        used, total, model = await resolver(resident, ctx, entry, source)
+    else:
+        used = max(0, int(getattr(entry, "last_prompt_tokens", 0) or 0))
+        total = 0
+        model = ""
+    used = max(0, int(used or 0))
+    total = max(0, int(total or 0))
+
+    def snapshot(**extra: Any) -> dict[str, Any]:
+        return {
+            "accepted": True,
+            "found": True,
+            "session_key": session_key,
+            "session_id": str(getattr(entry, "session_id", "") or ""),
+            "busy": busy,
+            "last_prompt_tokens": used,
+            "context_length": total,
+            "context_pct": round((used / total) * 100, 1) if total else None,
+            "model": str(model or ""),
+            **extra,
+        }
+
+    action = _clean(params.get("action"), limit=64).lower() or "inspect"
+    if action == "inspect":
+        return snapshot()
+    if busy:
+        return snapshot(action=action, changed=False, reason="session_busy")
+
+    store = getattr(runner, "async_session_store", None)
+    if store is None:
+        return snapshot(action=action, changed=False, reason="session_store_unavailable")
+
+    if action != "compress":
+        return snapshot(action=action, changed=False, reason="unsupported_action")
+
+    try:
+        history = await store.load_transcript(entry.session_id)
+    except Exception as exc:
+        return snapshot(
+            action=action,
+            changed=False,
+            reason=f"transcript_read_failed:{type(exc).__name__}",
+        )
+    from agent.conversation_compression_manual import MIN_MESSAGES, parse_compress_args
+    messages = [
+        row for row in history
+        if isinstance(row, dict) and row.get("role") in {"user", "assistant", "tool"}
+    ]
+    if len(messages) < MIN_MESSAGES:
+        return snapshot(action=action, changed=False, reason="not_enough_messages")
+
+    request = parse_compress_args("here 6")
+    try:
+        from gateway.run import _profile_runtime_scope
+        with _profile_runtime_scope(runner._resolve_profile_home_for_source(source)):
+            await runner._run_manual_compression(source, entry, history, request)
+    except Exception as exc:
+        return snapshot(
+            action=action,
+            changed=False,
+            reason=f"compression_failed:{type(exc).__name__}",
+        )
+
+    refreshed_entry = (
+        (getattr(getattr(runner, "session_store", None), "_entries", None) or {}).get(session_key)
+        or entry
+    )
+    refreshed_resident = (
+        runner._resident_agent_for(session_key)
+        if callable(getattr(runner, "_resident_agent_for", None))
+        else None
+    )
+    refreshed_ctx = (
+        getattr(refreshed_resident, "context_compressor", None)
+        if refreshed_resident is not None else None
+    )
+    if callable(resolver):
+        after_used, after_total, after_model = await resolver(
+            refreshed_resident, refreshed_ctx, refreshed_entry, source
+        )
+    else:
+        after_used = max(0, int(getattr(refreshed_entry, "last_prompt_tokens", 0) or 0))
+        after_total = total
+        after_model = model
+    after_used = max(0, int(after_used or 0))
+    after_total = max(0, int(after_total or 0))
+    return {
+        "accepted": True,
+        "found": True,
+        "session_key": session_key,
+        "session_id": str(getattr(refreshed_entry, "session_id", "") or ""),
+        "busy": False,
+        "action": "compress",
+        "changed": after_used < used,
+        "compressed": after_used < used,
+        "before_prompt_tokens": used,
+        "last_prompt_tokens": after_used,
+        "context_length": after_total,
+        "context_pct": round((after_used / after_total) * 100, 1) if after_total else None,
+        "model": str(after_model or ""),
+    }
+
+
+def local_session_health_verb(runner, loop):
+    """Control socket handler for zero-presentation session inspection and maintenance."""
+    def handler(params: dict[str, Any]) -> dict[str, Any]:
+        action = _clean(params.get("action"), limit=64).lower() or "inspect"
+        timeout = 185.0 if action == "compress" else 20.0
+        future = asyncio.run_coroutine_threadsafe(
+            _local_session_health(runner, params), loop
+        )
+        try:
+            return future.result(timeout=timeout)
+        except Exception as exc:
+            return {
+                "accepted": False,
+                "reason": f"control_failed:{type(exc).__name__}",
+            }
+
+    return handler

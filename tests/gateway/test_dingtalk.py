@@ -158,6 +158,66 @@ class TestSend:
         assert payload["msgtype"] == "markdown"
         assert payload["markdown"]["text"] == "Screenshot\n\n![image](https://example.com/demo.png)"
 
+
+class TestOpenApiMediaDelivery:
+
+    def test_openapi_target_routing_prefers_live_context_then_configured_dm(self):
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+
+        adapter = DingTalkAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"dm_user_id": "staff-home", "dm_chat_ids": "dm-home"},
+            )
+        )
+
+        assert adapter._resolve_send_target("dm-home") == ("dm", None, "staff-home")
+        assert adapter._resolve_send_target("group-home") == ("group", "group-home", None)
+
+        adapter._message_contexts["live-dm"] = SimpleNamespace(
+            conversation_type="1",
+            conversation_id="cid-dm",
+            sender_staff_id="staff-live",
+        )
+        adapter._message_contexts["live-group"] = SimpleNamespace(
+            conversation_type="2",
+            conversation_id="cid-group",
+            sender_staff_id="ignored-for-group",
+        )
+
+        assert adapter._resolve_send_target("live-dm") == ("dm", None, "staff-live")
+        assert adapter._resolve_send_target("live-group") == ("group", "cid-group", None)
+
+    @pytest.mark.asyncio
+    async def test_local_image_uses_native_upload_then_robot_message(self):
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter, SendResult
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._http_client = AsyncMock()
+
+        with (
+            patch.object(
+                adapter,
+                "_upload_media",
+                new=AsyncMock(return_value=("media-123", None)),
+            ) as upload,
+            patch.object(
+                adapter,
+                "_robot_send",
+                new=AsyncMock(return_value=SendResult(success=True, message_id="robot-1")),
+            ) as robot_send,
+        ):
+            result = await adapter.send_image_file("chat-123", "/tmp/demo.png")
+
+        assert result.success is True
+        upload.assert_awaited_once_with("/tmp/demo.png", "image", "demo.png")
+        robot_send.assert_awaited_once_with(
+            "sampleImageMsg",
+            {"photoURL": "media-123"},
+            "chat-123",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Connect / disconnect
 # ---------------------------------------------------------------------------
@@ -448,6 +508,78 @@ class TestShouldProcessMessage:
         assert adapter._should_process_message(msg, "hi", is_group=True, chat_id="grp1") is True
         # Different group still blocked
         assert adapter._should_process_message(msg, "hi", is_group=True, chat_id="grp2") is False
+
+
+class TestChannelBindings:
+
+    def test_exact_chat_id_resolves_skill_and_prompt(self, monkeypatch):
+        adapter = _make_gating_adapter(
+            monkeypatch,
+            extra={
+                "channel_skill_bindings": [
+                    {"id": "math-room", "skills": ["jiayin-math-tutor"]},
+                    {"id": "physics-room", "skill": "jiayin-physics-tutor"},
+                ],
+                "channel_prompts": {
+                    "math-room": "learner_id=jiayin; subject=math",
+                    "physics-room": "learner_id=jiayin; subject=physics",
+                },
+            },
+        )
+
+        assert adapter._resolve_channel_skills("math-room") == ["jiayin-math-tutor"]
+        assert adapter._resolve_channel_prompt("math-room") == "learner_id=jiayin; subject=math"
+        assert adapter._resolve_channel_skills("physics-room") == ["jiayin-physics-tutor"]
+        assert adapter._resolve_channel_prompt("physics-room") == "learner_id=jiayin; subject=physics"
+        assert adapter._resolve_channel_skills("unknown-room") is None
+        assert adapter._resolve_channel_prompt("unknown-room") is None
+
+    @pytest.mark.asyncio
+    async def test_on_message_attaches_exact_channel_skill_and_prompt(self, monkeypatch):
+        adapter = _make_gating_adapter(
+            monkeypatch,
+            extra={
+                "require_mention": False,
+                "free_response_chats": ["math-room"],
+                "channel_skill_bindings": [
+                    {"id": "math-room", "skills": ["jiayin-math-tutor"]},
+                ],
+                "channel_prompts": {
+                    "math-room": "learner_id=jiayin; subject=math",
+                },
+            },
+        )
+        adapter._resolve_media_codes = AsyncMock()
+        adapter.handle_message = AsyncMock()
+
+        message = MagicMock()
+        message.message_id = "msg-1"
+        message.conversation_id = "math-room"
+        message.conversation_type = "2"
+        message.sender_id = "user-1"
+        message.sender_staff_id = "staff-1"
+        message.sender_nick = "Learner"
+        message.is_in_at_list = False
+        message.at_users = []
+        message.session_webhook = ""
+        message.session_webhook_expired_time = 0
+        message.create_at = 0
+        message.conversation_title = "display-name-does-not-route"
+        message.message_type = "text"
+        message.text = "开始"
+        message.rich_text = None
+        message.rich_text_content = None
+        message.image_content = None
+        message.extensions = {}
+
+        await adapter._on_message(message)
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.chat_id == "math-room"
+        assert event.source._trusted_context_tail is True
+        assert event.auto_skill == ["jiayin-math-tutor"]
+        assert event.channel_prompt == "learner_id=jiayin; subject=math"
+
 
 # ---------------------------------------------------------------------------
 # _IncomingHandler.process — session_webhook extraction & fire-and-forget
