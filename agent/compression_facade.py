@@ -122,15 +122,14 @@ def _sync_persisted_markers(target_messages, source_messages) -> None:
 
 def _run_under_progress_timeout(
     agent, run, messages, system_message, *, active_fence, registration, fence_registration_lock,
-    idle_timeout, total_ceiling, approx_tokens=None, foreground_turn=False,
+    idle_timeout, total_ceiling, approx_tokens=None,
 ):
     """Run ``run(fence, target_messages=snapshot)`` on the pool under the progress-aware timeout.
     The pooled worker must NEVER share the caller's live transcript — a late engine after a host timeout could
     rewrite it. It deep-snapshots on the worker and publishes only via an ADMITTED commit; a no-op/abort
     returns the snapshot unchanged, so the ORIGINAL list is handed back to keep identity semantics."""
     from agent.conversation_compression import (
-        CompressionCommitFence, request_exceeds_model_window, resolve_context_compression_turn_hold_seconds,
-        run_compress_context_with_progress_timeout,
+        CompressionCommitFence, request_exceeds_model_window, run_compress_context_with_progress_timeout,
     )
 
     def _snapshot_worker(fence=None, *, same_turn_fallback_recovery=False):
@@ -176,13 +175,6 @@ def _run_under_progress_timeout(
                 agent._active_compression_commit_fence = retry_fence
         return retry_fence
 
-    _window_verdict = request_exceeds_model_window(agent, approx_tokens)
-    _foreground_hold = None
-    if foreground_turn and _window_verdict is False:
-        _resolved_hold = resolve_context_compression_turn_hold_seconds()
-        if 0 < _resolved_hold < total_ceiling:
-            _foreground_hold = _resolved_hold
-
     return run_compress_context_with_progress_timeout(
         worker=_snapshot_worker, messages=messages,
         system_prompt_fallback=lambda: _timeout_fallback_prompt(agent, system_message),
@@ -190,8 +182,7 @@ def _run_under_progress_timeout(
         on_timeout_cause=_on_timeout_cause,
         on_commit_overrun=lambda waited, ceiling: _warn_commit_overrun(agent, waited, ceiling), fence=active_fence,
         telemetry_agent=agent, new_fence=_publish_new_fence, fallback_worker=_same_turn_fallback_worker,
-        request_exceeds_window=_window_verdict is True, max_wait_seconds=_foreground_hold,
-        stall_fallback=_foreground_hold is None,
+        request_exceeds_window=request_exceeds_model_window(agent, approx_tokens) is True,
     )
 
 
@@ -231,7 +222,7 @@ class CompressionFacadeMixin:
         self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default",
         focus_topic: str = None, force: bool = False, bypass_cooldown: bool = False,
         defer_context_engine_notification: bool = False, commit_fence=None, verbatim_tail: list = None,
-        foreground_turn: bool = False,
+        trigger: str = None, snapshot_is_current=None,
     ) -> tuple:
         """Forwarder — see ``agent.conversation_compression.compress_context``.
         ``force=True`` (manual /compress) bypasses the summary-failure cooldown; ``bypass_cooldown=True``
@@ -291,7 +282,7 @@ class CompressionFacadeMixin:
                     approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic, force=force,
                     bypass_cooldown=bypass_cooldown or same_turn_fallback_recovery,
                     defer_context_engine_notification=(defer_context_engine_notification), commit_fence=fence,
-                    verbatim_tail=verbatim_tail,
+                    verbatim_tail=verbatim_tail, trigger=trigger, snapshot_is_current=snapshot_is_current,
                 )
 
             # Callers that already own a progress-aware wait (gateway session
@@ -308,7 +299,6 @@ class CompressionFacadeMixin:
                     active_fence=active_fence, registration=registration,
                     fence_registration_lock=fence_registration_lock,
                     idle_timeout=idle_timeout, total_ceiling=total_ceiling, approx_tokens=approx_tokens,
-                    foreground_turn=foreground_turn,
                 )
             _mirror_result_onto_live_lists(self, result, messages, direct_path=direct_path)
             _rebind_caller_session_context(self)
