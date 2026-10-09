@@ -514,6 +514,8 @@ def execution_guidance_text(valid_tool_names: Optional[set[str]] = None) -> str:
     if valid_tool_names is None:
         return text
     names = set(valid_tool_names)
+    if {"terminal", "execute_code", "read_file", "search_files"} <= names:
+        return text
     lines = []
     for line in text.splitlines(keepends=True):
         if line.startswith("- Arithmetic, math, calculations"):
@@ -528,13 +530,13 @@ def execution_guidance_text(valid_tool_names: Optional[set[str]] = None) -> str:
             tools = [tool for tool in ("read_file", "search_files", "terminal") if tool in names]
             if not tools:
                 continue
-            line = "- File contents, sizes, line counts → use " + " or ".join(tools) + "\\n"
+            line = line.replace("read_file, search_files, or terminal", " or ".join(tools))
         elif line.startswith("- 'What time is it?'") and "terminal" not in names:
             continue
         elif line.startswith("- Use the appropriate permitted lookup tool when missing information"):
             tools = [tool for tool in ("search_files", "read_file") if tool in names]
             if len(tools) != 2:
-                line = "- Use an available permitted retrieval/search tool when context is missing.\\n"
+                line = line.replace("(search_files, read_file, or an available retrieval/search tool)", "(an available permitted retrieval/search tool)")
         lines.append(line)
     return "".join(lines)
 
