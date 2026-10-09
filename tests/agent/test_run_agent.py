@@ -3255,35 +3255,31 @@ class TestRunConversation:
         assert result["completed"] is True
         assert result["api_calls"] == 2
 
-    def test_reasoning_only_local_clean_stop_returns_immediately(self, agent):
-        """A clean-stop reasoning answer returns without compression or recovery."""
+    def test_reasoning_only_local_clean_stop_recovers_visible_response(self, agent):
+        """A clean-stop reasoning field is not a public response even for local models."""
         self._setup_agent(agent)
         agent.base_url = "http://127.0.0.1:1234/v1"
         agent.compression_enabled = True
-        empty_resp = _mock_response(
-            content=None,
-            finish_reason="stop",
-            reasoning_content="reasoning only",
+        private = _mock_response(
+            content=None, finish_reason="stop", reasoning_content="private thinking"
         )
+        visible = _mock_response(content="The visible answer.", finish_reason="stop")
         prefill = [
             {"role": "user", "content": "old question"},
             {"role": "assistant", "content": "old answer"},
         ]
-
         with (
-            patch.object(agent, "_interruptible_api_call", side_effect=[empty_resp] * 6),
+            patch.object(agent, "_interruptible_api_call", side_effect=[private, visible]),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
             result = agent.run_conversation("hello", conversation_history=prefill)
-
-        mock_compress.assert_not_called()  # no compression triggered
+        mock_compress.assert_not_called()
         assert result["completed"] is True
-        assert result["final_response"] == "reasoning only"
-        assert result["api_calls"] == 1
-
+        assert result["final_response"] == "The visible answer."
+        assert result["api_calls"] == 2
 
     def test_truly_empty_response_stops_after_repeated_empty(self, agent):
         """Repeated empty responses stop after one retry and return an explanation."""
