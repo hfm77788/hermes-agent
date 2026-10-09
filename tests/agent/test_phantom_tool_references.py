@@ -19,13 +19,16 @@ from pathlib import Path
 class TestExecutionGuidanceText:
     def test_full_text_when_toolset_has_every_named_tool_or_is_unknown(self):
         from agent.prompt_builder import OPENAI_MODEL_EXECUTION_GUIDANCE, execution_guidance_text
-        assert execution_guidance_text() == OPENAI_MODEL_EXECUTION_GUIDANCE
+        assert execution_guidance_text(None) == OPENAI_MODEL_EXECUTION_GUIDANCE
+        assert execution_guidance_text(
+            {"terminal", "execute_code", "read_file", "search_files"}
+        ) == OPENAI_MODEL_EXECUTION_GUIDANCE
 
     def test_lean_toolset_is_not_told_to_use_absent_tools(self):
         # #106506: a toolset with none of terminal/execute_code/read_file/search_files must not be told to
         # reach for them (GPT models then refused plain arithmetic as "prohibited mental computation").
         from agent.prompt_builder import execution_guidance_text
-        text = execution_guidance_text()
+        text = execution_guidance_text({"memory"})
         mandatory = text.split("<mandatory_tool_use>")[1].split("</mandatory_tool_use>")[0]
         for tool in ("terminal", "execute_code", "read_file", "search_files", "Arithmetic"):
             assert tool not in mandatory
