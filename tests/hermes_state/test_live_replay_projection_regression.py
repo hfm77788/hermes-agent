@@ -10,6 +10,9 @@ from hermes_state import SessionDB
 
 
 def test_feishu_live_replay_fetches_cas_owned_columns(tmp_path):
+    from hermes_state_coverage import SessionCoverageMixin
+    assert SessionCoverageMixin in SessionDB.__mro__, "coverage helpers missing from live SessionDB"
+
     store = SessionDB(tmp_path / "state.db")
     try:
         selected = {part.strip() for part in store._CONVERSATION_ROW_COLUMNS.split(",")}
