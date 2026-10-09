@@ -100,6 +100,17 @@ class HomeIOGuard:
             for prefix in _INTERPRETER_PREFIX_STRS:
                 if _within(absolute, prefix) or (metadata and _contains(absolute, prefix)):
                     return
+            # A read-only probe that RESOLVES into the interpreter's own installation touches no
+            # Hermes state, even when its lexical path sits under the home: the PM runtime's
+            # unversioned alias dir (``cpython-3.12-linux-x86_64-gnu``) is a symlink sibling of
+            # base_prefix, and the import machinery stats/scandirs through it (sysconfig,
+            # zoneinfo, sys.path scans). Decide by the resolved path before the lexical refusal;
+            # anything that can change the tree (destructive) still checks lexically first, so
+            # resolving never probes a protected tree to decide a FORBIDDEN action.
+            if not destructive:
+                if any(_within(resolved_probe := _normcase(os.path.realpath(absolute)), prefix)
+                       for prefix in _INTERPRETER_PREFIX_STRS):
+                    return
             # Check the lexical path first: resolving must not probe a protected
             # tree merely to decide that the original path was forbidden.
             for root in roots:
