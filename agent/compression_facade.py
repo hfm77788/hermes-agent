@@ -96,6 +96,46 @@ def _report_compression_timeout(
         )
 
 
+def _report_compression_foreground_hold(
+    agent, *, waited: float, budget: float, progress_observed: bool,
+) -> None:
+    """Record a user-latency hold expiry without misclassifying it as the generic total ceiling."""
+    from agent.conversation_compression import mark_context_compression_timed_out
+
+    mark_context_compression_timed_out(agent)
+    logger.warning(
+        "Context compression exceeded its %.1fs foreground turn-hold budget after %.1fs "
+        "(summary progress observed=%s); continuing this request uncompressed",
+        budget, waited, progress_observed,
+    )
+    touch = getattr(agent, "_touch_activity", None)
+    if callable(touch):
+        try:
+            touch(
+                "context compression foreground hold expired",
+                provenance=ActivityProvenance.AGENT_COMPRESSION_TIMEOUT,
+            )
+        except Exception:
+            logger.debug("foreground compression hold activity touch failed", exc_info=True)
+    record = getattr(getattr(agent, "context_compressor", None), "record_timeout_failure", None)
+    if callable(record):
+        try:
+            record(
+                "host compress_context foreground turn-hold exhausted",
+                failure_kind="foreground_hold",
+            )
+        except Exception:
+            logger.debug("failed to record foreground compression hold cooldown", exc_info=True)
+    emit = getattr(agent, "_emit_warning", None)
+    if callable(emit):
+        progress = " after summary output was observed" if progress_observed else ""
+        emit(
+            "⚠ Context compression exceeded the foreground wait budget "
+            f"after {waited:.1f}s{progress}. No messages were dropped — "
+            "continuing this request uncompressed. Compression will retry after its cooldown."
+        )
+
+
 def _warn_commit_overrun(agent, waited: float, ceiling: float) -> None:
     """Commit-phase ceiling breach: the SessionDB mutation must complete, so only surface it."""
     emit = getattr(agent, "_emit_warning", None)
@@ -122,14 +162,15 @@ def _sync_persisted_markers(target_messages, source_messages) -> None:
 
 def _run_under_progress_timeout(
     agent, run, messages, system_message, *, active_fence, registration, fence_registration_lock,
-    idle_timeout, total_ceiling, approx_tokens=None,
+    idle_timeout, total_ceiling, approx_tokens=None, foreground_turn=False,
 ):
     """Run ``run(fence, target_messages=snapshot)`` on the pool under the progress-aware timeout.
     The pooled worker must NEVER share the caller's live transcript — a late engine after a host timeout could
     rewrite it. It deep-snapshots on the worker and publishes only via an ADMITTED commit; a no-op/abort
     returns the snapshot unchanged, so the ORIGINAL list is handed back to keep identity semantics."""
     from agent.conversation_compression import (
-        CompressionCommitFence, request_exceeds_model_window, run_compress_context_with_progress_timeout,
+        CompressionCommitFence, request_exceeds_model_window, resolve_context_compression_turn_hold_seconds,
+        run_compress_context_with_progress_timeout,
     )
 
     def _snapshot_worker(fence=None, *, same_turn_fallback_recovery=False):
@@ -159,6 +200,12 @@ def _run_under_progress_timeout(
         timeout_cause.update(total_exhausted=total_exhausted, progress_observed=progress_observed)
 
     def _on_timeout(idle, waited, since_progress):
+        if _foreground_hold is not None and timeout_cause["total_exhausted"]:
+            _report_compression_foreground_hold(
+                agent, waited=waited, budget=_foreground_hold,
+                progress_observed=timeout_cause["progress_observed"],
+            )
+            return
         _report_compression_timeout(
             agent, idle=idle, waited=waited, since_progress=since_progress, total_ceiling=total_ceiling, **timeout_cause
         )
@@ -175,6 +222,13 @@ def _run_under_progress_timeout(
                 agent._active_compression_commit_fence = retry_fence
         return retry_fence
 
+    _window_verdict = request_exceeds_model_window(agent, approx_tokens)
+    _foreground_hold = None
+    if foreground_turn and _window_verdict is False:
+        _resolved_hold = resolve_context_compression_turn_hold_seconds()
+        if 0 < _resolved_hold < total_ceiling:
+            _foreground_hold = _resolved_hold
+
     return run_compress_context_with_progress_timeout(
         worker=_snapshot_worker, messages=messages,
         system_prompt_fallback=lambda: _timeout_fallback_prompt(agent, system_message),
@@ -182,7 +236,8 @@ def _run_under_progress_timeout(
         on_timeout_cause=_on_timeout_cause,
         on_commit_overrun=lambda waited, ceiling: _warn_commit_overrun(agent, waited, ceiling), fence=active_fence,
         telemetry_agent=agent, new_fence=_publish_new_fence, fallback_worker=_same_turn_fallback_worker,
-        request_exceeds_window=request_exceeds_model_window(agent, approx_tokens) is True,
+        request_exceeds_window=_window_verdict is True, max_wait_seconds=_foreground_hold,
+        stall_fallback=_foreground_hold is None,
     )
 
 
@@ -222,7 +277,7 @@ class CompressionFacadeMixin:
         self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default",
         focus_topic: str = None, force: bool = False, bypass_cooldown: bool = False,
         defer_context_engine_notification: bool = False, commit_fence=None, verbatim_tail: list = None,
-        trigger: str = None, snapshot_is_current=None,
+        trigger: str = None, snapshot_is_current=None, foreground_turn: bool = False,
     ) -> tuple:
         """Forwarder — see ``agent.conversation_compression.compress_context``.
         ``force=True`` (manual /compress) bypasses the summary-failure cooldown; ``bypass_cooldown=True``
@@ -299,6 +354,7 @@ class CompressionFacadeMixin:
                     active_fence=active_fence, registration=registration,
                     fence_registration_lock=fence_registration_lock,
                     idle_timeout=idle_timeout, total_ceiling=total_ceiling, approx_tokens=approx_tokens,
+                    foreground_turn=foreground_turn,
                 )
             _mirror_result_onto_live_lists(self, result, messages, direct_path=direct_path)
             _rebind_caller_session_context(self)
