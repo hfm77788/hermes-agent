@@ -7,11 +7,9 @@ import pytest
 
 from gateway.config import PlatformConfig
 
-
 class _FakeDingTalkModel:
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
-
 
 class _FakeChatbotMessage(SimpleNamespace):
     @classmethod
@@ -33,7 +31,6 @@ class _FakeChatbotMessage(SimpleNamespace):
             at_users=data.get("atUsers") or data.get("at_users") or [],
             is_in_at_list=bool(data.get("isInAtList") or data.get("is_in_at_list")),
         )
-
 
 @pytest.fixture(autouse=True)
 def _fake_dingtalk_optional_sdks(monkeypatch):
@@ -81,14 +78,11 @@ def _fake_dingtalk_optional_sdks(monkeypatch):
     monkeypatch.setattr(dt, "dingtalk_card_models", card_models, raising=False)
     monkeypatch.setattr(dt, "dingtalk_robot_models", robot_models, raising=False)
 
-
 # ---------------------------------------------------------------------------
 # Requirements check
 # ---------------------------------------------------------------------------
 
-
 class TestDingTalkRequirements:
-
 
     def test_returns_false_when_env_vars_missing(self, monkeypatch):
         monkeypatch.setattr(
@@ -100,25 +94,17 @@ class TestDingTalkRequirements:
         from plugins.platforms.dingtalk.adapter import check_dingtalk_requirements
         assert check_dingtalk_requirements() is False
 
-
 # ---------------------------------------------------------------------------
 # Adapter construction
 # ---------------------------------------------------------------------------
-
-
-
 
 # ---------------------------------------------------------------------------
 # Deduplication
 # ---------------------------------------------------------------------------
 
-
-
-
 # ---------------------------------------------------------------------------
 # Send
 # ---------------------------------------------------------------------------
-
 
 class TestSend:
 
@@ -146,7 +132,6 @@ class TestSend:
         payload = call_args[1]["json"]
         assert payload["msgtype"] == "markdown"
         assert payload["markdown"]["text"] == "Hello!"
-
 
     @pytest.mark.asyncio
     async def test_send_image_renders_markdown_image(self):
@@ -237,9 +222,7 @@ class TestOpenApiMediaDelivery:
 # Connect / disconnect
 # ---------------------------------------------------------------------------
 
-
 class TestConnect:
-
 
     @pytest.mark.asyncio
     async def test_connect_fails_without_sdk(self, monkeypatch):
@@ -250,7 +233,6 @@ class TestConnect:
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
         result = await adapter.connect()
         assert result is False
-
 
     @pytest.mark.asyncio
     async def test_disconnect_finalizes_open_streaming_cards(self):
@@ -282,16 +264,13 @@ class TestConnect:
         assert adapter._streaming_cards == {}
         assert adapter._http_client is None
 
-
 # ---------------------------------------------------------------------------
 # Platform enum
 # ---------------------------------------------------------------------------
 
-
 # ---------------------------------------------------------------------------
 # SDK compatibility regression tests (dingtalk-stream >= 0.20 / 0.24)
 # ---------------------------------------------------------------------------
-
 
 class TestWebhookDomainAllowlist:
     """Guard the webhook origin allowlist against regression.
@@ -313,9 +292,6 @@ class TestWebhookDomainAllowlist:
             "https://oapi.dingtalk.com/robot/send?access_token=x"
         )
 
-
-
-
 class TestExtractText:
     """_extract_text must handle both legacy and current SDK payload shapes.
 
@@ -324,7 +300,6 @@ class TestExtractText:
     returns ``"TextContent(content=...)"`` — falling back to ``str(text)``
     leaks that repr into the agent's input.
     """
-
 
     def test_text_as_textcontent_object(self):
         """SDK >= 0.20 shape: object with ``.content`` attribute."""
@@ -344,7 +319,6 @@ class TestExtractText:
         assert result == "hello from new sdk"
         assert "TextContent(" not in result
 
-
     def test_rich_text_content_new_shape(self):
         """SDK >= 0.20 exposes rich text as ``message.rich_text_content.rich_text_list``."""
         from plugins.platforms.dingtalk.adapter import DingTalkAdapter
@@ -358,7 +332,6 @@ class TestExtractText:
         msg.rich_text = None
         result = DingTalkAdapter._extract_text(msg)
         assert "hello" in result and "world" in result
-
 
     def test_empty_message(self):
         from plugins.platforms.dingtalk.adapter import DingTalkAdapter
@@ -400,7 +373,6 @@ class TestExtractText:
         }
         assert DingTalkAdapter._extract_text(msg) == "[文档] 周报模板 https://docs.dingtalk.com/xyz"
 
-
     def test_interactive_card_with_title_and_url(self):
         """interactiveCard msgtype with both title and biz_custom_action_url."""
         from plugins.platforms.dingtalk.adapter import DingTalkAdapter
@@ -416,7 +388,6 @@ class TestExtractText:
         }
         assert DingTalkAdapter._extract_text(msg) == "[文档卡片] 项目看板 https://dingtalk.com/doc/kanban"
 
-
 class TestExtractMedia:
     """_extract_media must split native voice rich-text items (auto-STT)
     from generic audio file uploads (kept as attachments, no STT)."""
@@ -428,7 +399,6 @@ class TestExtractMedia:
         msg.rich_text_content = None
         msg.rich_text = items
         return msg
-
 
     def test_richtext_reset_does_not_clobber_voice(self):
         """A richText envelope containing a native voice item must stay
@@ -448,7 +418,6 @@ class TestExtractMedia:
         assert msg_type == MessageType.VOICE
         assert urls == ["dl_voice_rt"]
         assert mtypes == ["audio"]
-
 
     def test_image_no_filename_still_photo(self):
         """msgtype='image' without fileName → still PHOTO (MIME heuristic)."""
@@ -470,11 +439,9 @@ class TestExtractMedia:
         # Without fileName, mime defaults to octet-stream but msg_type_str=="image" still wins
         assert mtypes == ["application/octet-stream"]
 
-
 # ---------------------------------------------------------------------------
 # Group gating — require_mention + allowed_users (parity with other platforms)
 # ---------------------------------------------------------------------------
-
 
 def _make_gating_adapter(monkeypatch, *, extra=None, env=None):
     """Build a DingTalkAdapter with only the gating fields populated.
@@ -494,13 +461,11 @@ def _make_gating_adapter(monkeypatch, *, extra=None, env=None):
     from plugins.platforms.dingtalk.adapter import DingTalkAdapter
     return DingTalkAdapter(PlatformConfig(enabled=True, extra=extra or {}))
 
-
 class TestAllowedUsersGate:
 
     def test_empty_allowlist_allows_everyone(self, monkeypatch):
         adapter = _make_gating_adapter(monkeypatch)
         assert adapter._is_user_allowed("anyone", "any-staff") is True
-
 
     def test_matches_sender_id_case_insensitive(self, monkeypatch):
         adapter = _make_gating_adapter(
@@ -508,9 +473,7 @@ class TestAllowedUsersGate:
         )
         assert adapter._is_user_allowed("senderabc", "") is True
 
-
 class TestMentionPatterns:
-
 
     def test_pattern_matches_text(self, monkeypatch):
         adapter = _make_gating_adapter(
@@ -518,7 +481,6 @@ class TestMentionPatterns:
         )
         assert adapter._message_matches_mention_patterns("hermes please help") is True
         assert adapter._message_matches_mention_patterns("please hermes help") is False
-
 
     def test_env_var_json_populates_patterns(self, monkeypatch):
         adapter = _make_gating_adapter(
@@ -528,7 +490,6 @@ class TestMentionPatterns:
         assert len(adapter._mention_patterns) == 2
         assert adapter._message_matches_mention_patterns("bot ping") is True
 
-
 class TestShouldProcessMessage:
 
     def test_dm_always_accepted(self, monkeypatch):
@@ -537,7 +498,6 @@ class TestShouldProcessMessage:
         )
         msg = MagicMock(is_in_at_list=False)
         assert adapter._should_process_message(msg, "hi", is_group=False, chat_id="dm1") is True
-
 
     def test_group_accepted_when_chat_in_free_response_list(self, monkeypatch):
         adapter = _make_gating_adapter(
@@ -625,12 +585,10 @@ class TestChannelBindings:
 # _IncomingHandler.process — session_webhook extraction & fire-and-forget
 # ---------------------------------------------------------------------------
 
-
 class TestIncomingHandlerProcess:
     """Verify that _IncomingHandler.process correctly converts callback data
     and dispatches message processing as a background task (fire-and-forget)
     so the SDK ACK is returned immediately."""
-
 
     @pytest.mark.asyncio
     async def test_process_returns_ack_immediately(self):
@@ -667,7 +625,6 @@ class TestIncomingHandlerProcess:
         processing_gate.set()
         await asyncio.sleep(0.05)
 
-
 # ---------------------------------------------------------------------------
 # Text extraction — mention preservation + platform sanity
 # ---------------------------------------------------------------------------
@@ -697,21 +654,15 @@ class TestExtractTextMentions:
                 f"mangled: {text!r} -> {DingTalkAdapter._extract_text(msg)!r}"
             )
 
-
 # ---------------------------------------------------------------------------
-
 
 # ---------------------------------------------------------------------------
 # Concurrency — chat-scoped message context
 # ---------------------------------------------------------------------------
 
-
-
-
 # ---------------------------------------------------------------------------
 # Card lifecycle: finalize via metadata["streaming"]
 # ---------------------------------------------------------------------------
-
 
 class TestCardLifecycle:
 
@@ -765,7 +716,6 @@ class TestCardLifecycle:
         # Tracked for sibling cleanup.
         assert result.message_id in a._streaming_cards.get("chat-1", {})
 
-
     @pytest.mark.asyncio
     async def test_edit_message_finalize_fires_done(self, adapter_with_card):
         """Stream consumer's final edit_message(finalize=True) fires Done."""
@@ -813,8 +763,6 @@ class TestCardLifecycle:
         assert result.message_id == "track-1"
         adapter_with_card._card_sdk.streaming_update_with_options_async.assert_awaited_once()
 
-
 # ---------------------------------------------------------------------------
 # AI Card Tests
 # ---------------------------------------------------------------------------
-

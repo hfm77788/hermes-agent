@@ -90,6 +90,24 @@ class TestRestorePrimaryRuntime:
         assert agent._fallback_activated is False
         assert agent._restore_primary_runtime() is False
 
+    def test_reasoning_replay_verdict_does_not_follow_the_session_to_another_route(self):
+        """#61552: a replay kill switch tripped on one route must not disable replay on the next."""
+        agent = _make_agent(fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"})
+        tripped = (False, True)
+
+        def verdict():
+            return agent._codex_reasoning_replay_enabled, agent._codex_reasoning_replay_rejected
+
+        agent._codex_reasoning_replay_enabled, agent._codex_reasoning_replay_rejected = tripped
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(_mock_resolve(), None)):
+            assert agent._try_activate_fallback() is True
+        assert verdict() == (True, False)
+
+        agent._codex_reasoning_replay_enabled, agent._codex_reasoning_replay_rejected = tripped
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+        assert verdict() == (True, False)
+
 
 
     def test_does_not_label_temporary_model_restore_as_fallback_recovery(self):
@@ -668,7 +686,12 @@ class TestRateLimitCooldown:
             fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
         )
         mock_client = _mock_resolve()
-        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
+        # Patch the lazy SDK proxy through the restore too (like every other restore test in this
+        # file): an unpatched restore resolves the real `from openai import OpenAI`, whose import
+        # path scan stats the PM runtime's lib-dynload under the real home and trips the home-io
+        # guard in worktree runs. The restore semantics under test are unchanged.
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)), \
+                patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
             agent._try_activate_fallback(
                 reason=FailoverReason.rate_limit, reset_at=time.time() + 3600,
             )

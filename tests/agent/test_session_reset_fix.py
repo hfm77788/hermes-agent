@@ -90,3 +90,12 @@ class TestResetSessionState:
         )
 
 
+
+
+def test_skill_retrieval_catalog_cleared_on_session_reset():
+    agent = _make_minimal_agent()
+    agent._skill_retrieval_catalog = [{"name": "old-project-skill"}]
+
+    agent.reset_session_state()
+
+    assert agent._skill_retrieval_catalog == []

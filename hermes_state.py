@@ -64,6 +64,7 @@ from hermes_state_dbfile import (
     RetiredGenerationCaptureError, capture_retired_wal_generation, refuse_deleted_wal_generation,
 )
 from hermes_state_messages import SessionMessagesMixin
+from hermes_state_coverage import SessionCoverageMixin
 from hermes_state_rewind import SessionRewindMixin
 from hermes_state_wal import (
     _WAL_INCOMPAT_MARKERS, _on_disk_journal_mode, apply_database_pragmas, apply_wal_with_fallback,
@@ -453,7 +454,7 @@ class SessionDB(
     SessionSessionsMixin, SessionFtsSetupMixin, SessionSearchMixin, SessionSchemaMixin,
     SessionPortabilityMixin, SessionTelegramTopicsMixin, SessionCompressionMixin,
     SessionGatewayMixin, SessionMaintenanceMixin, SessionColdArchiveMixin, SessionUsageMixin, SessionTitlesMixin,
-    SessionMessagesMixin, SessionRewindMixin, SessionProfileRepairMixin,
+    SessionCoverageMixin, SessionMessagesMixin, SessionRewindMixin, SessionProfileRepairMixin,
 ):
     """SQLite-backed session storage with FTS5 search; many reader threads, one writer (WAL)."""
 
@@ -1588,7 +1589,8 @@ class SessionDB(
         "id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
         "codex_reasoning_items, codex_message_items, platform_message_id, observed, "
-        "_compressed_summary, timestamp, active, api_content, display_kind, display_metadata"
+        "_compressed_summary, timestamp, active, api_content, display_kind, display_metadata, "
+        "token_count, message_uid, absorbed_message_uids, tool_call_uids, tool_call_uid"
     )
 
     # ── Meta key/value (scheduler bookkeeping) ──

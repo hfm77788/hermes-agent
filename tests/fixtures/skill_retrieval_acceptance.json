@@ -1,0 +1,205 @@
+{
+  "schema": "hermes.skill_retrieval_acceptance_fixture.v1",
+  "synthetic_skills": [
+    {
+      "name": "wps-data-workflow",
+      "category": "office",
+      "description": "Build governed WPS forms, lookup workflows, and structured data collection.",
+      "semantic_terms": [
+        "WPS 表单",
+        "多维查询",
+        "数据收集"
+      ]
+    },
+    {
+      "name": "generic-forms",
+      "category": "office",
+      "description": "Create generic forms and surveys.",
+      "semantic_terms": [
+        "survey",
+        "form"
+      ]
+    },
+    {
+      "name": "github-code-review",
+      "category": "development",
+      "description": "Review GitHub pull request diffs and code changes safely.",
+      "semantic_terms": [
+        "GitHub PR",
+        "code review",
+        "diff"
+      ]
+    },
+    {
+      "name": "github",
+      "category": "development",
+      "description": "General GitHub repository operations.",
+      "semantic_terms": [
+        "repository",
+        "issue"
+      ]
+    },
+    {
+      "name": "pdf-tools",
+      "category": "documents",
+      "description": "Convert and manipulate PDF documents.",
+      "semantic_terms": [
+        "PDF",
+        "document conversion"
+      ]
+    },
+    {
+      "name": "hermes-doctor",
+      "category": "operations",
+      "description": "Diagnose and repair Hermes runtime failures.",
+      "semantic_terms": [
+        "Hermes repair",
+        "diagnose runtime",
+        "故障修复"
+      ]
+    },
+    {
+      "name": "reference-writing",
+      "category": "writing",
+      "description": "Produce reference-grounded professional and official writing.",
+      "semantic_terms": [
+        "reference writing",
+        "公文写作"
+      ]
+    },
+    {
+      "name": "agent-memory-workflows",
+      "category": "memory",
+      "description": "Use and evaluate agent memory workflows.",
+      "semantic_terms": [
+        "agent memory",
+        "memory workflow"
+      ]
+    },
+    {
+      "name": "skill-curator",
+      "category": "skills",
+      "description": "Curate, merge, simplify, and organize skills.",
+      "semantic_terms": [
+        "skill curator",
+        "整理技能",
+        "skill 管家"
+      ]
+    },
+    {
+      "name": "hermes-browser-ops",
+      "category": "browser",
+      "description": "Operate authenticated browser workflows and web forms safely.",
+      "semantic_terms": [
+        "浏览器自动化",
+        "表单",
+        "browser automation"
+      ]
+    }
+  ],
+  "ci_queries": [
+    {
+      "query": "skill:wps-data-workflow",
+      "expected": "wps-data-workflow"
+    },
+    {
+      "query": "表单 多维查询",
+      "expected": "wps-data-workflow"
+    },
+    {
+      "query": "GitHub PR code review",
+      "expected": "github-code-review"
+    },
+    {
+      "query": "use PDF",
+      "expected": "pdf-tools"
+    },
+    {
+      "query": "HERMES doctor repair runtime",
+      "expected": "hermes-doctor"
+    },
+    {
+      "query": "reference writing 公文写作",
+      "expected": "reference-writing"
+    },
+    {
+      "query": "agent memory workflows",
+      "expected": "agent-memory-workflows"
+    },
+    {
+      "query": "浏览器自动化 表单",
+      "expected": "hermes-browser-ops"
+    },
+    {
+      "query": "Skill 管家 整理 skill",
+      "expected": "skill-curator"
+    }
+  ],
+  "ci_context_query": {
+    "query": "表单 多维查询",
+    "expected": "wps-data-workflow"
+  },
+  "ci_fallback_query": {
+    "query": "WPS forms lookup workflow",
+    "expected": "wps-data-workflow"
+  },
+  "runtime_queries": [
+    {
+      "query": "skill:hermes-agent",
+      "expected": "hermes-agent"
+    },
+    {
+      "query": "WPS 表单 多维查询",
+      "expected": "wps-query-app"
+    },
+    {
+      "query": "reference writing 公文写作",
+      "expected": "reference-writing"
+    },
+    {
+      "query": "HERMES医生 修复 Hermes",
+      "expected": "hermes-doctor"
+    },
+    {
+      "query": "Skill 管家 整理 skill",
+      "expected": "skill-curator"
+    },
+    {
+      "query": "agent memory workflows",
+      "expected": "agent-memory-workflows"
+    },
+    {
+      "query": "GitHub PR code review",
+      "expected": "github-code-review"
+    },
+    {
+      "query": "浏览器自动化 表单",
+      "expected": "hermes-browser-ops"
+    }
+  ],
+  "runtime_fallback_query": {
+    "query": "WPS 表单 多维查询",
+    "expected": "wps-query-app"
+  },
+  "ci": {
+    "catalog_size": 256,
+    "min_top1_rate": 1.0,
+    "min_top5_rate": 1.0,
+    "max_context_candidates": 8,
+    "max_static_bytes_per_skill": 80.0,
+    "max_cold_ms": 5000.0,
+    "max_warm_p95_ms": 50.0,
+    "require_semantic": false
+  },
+  "runtime": {
+    "min_catalog_count": 100,
+    "min_top1_rate": 1.0,
+    "min_top5_rate": 1.0,
+    "max_context_candidates": 8,
+    "max_static_bytes_per_skill": 60.0,
+    "max_system_prompt_bytes": 120000,
+    "max_cold_ms": 5000.0,
+    "max_warm_p95_ms": 25.0,
+    "require_semantic": true
+  }
+}

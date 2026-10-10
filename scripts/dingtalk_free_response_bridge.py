@@ -27,6 +27,107 @@ _IMAGE_PLACEHOLDER_RE = re.compile(r"\[图片消息\]\(mediaId=[^)]+\)")
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic"}
 
 
+_MATH_PLAIN_TEXT_SKILLS = frozenset({"huangshang-math-tutor", "jiayin-math-tutor"})
+_RAW_MATH_MARKUP_RE = re.compile(r"\\(?:[A-Za-z]+|[\(\)\[\]\{\}])")
+
+
+def _take_braced(value: str, start: int) -> tuple[str, int] | None:
+    if start >= len(value) or value[start] != "{":
+        return None
+    depth = 0
+    for index in range(start, len(value)):
+        char = value[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return value[start + 1 : index], index + 1
+    return None
+
+
+def _replace_fraction_commands(value: str) -> str:
+    for command in (r"\dfrac", r"\frac"):
+        while command in value:
+            start = value.find(command)
+            first = _take_braced(value, start + len(command))
+            if first is None:
+                break
+            numerator, after_first = first
+            second = _take_braced(value, after_first)
+            if second is None:
+                break
+            denominator, after_second = second
+            value = value[:start] + f"({numerator})/({denominator})" + value[after_second:]
+    return value
+
+
+def _replace_sqrt_commands(value: str) -> str:
+    command = r"\sqrt"
+    while command in value:
+        start = value.find(command)
+        item = _take_braced(value, start + len(command))
+        if item is None:
+            break
+        radicand, after = item
+        value = value[:start] + f"√({radicand})" + value[after:]
+    return value
+
+
+def _plain_markdown_tables(value: str) -> str:
+    lines: list[str] = []
+    separator = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
+    for line in value.splitlines():
+        if separator.fullmatch(line):
+            continue
+        line = re.sub(r"^\s{0,3}#{1,6}\s+", "", line)
+        stripped = line.strip()
+        if stripped.startswith("|") and stripped.endswith("|") and line.count("|") >= 2:
+            cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+            lines.append("  ".join(cell for cell in cells if cell))
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _normalize_dingtalk_math_reply(value: str) -> str:
+    """Render model math markup as DingTalk-safe plain text without semantic guessing."""
+    out = str(value or "")
+    out = _replace_fraction_commands(out)
+    out = _replace_sqrt_commands(out)
+    replacements = (
+        (r"\Rightarrow", "⇒"), (r"\rightarrow", "→"), (r"\subseteq", "⊆"),
+        (r"\emptyset", "∅"), (r"\notin", "∉"), (r"\times", "×"),
+        (r"\cdot", "·"), (r"\div", "÷"), (r"\pm", "±"), (r"\neq", "≠"),
+        (r"\geq", "≥"), (r"\leq", "≤"), (r"\cup", "∪"), (r"\cap", "∩"),
+        (r"\iff", "⇔"), (r"\to", "→"), (r"\ne", "≠"), (r"\ge", "≥"),
+        (r"\le", "≤"), (r"\in", "∈"),
+    )
+    for raw, rendered in replacements:
+        out = re.sub(re.escape(raw) + r"(?![A-Za-z])", rendered, out)
+    out = out.replace(r"\left", "").replace(r"\right", "")
+    out = out.replace("$", "").replace("$", "")
+    for delimiter in (r"\(", r"\)", r"\[", r"\]"):
+        out = out.replace(delimiter, "")
+    out = re.sub(r"([A-Za-z0-9\)\]])\^\{?2\}?", r"\1²", out)
+    out = re.sub(r"([A-Za-z0-9\)\]])\^\{?3\}?", r"\1³", out)
+    out = _plain_markdown_tables(out)
+    fence = chr(96) * 3
+    tick = chr(96)
+    out = out.replace(fence, "").replace(tick, "").replace("**", "").strip()
+    if "$" in out or tick in out or "**" in out or _RAW_MATH_MARKUP_RE.search(out):
+        raise ValueError("dingtalk_math_markup_residual")
+    if not out:
+        raise ValueError("dingtalk_math_reply_empty_after_normalization")
+    return out
+
+
+def _prepare_dingtalk_reply(skill: str, value: str) -> str:
+    if skill not in _MATH_PLAIN_TEXT_SKILLS:
+        return value
+    return _normalize_dingtalk_math_reply(value)
+
+
 @dataclass(frozen=True)
 class MemberRoute:
     open_dingtalk_id: str
@@ -70,6 +171,9 @@ class Bridge:
             )
         )
         self.max_attempts = int(self.cfg.get("max_attempts", 3))
+        self.fetch_attempts = max(1, int(self.cfg.get("fetch_attempts", 3)))
+        self.fetch_timeout_seconds = int(self.cfg.get("fetch_timeout_seconds", 30))
+        self.fetch_sleep = time.sleep
         self.hermes_timeout = int(self.cfg.get("hermes_timeout_seconds", 180))
         self.gateway_inject = bool(self.cfg.get("gateway_inject_existing_session", False))
         self.gateway_home = Path(self.cfg.get("gateway_home", "/home/ubuntu/.hermes"))
@@ -279,17 +383,50 @@ class Bridge:
             "--format",
             "json",
         ]
-        proc = self._run(cmd, timeout=30)
-        if proc.returncode != 0:
-            raise RuntimeError(f"dws fetch failed rc={proc.returncode}: {proc.stderr[-500:]}")
-        payload = json.loads(proc.stdout or "{}")
-        if isinstance(payload, dict):
-            rows = payload.get("messages") or payload.get("items") or []
-        elif isinstance(payload, list):
-            rows = payload
-        else:
-            rows = []
-        return [x for x in rows if isinstance(x, dict)]
+        # The dws read path (mcp_gateway -> dingtalk) intermittently answers with
+        # i/o timeouts or partial-page failures it itself marks retryable. One
+        # blip must not kill the whole poll loop with a traceback ERROR: retry a
+        # bounded number of times with a short backoff, and only surface a real
+        # failure once every attempt failed.
+        last_error = ""
+        for attempt in range(1, self.fetch_attempts + 1):
+            if attempt > 1:
+                self.fetch_sleep(min(2.0 ** (attempt - 2), 4.0))
+            try:
+                proc = self._run(cmd, timeout=self.fetch_timeout_seconds)
+            except subprocess.TimeoutExpired:
+                last_error = f"timeout after {self.fetch_timeout_seconds}s"
+                LOG.warning(
+                    "dws fetch timeout group=%s attempt=%s/%s",
+                    group.name, attempt, self.fetch_attempts,
+                )
+                continue
+            if proc.returncode != 0:
+                last_error = f"rc={proc.returncode}: {proc.stderr[-500:]}"
+                LOG.warning(
+                    "dws fetch failed group=%s attempt=%s/%s error=%s",
+                    group.name, attempt, self.fetch_attempts, last_error[:200],
+                )
+                continue
+            try:
+                payload = json.loads(proc.stdout or "{}")
+            except json.JSONDecodeError as exc:
+                last_error = f"invalid json: {exc}"
+                LOG.warning(
+                    "dws fetch returned invalid json group=%s attempt=%s/%s",
+                    group.name, attempt, self.fetch_attempts,
+                )
+                continue
+            if isinstance(payload, dict):
+                rows = payload.get("messages") or payload.get("items") or []
+            elif isinstance(payload, list):
+                rows = payload
+            else:
+                rows = []
+            return [x for x in rows if isinstance(x, dict)]
+        raise RuntimeError(
+            f"dws fetch failed after {self.fetch_attempts} attempts: {last_error}"
+        )
 
     def _session_id(self, group: GroupRoute, member: MemberRoute) -> str:
         sessions = json.loads(self.sessions_json.read_text(encoding="utf-8"))
@@ -440,6 +577,12 @@ class Bridge:
         return reply
 
     def _send_reply(self, group: GroupRoute, reply: str) -> None:
+        try:
+            reply = _prepare_dingtalk_reply(group.skill, reply)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"DingTalk math outbound blocked before send: {exc}"
+            ) from exc
         proc = self._run(
             [
                 self.dws,
