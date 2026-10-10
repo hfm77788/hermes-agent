@@ -98,6 +98,39 @@ def test_error_hit_lines_excludes_agent_tool_noise():
     assert mod.error_hit_lines(text) == []
 
 
+def test_error_hit_lines_coalesces_one_chained_traceback_event():
+    # 2026-10-10 repair ticket t_bcd50904: one upstream APIConnectionError during a
+    # stream prints a chained traceback (several 'Traceback (most recent call last)'
+    # headers) plus the ERROR record in the same second. Line-by-line counting
+    # inflated that single transient event into hits=3 and a false yellow.
+    text = "\n".join([
+        "Oct 10 14:09:58 python[1]: 2026-10-10 14:09:58,071 ERROR agent.chat_completion_helpers: Streaming failed before delivery: Connection error.",
+        "Oct 10 14:09:58 python[1]: Traceback (most recent call last):",
+        'Oct 10 14:09:58 python[1]:   File "/x/httpx/_transports/default.py", line 101, in map_httpcore_exceptions',
+        "Oct 10 14:09:58 python[1]:     yield",
+        "Oct 10 14:09:58 python[1]: Traceback (most recent call last):",
+        "Oct 10 14:09:58 python[1]:   File \"/x/openai/_base_client.py\", line 1005, in request",
+        "Oct 10 14:09:58 python[1]: Traceback (most recent call last):",
+        "Oct 10 14:09:58 python[1]:     raise APIConnectionError(request=request) from err",
+        "Oct 10 14:09:58 python[1]: openai.APIConnectionError: Connection error.",
+        "Oct 10 14:09:58 python[1]: 2026-10-10 14:09:58,182 INFO run_agent: OpenAI client closed (stream_error_cleanup)",
+    ])
+    hits = mod.error_hit_lines(text)
+    assert len(hits) == 1
+    assert "APIConnectionError" in hits[0]
+
+
+def test_error_hit_lines_keeps_distinct_events_across_seconds():
+    text = "\n".join([
+        "Oct 10 14:00:01 python[1]: Traceback (most recent call last):",
+        "Oct 10 14:00:01 python[1]: openai.APIConnectionError: Connection error.",
+        "Oct 10 14:09:58 python[1]: Traceback (most recent call last):",
+        "Oct 10 14:09:58 python[1]: openai.APIConnectionError: Connection error.",
+        "Oct 10 14:15:00 python[1]: ERROR gateway.run: gateway injection rejected",
+    ])
+    assert len(mod.error_hit_lines(text)) == 3
+
+
 def test_error_hit_lines_keeps_infrastructure_errors():
     text = "\n".join([
         "Oct 07 14:00:00 python[1]: ERROR gateway.run: gateway injection rejected",

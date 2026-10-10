@@ -62,13 +62,44 @@ BENIGN_NOISE_PATTERNS = re.compile(
 )
 
 
+#: Journalctl line prefix ("Oct 10 14:09:58 host ...") used as the event clock.
+_JOURNAL_TS = re.compile(r"^[A-Z][a-z]{2} +\d+ \d{2}:\d{2}:\d{2} ")
+
+
 def error_hit_lines(text: str) -> list[str]:
-    """Journal lines that signal a real service error, benign noise excluded."""
-    return [
-        line[-500:]
-        for line in text.splitlines()
-        if ERROR_PATTERNS.search(line) and not BENIGN_NOISE_PATTERNS.search(line)
-    ]
+    """Real service-error *events* in journal text, benign noise excluded.
+
+    A single Python exception prints a chained traceback — several
+    'Traceback (most recent call last)' headers plus the final error line — all
+    inside one journal second. Counting those lines separately inflated one
+    transient upstream failure into hits=3 and a false-yellow repair ticket
+    (t_bcd50904, 2026-10-10). All error lines sharing one journal timestamp
+    coalesce into a single event (non-error continuation lines inside the
+    traceback do not break the burst); the representative kept is the latest
+    error line of the burst (the exception itself). An untimestamped error
+    line glued right after a counted line joins the same event. Distinct
+    seconds stay distinct events.
+    """
+    events: list[str] = []
+    open_ts: str | None = None
+    prev_counted = False
+    for line in text.splitlines():
+        if not ERROR_PATTERNS.search(line) or BENIGN_NOISE_PATTERNS.search(line):
+            prev_counted = False
+            continue
+        match = _JOURNAL_TS.match(line)
+        stamp = match.group(0) if match else None
+        if stamp is not None and stamp == open_ts:
+            events[-1] = line[-500:]
+        elif stamp is None and prev_counted:
+            events[-1] = line[-500:]
+        else:
+            events.append(line[-500:])
+            open_ts = stamp
+        prev_counted = True
+    return events
+
+
 _CONTEXT_RE = re.compile(
     r"(?P<used>\d[\d,]*)\s*/\s*(?P<total>\d[\d,]*)[^\n%]*"
     r"(?:\(|\s)(?:~)?(?P<pct>\d{1,3})%"
