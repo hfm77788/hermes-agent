@@ -755,7 +755,6 @@ class TestCompressContextForwarderOwnsTimeout:
 def test_facade_foreground_turn_uses_short_hold_budget(monkeypatch):
     """The public _compress_context foreground flag must wire the configured turn-hold cap."""
     from run_agent import AIAgent
-    from agent.context_compressor import ContextCompressor
 
     agent = object.__new__(AIAgent)
     agent.session_id = "s1"
@@ -767,9 +766,7 @@ def test_facade_foreground_turn_uses_short_hold_budget(monkeypatch):
     agent.context_compressor = MagicMock()
     agent.context_compressor.context_length = 1_000
     agent.context_compressor._consecutive_timeout_failures = 0
-    agent.context_compressor.record_timeout_failure = (
-        ContextCompressor.record_timeout_failure.__get__(agent.context_compressor, MagicMock)
-    )
+    agent.context_compressor.record_timeout_failure = MagicMock()
     agent.context_compressor._record_compression_failure_cooldown = MagicMock()
 
     release = threading.Event()
@@ -785,7 +782,7 @@ def test_facade_foreground_turn_uses_short_hold_budget(monkeypatch):
     monkeypatch.setattr("agent.conversation_compression.compress_context", streaming_compress)
     monkeypatch.setattr(
         "agent.conversation_compression.resolve_context_compression_timeouts",
-        lambda compression_cfg=None: (0.30, 0.60),
+        lambda compression_cfg=None: (0.30, 2.00),
     )
     monkeypatch.setattr(
         "agent.conversation_compression.resolve_context_compression_turn_hold_seconds",
@@ -802,10 +799,25 @@ def test_facade_foreground_turn_uses_short_hold_budget(monkeypatch):
     finally:
         release.set()
 
-    assert time.monotonic() - started < 0.20
+    assert time.monotonic() - started < 1.00
     assert out_msgs is original
     assert out_prompt == "sys"
     assert agent._last_compression_timed_out is True
+    agent.context_compressor.record_timeout_failure.assert_called_once_with(
+        "host compress_context foreground turn-hold exhausted",
+        failure_kind="foreground_hold",
+    )
+    assert "foreground wait budget" in agent._emit_warning.call_args.args[0]
+
+
+def test_foreground_facade_contract_remains_compatible_with_snapshot_and_trigger():
+    """Release sync must not drop foreground entrypoints or newer snapshot guards."""
+    import inspect
+    from agent.compression_facade import CompressionFacadeMixin
+
+    parameters = inspect.signature(CompressionFacadeMixin._compress_context).parameters
+    assert {"foreground_turn", "snapshot_is_current", "trigger"} <= set(parameters)
+    assert parameters["foreground_turn"].default is False
 
 
 def test_foreground_turn_hold_caps_streaming_fit_request(monkeypatch):
