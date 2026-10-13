@@ -538,6 +538,9 @@ class DingTalkAdapter(BasePlatformAdapter):
         ))
 
     _extract_text = staticmethod(extract_text)
+    def _extract_media(self, message):
+        """Preserve the original instance method contract while using shared parser."""
+        return extract_media(message)
 
     def _resolve_channel_skills(self, chat_id: str) -> list[str] | None:
         """Return auto-loaded skills bound to an exact DingTalk conversation id."""
