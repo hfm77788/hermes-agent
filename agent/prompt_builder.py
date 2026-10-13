@@ -59,7 +59,7 @@ def _read_text_with_timeout(path: Path, timeout: Optional[float] = None) -> Opti
     """
     if timeout is None:
         timeout = _get_context_file_read_timeout()
-    result: "queue.Queue[tuple[bool, object]]" = queue.Queue(maxsize=1)
+    result: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
 
     def _reader() -> None:
         try:
@@ -94,8 +94,7 @@ def _scan_context_content(content: str, filename: str, *, user_authored: bool = 
     ``load_soul_md`` passes ``user_authored=False`` when ``distribution.yaml`` owns the file).
     """
     # A leading UTF-8 BOM is a Windows-editor artifact, not an injection.
-    if content.startswith("\ufeff"):
-        content = content[1:]
+    content = content.removeprefix("\ufeff")
     findings = _scan_for_threats(content, scope="context")
     if not findings:
         return content
@@ -593,7 +592,7 @@ def format_steer_marker(steer_text: str) -> str:
 STEER_DISPLAY_KIND = "steer"
 
 
-def steer_user_row(steer_text: str) -> Dict[str, Any]:
+def steer_user_row(steer_text: str) -> dict[str, Any]:
     """The standalone ``role:user`` row a mid-turn /steer is delivered as (after the newest tool
     result). Its own row — never smeared onto the already-persisted tool row, which append-only
     persistence would leave divergent from the live request — and typed so the alternation repair
@@ -622,14 +621,20 @@ STEER_CHANNEL_NOTE = (
 )
 
 
-def hud_surface_note(valid_tool_names: "set[str] | None" = None) -> str:
+def hud_surface_note(valid_tool_names: set[str] | None = None,
+                     deferred_tool_names: frozenset[str] | set[str] = frozenset()) -> str:
     """Per-turn note for a message typed into the desktop's floating HUD ("this"/"here" = the app behind it).
 
     A per-turn fact, not a platform (one session alternates between app window and HUD), so it rides the
     model-bound message, never the byte-stable system prompt. Each sentence is gated on the tool it names (an
     unknown tool name invites a hallucinated call); without read_window_below the whole note is withheld.
+    ``deferred_tool_names`` are tools this session reaches only through the tool_call bridge (the default
+    session's tool-search catalog): the note must tell the model those names are real and how to call
+    them via tool_call, since a direct call to a deferred name is rejected as an unknown tool.
     """
-    names = valid_tool_names or set()
+    direct = valid_tool_names or set()
+    deferred = set(deferred_tool_names) - direct
+    names = direct | deferred
     if "read_window_below" not in names:
         return ""
     gated = (
@@ -648,9 +653,14 @@ def hud_surface_note(valid_tool_names: "set[str] | None" = None) -> str:
         ("computer_use" in names and "browser_navigate" in names,
          "When the app underneath is a browser, that means driving the "
          "user's browser rather than opening yours with browser_navigate."),
-        (True, "This is a prior, not a rule: when the request names its own target, follow the request.]"),
+        (True, "This is a prior, not a rule: when the request names its own target, follow the request."),
     )
-    return " ".join(text for ok, text in gated if ok)
+    note = " ".join(text for ok, text in gated if ok)
+    named = ("read_window_below", "computer_use") if "computer_use" in names else ("read_window_below",)
+    bridged = [name for name in named if name in deferred]
+    if bridged:
+        note += f" Call {' and '.join(bridged)} through the tool_call bridge (deferred behind tool search)."
+    return note + "]"
 
 
 # Models whose system prompt is sent as the 'developer' role (stronger instruction-following weight);
@@ -991,7 +1001,7 @@ def _run_backend_probe(env_type: str, terminal_tool) -> str:
 def _format_backend_probe(output: str) -> str:
     """Render the probe's key=value lines as an indented summary ("" if nothing usable)."""
     parsed = {k.strip(): v.strip() for k, _, v in (line.partition("=") for line in output.splitlines() if "=" in line)}
-    known = lambda key: parsed.get(key) if parsed.get(key) != "unknown" else None  # noqa: E731
+    known = lambda key: parsed.get(key) if parsed.get(key) != "unknown" else None
     os_line = " ".join(x for x in (known("os"), known("kernel")) if x)
     return f"  OS: {os_line}" if os_line else ""
 
@@ -1004,7 +1014,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
     if formatted is None:
         formatted = ""
         try:
-            import tools.terminal_tool as terminal_tool  # heavy; only needed for non-local backends
+            from tools import terminal_tool  # heavy; only needed for non-local backends
         except Exception as e:
             logger.debug("Backend probe unavailable (import failed): %s", e)
         else:
@@ -1051,6 +1061,42 @@ def _local_host_hints() -> list[str]:
     )
     # Windows-local terminal runs bash, not PowerShell — without this the model issues PowerShell syntax.
     return ["\n".join(host_lines), _WINDOWS_BASH_SHELL_HINT]
+
+
+def bot_screen_note(running: bool, display: str | None, holder: str) -> str:
+    """The one-line Bot Screen status the model sees — the prompt's ``_bot_screen_hint`` body,
+    parameterised so the display watcher can stage the same sentence as a per-turn note when a
+    screen starts or stops mid-session (#125830; the byte-stable prompt only converges at
+    compaction). ``holder`` is ``lease.AGENT``/``lease.HUMAN``; "" when there is nothing to say
+    (a stop with no display known, or an unknown holder on a running screen)."""
+    if running:
+        if not display:
+            return ""
+        held = ("a human holds it — do not drive the screen; ask them or wait" if holder == "human"
+                else "you hold it" if holder == "agent" else "")
+        if not held:
+            return ""
+        return (f"Bot Screen: this profile's own headless desktop is RUNNING on display {display} "
+                f"({held}). 'screen N' / ':N' / 'the bot screen' / 'your screen' means THIS screen: "
+                f"GUI apps you launch from the terminal already open there (their DISPLAY is routed "
+                f"to it), and display introspection (xrandr/xdotool/wmctrl) targets it. It is NOT "
+                f"the user's own display.")
+    return ("Bot Screen: this profile's own headless desktop is no longer running. Do not refer to "
+            "'the bot screen' or route GUI launches at it; GUI apps from the terminal open on the "
+            "user's own display again.")
+
+
+def _bot_screen_hint() -> str:
+    """One line naming this profile's running Bot Screen (#125830): the display, and who holds it.
+
+    Pure reads (``published_env`` + the lease file); never raises — a missing/unimportable
+    bot_desktop module or an unreadable lease must not break prompt construction. ``""`` when
+    no screen is running, so the block simply drops out of the environment hints."""
+    try:
+        from tools.bot_desktop import lease as _bd_lease, runtime as _bd_runtime
+        return bot_screen_note(True, _bd_runtime.published_env().get("DISPLAY"), _bd_lease.get().holder)
+    except Exception:
+        return ""
 
 
 def _remote_backend_hint(backend: str) -> str:
@@ -1135,7 +1181,7 @@ def _get_context_file_max_chars(context_length: Optional[int] = None) -> int:
 
 # Truncation warnings for run_agent to surface. A ContextVar so concurrent gateway prompt builds cannot
 # drain each other's.
-_truncation_warnings: "contextvars.ContextVar[Optional[list]]" = contextvars.ContextVar(
+_truncation_warnings: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar(
     "context_file_truncation_warnings", default=None
 )
 
@@ -1208,14 +1254,14 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     return manifest
 
 
-def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
+def _load_skills_snapshot(skills_dir: Path, manifest: Optional[dict] = None) -> Optional[dict]:
     """The disk snapshot if it exists, is current-version, and its manifest still matches."""
     try:
         snapshot = json.loads(_skills_prompt_snapshot_path().read_text(encoding="utf-8"))
     except Exception:  # missing, unreadable or corrupt -> rebuild
         return None
     if (isinstance(snapshot, dict) and snapshot.get("version") == _SKILLS_SNAPSHOT_VERSION
-            and snapshot.get("manifest") == _build_skills_manifest(skills_dir)):
+            and snapshot.get("manifest") == (manifest if manifest is not None else _build_skills_manifest(skills_dir))):
         return snapshot
     return None
 
@@ -1291,8 +1337,8 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
 
 
 def _skill_should_show(
-    conditions: dict, available_tools: "set[str] | None", available_toolsets: "set[str] | None",
-    session_platform: "str | None" = None,
+    conditions: dict, available_tools: set[str] | None, available_toolsets: set[str] | None,
+    session_platform: str | None = None,
 ) -> bool:
     """False if the skill's conditional activation rules exclude it."""
     # Gateway-channel gate runs regardless of tool info; fails open when the platform is unknown.
@@ -1309,6 +1355,38 @@ def _skill_should_show(
         or any(ts not in ats for ts in conditions.get("requires_toolsets", []))
         or any(t not in at for t in conditions.get("requires_tools", []))
     )
+
+
+def _plugin_skill_prompt_rows(
+    disabled: set[str], available_tools: set[str] | None, available_toolsets: set[str] | None,
+    session_platform: str | None,
+) -> list[tuple[str, str]]:
+    """``(qualified_name, description)`` for every skill registered by an ENABLED plugin
+    (``ctx.register_skill``), filtered through the same offer-time gates as on-disk skills.
+    Plugin skills live in the plugin-manager registry — never under the profile skills tree —
+    so the disk scans above cannot see them; this is their one path into ``<available_skills>``.
+    The qualified ``plugin:skill`` name is exactly what ``skill_view`` resolves, and disabling
+    or unloading a plugin removes its registry entries, so enablement gating is inherent."""
+    rows: list[tuple[str, str]] = []
+    try:
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+        discover_plugins()  # idempotent; joins an in-flight discovery (same call skills_list makes)
+        for meta in get_plugin_manager().list_plugin_skill_metadata():
+            name = str(meta.get("name") or "")
+            if not name or name in disabled:
+                continue
+            frontmatter = meta.get("frontmatter") or {}
+            if not (skill_matches_platform(frontmatter) and skill_matches_environment(frontmatter)
+                    and skill_matches_apps(frontmatter)):
+                continue
+            if not _skill_should_show(extract_skill_conditions(frontmatter), available_tools,
+                                      available_toolsets, session_platform):
+                continue
+            desc = str(meta.get("description") or "").strip() or extract_skill_description(frontmatter)
+            rows.append((name, desc))
+    except Exception:
+        logger.debug("Plugin skill prompt rows unavailable", exc_info=True)
+    return rows
 
 
 def _current_session_platform_hint() -> str:
@@ -1431,7 +1509,7 @@ def _label_visible_entries(
 
 def _render_skills_index(
     skills_by_category: dict[str, list[tuple[str, str]]], category_descriptions: dict[str, str],
-    compact_categories: "frozenset[str] | None", available_tools: "set[str] | None",
+    compact_categories: frozenset[str] | None, available_tools: set[str] | None,
     *, names_only_all: bool = False,
 ) -> str:
     """Render the ## Skills block; "" when there is nothing to list."""
@@ -1510,14 +1588,23 @@ def _build_skills_system_prompt_inner(
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
     project_dirs = project_dirs or []
+    # Plugin-registered skills (ctx.register_skill) are registry state, not files under any scanned
+    # root — the snapshot manifest can't see them change, so they participate in the cache key.
+    plugin_rows = _plugin_skill_prompt_rows(disabled, available_tools, available_toolsets, _platform_hint or None)
+    # Skill files are part of the key: another process (a hub install in a second terminal, the curator
+    # inside the gateway, a git pull of an external dir) never clears this process's LRU, so a key of
+    # config alone served the pre-change index to every running session until restart (#92313).
+    manifest = _build_skills_manifest(skills_dir)
+    files = frozenset((rel, *sig) for rel, sig in manifest.items())
+    files |= {(str(d), rel, *sig) for d in list(external_dirs) + list(project_dirs) for rel, sig in _build_skills_manifest(d).items()}
     cache_key = (
-        str(skills_dir), tuple(str(d) for d in external_dirs), tuple(str(d) for d in project_dirs),
+        str(skills_dir), tuple(str(d) for d in external_dirs), tuple(str(d) for d in project_dirs), files,
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())),
-        bool(names_only_all), _oneshot_prompt_variant(),
+        bool(names_only_all), _oneshot_prompt_variant(), tuple(plugin_rows),
     )
-    snapshot = _load_skills_snapshot(skills_dir)
+    snapshot = _load_skills_snapshot(skills_dir, manifest)
     app_gated = snapshot is not None and any(
         entry.get("requires_apps") for entry in snapshot.get("skills", []) if isinstance(entry, dict)
     )
@@ -1635,7 +1722,23 @@ def _truncate_content(
     return content[:head_chars] + marker + content[-tail_chars:]
 
 
-def load_soul_md(context_length: Optional[int] = None, home_override: "Path | None" = None) -> Optional[str]:
+def _omitted_headings(content: str, start: int, end: int, limit: int = 15) -> list:
+    """Markdown headings whose line starts inside ``content[start:end]``, so a truncation marker tells
+    the agent what it lost; ``#`` lines inside fenced code blocks are comments, not headings."""
+    import re
+
+    headings, offset, fenced = [], 0, False
+    for line in content.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            fenced = not fenced
+        elif not fenced and start <= offset < end and re.match(r"#{1,6} \S", stripped):
+            headings.append(stripped.lstrip("#").strip())
+        offset += len(line)
+    return headings[:limit] + (["..."] if len(headings) > limit else [])
+
+
+def load_soul_md(context_length: Optional[int] = None, home_override: Path | None = None) -> Optional[str]:
     """SOUL.md from HERMES_HOME (identity slot #1), or None.
 
     Callers must pass ``skip_soul=True`` to ``build_context_files_prompt`` so it isn't injected twice.
@@ -1841,7 +1944,7 @@ def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> s
 
 def build_context_files_prompt(
     cwd: Optional[str] = None, skip_soul: bool = False, context_length: Optional[int] = None,
-    allow_install_tree_fallback: bool = False, home_override: "Path | None" = None,
+    allow_install_tree_fallback: bool = False, home_override: Path | None = None,
 ) -> str:
     """Discover and load context files for the system prompt (each capped, see ``_get_context_file_max_chars``).
 
