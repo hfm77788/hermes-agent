@@ -1155,6 +1155,38 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), exc)
             return SendResult(success=False, error=str(exc))
 
+    async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        if not self._send_session or not self._token:
+            return SendResult(success=False, error="Not connected")
+        context_token = self._token_store.get(self._account_id, chat_id)
+        last_message_id: Optional[str] = None
+        # Extract MEDIA: tags and bare local file paths before text delivery, under the routed
+        # profile's scope: Docker MEDIA translation infers the sandbox from the active profile (#109024).
+        with self._media_delivery_scope(self.build_source(chat_id=chat_id)):
+            media_files, cleaned_content = self.extract_media(content)
+            local_files, final_content = self.extract_local_files(self.extract_images(cleaned_content)[1])
+            deliveries = [(p, v, "media") for p, v in self.filter_media_delivery_paths(media_files)]
+            deliveries += [(p, False, "local file") for p in self.filter_local_delivery_paths(local_files)]
+        try:
+            for path, is_voice, label in deliveries:
+                ext = Path(path).suffix.lower()
+                sender, key = next(((m, k) for exts, m, k in _OUTBOUND_BY_EXT if is_voice or ext in exts), ("send_document", "file_path"))
+                try:
+                    await getattr(self, sender)(chat_id=chat_id, metadata=metadata, **{key: path})
+                except Exception as exc:
+                    logger.warning("[%s] %s delivery failed for %s: %s", self.name, label, path, exc)
+            chunks = [c for c in self._split_text(self.format_message(final_content)) if c and c.strip()]
+            for idx, chunk in enumerate(chunks):
+                client_id = f"hermes-weixin-{uuid.uuid4().hex}"
+                await self._send_text_chunk(chat_id=chat_id, chunk=chunk, context_token=context_token, client_id=client_id)
+                last_message_id = client_id
+                if idx < len(chunks) - 1 and self._send_chunk_delay_seconds > 0:
+                    await asyncio.sleep(self._send_chunk_delay_seconds)
+            return SendResult(success=True, message_id=last_message_id)
+        except Exception as exc:
+            logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), exc)
+            return SendResult(success=False, error=str(exc))
+
     async def _ensure_typing_ticket(self, chat_id: str) -> Optional[str]:
         """Return a valid typing ticket, refreshing via getConfig once the 600s TTL evicts it —
         otherwise ``stop_typing`` no-ops and the WeChat client shows the indicator forever."""
