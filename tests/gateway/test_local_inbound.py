@@ -52,7 +52,6 @@ class FakeRunner:
         self.calls += 1
         self.adapter.seen = event
         event.source._local_inbound_response_future.set_result("答对了。下一题")
-        return None
 
 
 def _payload(message_id="m1", text="4000米", **extra):
@@ -105,6 +104,35 @@ def test_duplicate_message_id_returns_cached_result_without_second_turn():
 
     first, second = asyncio.run(scenario())
     assert first == second
+    assert runner.calls == 1
+
+
+def test_rejected_injection_is_not_cached_and_retries_after_idle():
+    # A session_busy rejection executed no user turn. Caching it (pre-2026-10-14
+    # behavior) poisoned every later retry of the same message id: the bridge's
+    # attempt loop got the cached rejection in seconds and dead-lettered the
+    # live-classroom question. The retry after the session goes idle must run.
+    runner = FakeRunner()
+
+    def running(_key: object) -> bool:
+        return state["running"]
+
+    state = {"running": True}
+    runner._is_session_running = running
+
+    async def scenario():
+        first = await inject_local_inbound(
+            runner, _payload(wait_for_idle_seconds=0))
+        state["running"] = False
+        second = await inject_local_inbound(
+            runner, _payload(wait_for_idle_seconds=0))
+        return first, second
+
+    first, second = asyncio.run(scenario())
+    assert first["accepted"] is False
+    assert first["reason"] == "session_busy"
+    assert second["accepted"] is True
+    assert second["response"] == "答对了。下一题"
     assert runner.calls == 1
 
 

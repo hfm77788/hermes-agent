@@ -147,6 +147,24 @@ class GroupRoute:
     recent_context_messages: int
 
 
+#: DingTalk throttle signatures as they appear in dws structured output. The
+#: current CLI (v1.0.61) only surfaces "business error: success=false" on
+#: stderr while RATE_LIMIT_ERROR lives in ~/.dws/logs, so this check is a
+#: fast path for when markers do appear — the real storm control is the
+#: per-group hold escalation in poll_once/_record_fetch_failure.
+_RATE_LIMIT_MARKERS = (
+    "rate_limit",
+    "chat_messages_rate_limited",
+    "请求被限流",
+    "too many requests",
+)
+
+
+def _is_rate_limited(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _RATE_LIMIT_MARKERS)
+
+
 class Bridge:
     def __init__(self, config_path: Path):
         self.config_path = config_path
@@ -155,6 +173,23 @@ class Bridge:
         self.robot_code = self.cfg["robot_code"]
         self.bot_title = self.cfg.get("bot_title", "河马老师")
         self.poll_interval = float(self.cfg.get("poll_interval_seconds", 3))
+        self.poll_backoff_max = max(
+            self.poll_interval, float(self.cfg.get("poll_backoff_max_seconds", 30))
+        )
+        self.rate_limit_backoff_seconds = max(
+            1.0, float(self.cfg.get("rate_limit_backoff_seconds", 10))
+        )
+        self.fetch_error_escalation_after = max(
+            3, int(self.cfg.get("fetch_error_escalation_after", 10))
+        )
+        self.busy_defer_seconds = max(
+            1.0, float(self.cfg.get("busy_defer_seconds", 30))
+        )
+        self.busy_wait_max_seconds = max(
+            60.0, float(self.cfg.get("busy_wait_max_seconds", 1800))
+        )
+        self._hold_until: dict[str, float] = {}
+        self.monotonic = time.monotonic
         self.timezone = ZoneInfo(self.cfg.get("timezone", "Asia/Shanghai"))
         self.dws = self.cfg.get("dws_bin", "/home/ubuntu/.local/bin/dws")
         self.hermes = self.cfg.get("hermes_bin", "/home/ubuntu/.local/bin/hermes")
@@ -388,34 +423,69 @@ class Bridge:
         # blip must not kill the whole poll loop with a traceback ERROR: retry a
         # bounded number of times with a short backoff, and only surface a real
         # failure once every attempt failed.
+        #
+        # Rate-limit rejections (钉钉开放平台 RATE_LIMIT_ERROR) get a longer,
+        # escalating backoff and stay at DEBUG: hammering a throttled API with
+        # the 1s retry cadence only deepens the throttle storm (observed as
+        # ~2700 list calls/hour feeding the limiter, 2026-10-14 repair), while
+        # other retryable blips keep the original short backoff.
         last_error = ""
+        last_rate_limited = False
         for attempt in range(1, self.fetch_attempts + 1):
             if attempt > 1:
-                self.fetch_sleep(min(2.0 ** (attempt - 2), 4.0))
+                if last_rate_limited:
+                    self.fetch_sleep(min(2.0 * self.rate_limit_backoff_seconds,
+                                         self.rate_limit_backoff_seconds * attempt))
+                else:
+                    self.fetch_sleep(min(2.0 ** (attempt - 2), 4.0))
             try:
                 proc = self._run(cmd, timeout=self.fetch_timeout_seconds)
             except subprocess.TimeoutExpired:
                 last_error = f"timeout after {self.fetch_timeout_seconds}s"
-                LOG.warning(
-                    "dws fetch timeout group=%s attempt=%s/%s",
-                    group.name, attempt, self.fetch_attempts,
-                )
+                last_rate_limited = False
+                if attempt < self.fetch_attempts:
+                    LOG.debug(
+                        "dws fetch timeout group=%s attempt=%s/%s",
+                        group.name, attempt, self.fetch_attempts,
+                    )
+                else:
+                    LOG.warning(
+                        "dws fetch timeout group=%s attempt=%s/%s",
+                        group.name, attempt, self.fetch_attempts,
+                    )
                 continue
             if proc.returncode != 0:
                 last_error = f"rc={proc.returncode}: {proc.stderr[-500:]}"
-                LOG.warning(
-                    "dws fetch failed group=%s attempt=%s/%s error=%s",
-                    group.name, attempt, self.fetch_attempts, last_error[:200],
-                )
+                last_rate_limited = _is_rate_limited(proc.stderr)
+                if attempt < self.fetch_attempts:
+                    # Retry will still run; a mid-loop blip is self-healing
+                    # chatter, not a service event. It must not reach journal
+                    # WARNING, where the healthcheck counts every second.
+                    LOG.debug(
+                        "dws fetch failed group=%s attempt=%s/%s rate_limited=%s",
+                        group.name, attempt, self.fetch_attempts, last_rate_limited,
+                    )
+                else:
+                    LOG.warning(
+                        "dws fetch failed group=%s attempt=%s/%s error=%s",
+                        group.name, attempt, self.fetch_attempts, last_error[:200],
+                    )
                 continue
             try:
                 payload = json.loads(proc.stdout or "{}")
             except json.JSONDecodeError as exc:
                 last_error = f"invalid json: {exc}"
-                LOG.warning(
-                    "dws fetch returned invalid json group=%s attempt=%s/%s",
-                    group.name, attempt, self.fetch_attempts,
-                )
+                last_rate_limited = False
+                if attempt < self.fetch_attempts:
+                    LOG.debug(
+                        "dws fetch returned invalid json group=%s attempt=%s/%s",
+                        group.name, attempt, self.fetch_attempts,
+                    )
+                else:
+                    LOG.warning(
+                        "dws fetch returned invalid json group=%s attempt=%s/%s",
+                        group.name, attempt, self.fetch_attempts,
+                    )
                 continue
             if isinstance(payload, dict):
                 rows = payload.get("messages") or payload.get("items") or []
@@ -615,6 +685,7 @@ class Bridge:
         gs["processed_ids"] = ids[-500:]
         gs.get("attempts", {}).pop(message_id, None)
         gs.get("pending", {}).pop(message_id, None)
+        gs.pop("busy_since", None)
 
     def _process_message(self, group: GroupRoute, msg: dict[str, Any]) -> bool:
         gs = self.state["groups"][group.chat_id]
@@ -675,11 +746,81 @@ class Bridge:
         LOG.info("replied group=%s message_id=%s role=%s", group.name, message_id, member.role)
         return True
 
+    def _schedule_next_poll(self, chat_id: str, seconds: float) -> None:
+        self._hold_until[chat_id] = self.monotonic() + max(0.5, seconds)
+
+    def _record_fetch_failure(
+        self, group: GroupRoute, gs: dict[str, Any], exc: Exception
+    ) -> None:
+        """Hold one group off after a failed fetch without aborting the cycle.
+
+        A single group's read path (rate-limited, timed out, or upstream down)
+        used to raise through poll_once and skip every later group until the
+        next global tick. Now each group schedules its own retry window:
+        rate-limit failures back off on a ramp (10s, 20s, ... capped at
+        2*poll_backoff_max) and stay at DEBUG, because the dws retry inside
+        _fetch_messages already self-healed one cycle. Only a *sustained*
+        outage — every consecutive cycle across the escalation threshold —
+        produces an ERROR worth a health ticket; transient throttle storms
+        must not burn repair tickets when nothing is lost.
+        """
+        failed = int(gs.get("consecutive_fetch_failures") or 0) + 1
+        gs["consecutive_fetch_failures"] = failed
+        text = str(exc)
+        if _is_rate_limited(text):
+            hold = min(2.0 * self.poll_backoff_max,
+                       self.rate_limit_backoff_seconds * failed)
+        else:
+            hold = min(self.poll_backoff_max, self.poll_interval * 2 * failed)
+        self._schedule_next_poll(group.chat_id, hold)
+        threshold = self.fetch_error_escalation_after
+        if failed == threshold or (
+            failed > threshold and failed % (3 * threshold) == 0
+        ):
+            LOG.error(
+                "dws fetch outage group=%s consecutive=%s next_poll_in=%.0fs error=%s",
+                group.name, failed, hold, text[:200],
+            )
+        else:
+            LOG.debug(
+                "dws fetch held off group=%s consecutive=%s next_poll_in=%.0fs",
+                group.name, failed, hold,
+            )
+
     def poll_once(self) -> None:
         changed = False
+        now = self.monotonic()
         for group in self.groups:
             gs = self.state["groups"][group.chat_id]
-            rows = self._fetch_messages(group, gs["cursor_time"])
+            if self._hold_until.get(group.chat_id, 0.0) > now:
+                continue
+            try:
+                rows = self._fetch_messages(group, gs["cursor_time"])
+            except Exception as exc:
+                self._record_fetch_failure(group, gs, exc)
+                continue
+            prior_failures = int(gs.get("consecutive_fetch_failures") or 0)
+            if prior_failures:
+                LOG.info(
+                    "dws fetch recovered group=%s after %s consecutive failures",
+                    group.name, prior_failures,
+                )
+            gs["consecutive_fetch_failures"] = 0
+            if rows:
+                gs["idle_poll_seconds"] = self.poll_interval
+                self._schedule_next_poll(group.chat_id, self.poll_interval)
+            else:
+                # Idle groups back off (3s -> 30s cap): every 3s poll of a
+                # silent group is another list_conversation_message_v2 call
+                # against the shared DingTalk app quota, and that self-inflicted
+                # traffic is what fed the RATE_LIMIT_ERROR storm (2026-10-14).
+                idle = min(
+                    self.poll_backoff_max,
+                    max(self.poll_interval,
+                        float(gs.get("idle_poll_seconds") or self.poll_interval)) * 2,
+                )
+                gs["idle_poll_seconds"] = idle
+                self._schedule_next_poll(group.chat_id, idle)
             for msg in rows:
                 created = str(msg.get("createTime") or "")
                 if created and created > gs.get("cursor_time", ""):
@@ -693,7 +834,28 @@ class Bridge:
                 try:
                     self._process_message(group, msg)
                     changed = True
-                except Exception:
+                except Exception as exc:
+                    if "session_busy" in str(exc):
+                        # The tutor session is mid-turn; the message stays
+                        # unprocessed and the next poll re-reads it (cursor is
+                        # start-inclusive). Deferred waits must not consume
+                        # max_attempts: the cached-rejection bug made three
+                        # 8-second-spaced attempts dead-letter live-classroom
+                        # questions while the teacher was still answering the
+                        # previous one (2026-10-14, three lost replies).
+                        busy_since = float(gs.get("busy_since") or 0.0) or time.time()
+                        gs["busy_since"] = busy_since
+                        waited = time.time() - busy_since
+                        if waited <= self.busy_wait_max_seconds:
+                            self._schedule_next_poll(group.chat_id,
+                                                     self.busy_defer_seconds)
+                            LOG.warning(
+                                "gateway session busy; deferring message "
+                                "group=%s id=%s deferred_for=%.0fs",
+                                group.name, message_id, waited,
+                            )
+                            changed = True
+                            continue
                     attempts = gs.setdefault("attempts", {})
                     attempts[message_id] = int(attempts.get(message_id, 0)) + 1
                     LOG.exception(
