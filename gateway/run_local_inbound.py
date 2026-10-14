@@ -190,7 +190,14 @@ async def inject_local_inbound(runner, params: dict[str, Any]) -> dict[str, Any]
     try:
         result = await asyncio.shield(task)
         if message_id:
-            cache[message_id] = dict(result)
+            # Only accepted results are idempotency-cacheable. A rejection
+            # (e.g. session_busy after the idle wait) executed no user turn,
+            # so caching it poisoned every later retry of the same message id
+            # and dead-lettered the student message within one poll cadence
+            # (hema repair 2026-10-14). Rejections must fall through to a
+            # fresh attempt once the session goes idle.
+            if result.get("accepted"):
+                cache[message_id] = dict(result)
             while len(cache) > _RESULT_CACHE_MAX:
                 cache.pop(next(iter(cache)))
         return result
