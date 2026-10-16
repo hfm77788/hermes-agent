@@ -55,7 +55,9 @@ def authenticated_goal(source: dict, text: str, message_id: str) -> dict | None:
         if (not isinstance(group.get("boss_open_id"), str) or
                 source.get("user_id") != group["boss_open_id"]):
             return None
-    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+    except Exception as exc:
+        # Fail without routing when policy cannot be loaded/parsed. The user
+        # identity was not established from a trusted local group registry.
         logger.warning("Cortex Feishu group registry unavailable: %s", type(exc).__name__)
         return None
     return {

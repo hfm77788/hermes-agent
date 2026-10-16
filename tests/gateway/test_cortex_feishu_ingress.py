@@ -147,3 +147,12 @@ async def test_publish_result_acknowledges_not_model_activated(owner_group, monk
     )
     assert "等待接管" in ans["reply"]
     assert "完成" not in ans["reply"]
+
+
+def test_unparseable_registry_fails_closed(owner_group, monkeypatch, tmp_path):
+    file = tmp_path / "corrupt.yaml"
+    file.write_text("workspaces: [unterminated", encoding="utf-8")
+    monkeypatch.setattr(ingress, "_REGISTRY", file)
+    assert ingress.authenticated_goal(
+        owner_group, "这是一次性任务，请分析", "om_x1234567890abc"
+    ) is None
