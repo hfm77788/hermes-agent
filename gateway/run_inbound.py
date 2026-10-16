@@ -1311,6 +1311,18 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         if _reply is not None:
             return _reply
 
+        # This bounded Cortex route runs after admission but before the busy
+        # session lane, so a long-running model turn cannot swallow a task.
+        if not is_internal:
+            from gateway.cortex_feishu_ingress import maybe_publish_owner_goal
+            _cortex = await maybe_publish_owner_goal(
+                platform=source.platform.value if source.platform else "",
+                source=source.to_dict(), text=event.text or "",
+                message_id=event.message_id or "",
+            )
+            if _cortex is not None:
+                return _cortex["reply"]
+
         # Evict a leaked/reaped ``_running_agents`` slot before the busy-session fast-path.
         self._hm_evict_idle_stale_agent(_quick_key)
         if self._is_session_running(_quick_key):
