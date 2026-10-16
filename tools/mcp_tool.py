@@ -556,7 +556,7 @@ def _reset_server_error(server_name: str) -> None:
 # ``foo_bar`` sanitize alike but must not share policy; neither do two profiles' same-named servers).
 _parallel_safe_servers: set = set()
 # Exact native MCP tool names declared read-only by operator config, keyed per profile/server.
-_parallel_explicit_readonly_tools: Dict[object, set[str]] = {}
+_parallel_explicit_readonly_tools: dict[object, set[str]] = {}
 # registry tool name -> raw server name (the generated name is lossy; never re-parse it).
 _mcp_tool_server_names: dict[str, str] = {}
 
@@ -692,17 +692,12 @@ def _update_death_supervisor(verb: str, pgids) -> None:
 
 
 def _mcp_registry_scope() -> Optional[str]:
-    """Registry scope for MCP registrations: the session's own tool scope when one is bound, else a
-    profile overlay when this process serves profiles, else None. Under ``gateway.multiplex_profiles``
-    every turn runs scoped; a process that serves a routed profile through the HERMES_HOME override
-    (dashboard/desktop backend, per-profile cron ticker) is a multiplexer too, even with the flag
-    off — keying its connections by the bare name would hand one profile's credentialed connection
-    to every other served profile (#111151). Single-profile processes (no override, or an override
-    naming their own home) keep bare names."""
-    from tools.registry import current_session_tool_scope
-    session_scope = current_session_tool_scope()
-    if session_scope is not None:
-        return session_scope
+    """Registry scope for MCP registrations: a profile overlay when this process serves profiles,
+    else None. Under ``gateway.multiplex_profiles`` every turn runs scoped; a process that serves a
+    routed profile through the HERMES_HOME override (dashboard/desktop backend, per-profile cron
+    ticker) is a multiplexer too, even with the flag off — keying its connections by the bare name
+    would hand one profile's credentialed connection to every other served profile (#111151).
+    Single-profile processes (no override, or an override naming their own home) keep bare names."""
     from agent.secret_scope import serves_routed_profile
     if not serves_routed_profile():
         return None

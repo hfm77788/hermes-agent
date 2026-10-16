@@ -48,7 +48,7 @@ def read_active_org_id(skills_dir: Path) -> Optional[str]:
         return None
 
 
-def _org_rel_parts(path, skills_dir: Path) -> Tuple[str, ...]:
+def _org_rel_parts(path, skills_dir: Path) -> tuple[str, ...]:
     """Path parts of *path* relative to *skills_dir* if it is under ``_org/``, else ``()``."""
     try:
         parts = Path(path).resolve().relative_to(Path(skills_dir).resolve()).parts
@@ -248,11 +248,6 @@ def _config_cache_key(config_path: Path) -> Optional[tuple[str, int, int, int, i
 
 def _load_raw_config() -> dict[str, Any]:
     """Read config.yaml with an mtime+size keyed cache (no hermes_cli.config import)."""
-    from agent.safe_worker_policy import worker_config_snapshot
-
-    snapshot = worker_config_snapshot()
-    if snapshot is not None:
-        return snapshot
     config_path = get_config_path()
     if not config_path.exists():
         return {}
@@ -316,7 +311,7 @@ def get_disabled_skill_names(platform: str | None = None) -> set[str]:
     return disabled - ESSENTIAL_SKILLS
 
 
-def get_compact_skill_categories(platform: str | None = None) -> Set[str]:
+def get_compact_skill_categories(platform: str | None = None) -> set[str]:
     """Skill categories rendered as names-only in the prompt.
 
     This is a footprint control, not an ability gate: skills remain discoverable and
