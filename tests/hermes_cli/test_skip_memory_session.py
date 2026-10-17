@@ -47,10 +47,55 @@ def test_cmd_chat_skip_memory_sets_only_memory_env(monkeypatch):
         os.environ.pop("HERMES_SKIP_MEMORY", None)
 
 
-def test_agent_setup_keep_rules_when_skipping_memory():
-    import inspect
+def test_agent_construction_skips_memory_but_keeps_rules(monkeypatch):
+    """Inspect actual AIAgent constructor arguments, not source formatting."""
+    from unittest.mock import MagicMock
+    import run_agent
+    import cli
+    import hermes_cli.mcp_startup as mcp_startup
     from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
-    source = inspect.getsource(CLIAgentSetupMixin)
-    assert "skip_context_files=self.ignore_rules" in source
-    assert 'os.environ.get("HERMES_SKIP_MEMORY") == "1"' in source
-    assert "skip_memory=(self.ignore_rules or " in source
+
+    fake = MagicMock()
+    fake.agent = None
+    fake._session_db = object()
+    fake._resumed = False
+    fake._single_query_mode = True
+    fake._auto_load_skills_result = None
+    fake._pending_title = None
+    fake.ignore_rules = False
+    fake.system_prompt = ""
+    fake.model = "unit-test/model"
+    fake.prefill_messages = None
+    fake._inline_diffs_enabled = False
+    fake._ensure_runtime_credentials.return_value = True
+    args = {}
+
+    def fake_agent(**kwargs):
+        args.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(run_agent, "AIAgent", fake_agent)
+    monkeypatch.setattr(cli, "_prepare_deferred_agent_startup", lambda: None)
+    monkeypatch.setattr(mcp_startup, "ensure_mcp_discovery_before_agent_build", lambda **kw: None)
+    monkeypatch.setattr(cli, "_active_agent_ref", None)
+    monkeypatch.setenv("HERMES_SKIP_MEMORY", "1")
+    success = CLIAgentSetupMixin._init_agent(
+        fake, model_override="unit-test/model",
+        runtime_override={"provider": "auto", "api_mode": "openai"})
+    assert success is True
+    assert args["skip_memory"] is True
+    assert args["skip_context_files"] is False
+
+
+def test_tui_skip_memory_rejected_before_agent_creation(monkeypatch):
+    import pytest
+    import hermes_cli.main as main_mod
+
+    parser, _, _ = build_top_level_parser()
+    args = parser.parse_args(["chat", "--skip-memory", "--tui"])
+    monkeypatch.setattr(main_mod, "_apply_safe_mode", lambda args: None)
+    monkeypatch.setattr(main_mod, "_apply_user_config_bypass", lambda args: None)
+    monkeypatch.setattr(main_mod, "_guard_noninteractive_user_config", lambda args: None)
+    monkeypatch.setattr(main_mod, "_resolve_use_tui", lambda args: True)
+    with pytest.raises(SystemExit, match="--skip-memory requires --cli"):
+        main_mod.cmd_chat(args)
