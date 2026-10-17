@@ -1758,6 +1758,9 @@ def cmd_chat(args):
     # entries and preloaded skills (AIAgent(skip_context_files, skip_memory)).
     if getattr(args, "ignore_rules", False):
         os.environ["HERMES_IGNORE_RULES"] = "1"
+    # --skip-memory isolates ephemeral worker reasoning, but keeps all rules and security context.
+    if getattr(args, "skip_memory", False):
+        os.environ["HERMES_SKIP_MEMORY"] = "1"
     # --source: tag session source for filtering (e.g. 'tool' for integrations)
     if getattr(args, "source", None):
         os.environ["HERMES_SESSION_SOURCE"] = args.source
