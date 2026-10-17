@@ -1734,6 +1734,9 @@ def cmd_chat(args):
     from hermes_cli.stream_json import stream_json_requested
     # Structured stdout is a non-interactive protocol: it overrides HERMES_TUI/display.interface too.
     use_tui = False if stream_json_requested(args) else _resolve_use_tui(args)
+    # TUI constructs its own agent: never silently accept a CLI-only memory gate.
+    if use_tui and getattr(args, "skip_memory", False):
+        raise SystemExit("--skip-memory requires --cli; TUI does not support this isolation option")
 
     _resolve_chat_session_args(args, use_tui)
 
@@ -1758,6 +1761,9 @@ def cmd_chat(args):
     # entries and preloaded skills (AIAgent(skip_context_files, skip_memory)).
     if getattr(args, "ignore_rules", False):
         os.environ["HERMES_IGNORE_RULES"] = "1"
+    # --skip-memory isolates ephemeral worker reasoning, but keeps all rules and security context.
+    if getattr(args, "skip_memory", False):
+        os.environ["HERMES_SKIP_MEMORY"] = "1"
     # --source: tag session source for filtering (e.g. 'tool' for integrations)
     if getattr(args, "source", None):
         os.environ["HERMES_SESSION_SOURCE"] = args.source
