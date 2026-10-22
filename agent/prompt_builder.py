@@ -1041,6 +1041,10 @@ def build_environment_hints() -> str:
     backend = (_tenv_read("TERMINAL_ENV") or "local").strip().lower()
     is_remote_backend = backend in _REMOTE_TERMINAL_BACKENDS or _plugin_backend_is_remote(backend)
     hints = [_remote_backend_hint(backend)] if is_remote_backend else _local_host_hints()
+    # A host-placed Bot Screen is only reachable from a local backend (a sandboxed terminal cannot
+    # open windows on the gateway host), and a sandbox-placed one is the sandbox probe's business.
+    if not is_remote_backend:
+        hints.append(_bot_screen_hint())
     hints += [WSL_ENVIRONMENT_HINT] if is_wsl() else []
     return "\n\n".join(h for h in (*hints, _embedder_environment_hint()) if h)
 
@@ -1612,10 +1616,12 @@ def _truncate_content(
         warnings.append(msg)
     head_chars = int(max_chars * CONTEXT_TRUNCATE_HEAD_RATIO)
     tail_chars = int(max_chars * CONTEXT_TRUNCATE_TAIL_RATIO)
+    omitted = _omitted_headings(content, head_chars, len(content) - tail_chars)
+    sections = f" Omitted sections: {'; '.join(omitted)}." if omitted else ""
     marker = (
         f"\n\n[...truncated {filename}: kept {head_chars}+{tail_chars} of {len(content)} chars. The middle is "
-        f"omitted — if you need the full instructions, read the complete file with the read_file tool: "
-        f"{read_path or filename}]\n\n"
+        f"omitted.{sections} If you need the full instructions, read the complete file with the read_file "
+        f"tool: {read_path or filename}]\n\n"
     )
     return content[:head_chars] + marker + content[-tail_chars:]
 
