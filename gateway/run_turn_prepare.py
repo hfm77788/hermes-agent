@@ -628,6 +628,8 @@ class GatewayTurnPrepareMixin:
         persistence_session_id: Optional[str] = None
         persistence_owner: Optional[str] = None
         title_user_message: Optional[str] = None
+        durable_history: Any = None
+        fast_lane: bool = False
 
     async def _hmwa_prepare_turn(self, event, source, session_entry, session_key, _quick_key, run_generation):
         """Everything between session resolution and the agent run: session open, task-local env,
@@ -646,8 +648,10 @@ class GatewayTurnPrepareMixin:
         from gateway.response_filters import display_kind_for_event
         persist_user_display_kind = display_kind_for_event(event)
         _redact_pii = False  # privacy.redact_pii, re-read per message
+        _turn_config: Optional[dict[str, Any]] = None
         with suppress(Exception):
-            _redact_pii = bool((_load_gateway_config().get("privacy") or {}).get("redact_pii", False))
+            _turn_config = _load_gateway_config()
+            _redact_pii = bool((_turn_config.get("privacy") or {}).get("redact_pii", False))
 
         # The context prompt render is pinned per session, keyed by a hash of the renderer inputs, so
         # the system prompt cannot drift turn-over-turn; a miss (thread rename, /sethome) re-renders.
@@ -688,16 +692,50 @@ class GatewayTurnPrepareMixin:
         # An unreadable store is not an empty conversation: stop before the agent invents continuity
         # from []. Restore task-local context here (before the broad cleanup finally).
         try:
-            history = await self.async_session_store.load_transcript(session_entry.session_id)
-            history = await self._hmwa_run_session_hygiene(
-                event, source, session_entry, session_key, history, _quick_key, run_generation,
+            durable_history = await self.async_session_store.load_transcript(session_entry.session_id)
+            _pending_state = self._peek_session_state(session_key) if session_key else None
+            _pending_sidecar = bool(
+                getattr(getattr(_pending_state, "conversation", None), "sidecar_notes", None)
             )
+            for _notes_attr in ("_pending_model_notes", "_pending_skills_reload_notes"):
+                _notes_map = getattr(self, _notes_attr, None)
+                if isinstance(_notes_map, dict) and session_key in _notes_map:
+                    _pending_sidecar = True
+                    break
+            from gateway.fast_lane import decide_fast_lane
+            _fast_lane = await decide_fast_lane(
+                event=event,
+                source=source,
+                history=durable_history,
+                session_entry=session_entry,
+                config=_turn_config,
+                was_auto_reset=_was_auto_reset,
+                is_new_session=_is_new_session,
+                pending_sidecar=_pending_sidecar,
+            )
+            if _fast_lane.use_fast_lane:
+                # A bounded replay must not reuse the cached agent built on the full history.
+                self._evict_cached_agent(session_key)
+                if _fast_lane.history_tail_rows > 0:
+                    _tail_start = max(0, len(durable_history) - _fast_lane.history_tail_rows)
+                    agent_history = durable_history[_tail_start:]
+                    # Never begin a bounded replay on an orphan tool result.
+                    while (agent_history and isinstance(agent_history[0], dict)
+                           and agent_history[0].get("role") == "tool"):
+                        agent_history = agent_history[1:]
+                else:
+                    agent_history = []
+            else:
+                durable_history = await self._hmwa_run_session_hygiene(
+                    event, source, session_entry, session_key, durable_history, _quick_key, run_generation,
+                )
+                agent_history = durable_history
         except TranscriptReadError:
             self._clear_session_env(_session_env_tokens)
             from gateway.session_results import record_unexecuted_failure
             return record_unexecuted_failure(t("gateway.errors.history_unavailable")), _session_env_tokens
 
-        await self._hmwa_first_contact_notes(source, history, turn_sidecar_notes, internal=event.internal)
+        await self._hmwa_first_contact_notes(source, durable_history, turn_sidecar_notes, internal=event.internal)
 
         # Voice channel state rides the user message ONLY when changed (in the system prompt it
         # forced a rebuild + prompt-cache re-key per message).
@@ -707,7 +745,7 @@ class GatewayTurnPrepareMixin:
 
         # Auto-analyze user images so the model gets a description plus the local path.
         message_text = await self._prepare_profile_scoped_inbound_message_text(
-            event=event, source=source, history=history, session_key=session_key,
+            event=event, source=source, history=durable_history, session_key=session_key,
         )
         if message_text is None:
             # A refused local turn answers with its refusal (session_context_refs.turn_references).
@@ -733,7 +771,9 @@ class GatewayTurnPrepareMixin:
         owner = (str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(namespace)))
                  if event.message_id else str(uuid.uuid4()))
         return self._PreparedTurn(
-            history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
+            agent_history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
             persist_user_display_kind, session_entry.session_id, owner,
             title_user_message=title_user_message,
+            durable_history=durable_history,
+            fast_lane=bool(_fast_lane.use_fast_lane),
         ), _session_env_tokens

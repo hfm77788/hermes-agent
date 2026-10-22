@@ -440,7 +440,13 @@ class GatewayTurnPersistenceMixin:
         ts = time.time()  # Unix epoch float — consistent with DB storage
         store = self.async_session_store
         sid = session_entry.session_id
-        history = prepared.history
+        # Fast-lane turns run on a bounded tail; the transcript write must still go against the
+        # full durable history, or the tail replay would truncate the durable record.
+        history = (
+            prepared.durable_history
+            if getattr(prepared, "durable_history", None) is not None
+            else prepared.history
+        )
         # The agent already persisted this turn's rows (codex app-server reports agent_persisted=True
         # too); skip the DB write. Default = a session DB exists; non-persisting runtimes pass False.
         # The agent already persisted these messages to SQLite via _flush_messages_to_session_db(), so skip

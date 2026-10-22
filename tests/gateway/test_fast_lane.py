@@ -220,7 +220,7 @@ def test_prepare_turn_fast_lane_skips_hygiene_and_preserves_loaded_history_view_
     entry=SimpleNamespace(session_id="sid", session_key="skey", last_prompt_tokens=60000, yolo=False)
     accepted=FastLaneDecision(True, "self_contained", 60000, len(loaded), 1)
     with (
-        patch("gateway.run_turn.build_session_context", return_value=SimpleNamespace()),
+        patch("gateway.run_turn_prepare.build_session_context", return_value=SimpleNamespace()),
         patch("gateway.run._load_gateway_config", return_value={}),
         patch("gateway.fast_lane.decide_fast_lane", new=AsyncMock(return_value=accepted)),
     ):
@@ -276,7 +276,7 @@ def test_prepare_turn_context_tail_uses_only_recent_history_and_preserves_durabl
     entry=SimpleNamespace(session_id="sid", session_key="skey", last_prompt_tokens=160000, yolo=False)
     accepted=FastLaneDecision(True, "context_tail", 160000, len(loaded), 1, 0.95, 12)
     with (
-        patch("gateway.run_turn.build_session_context", return_value=SimpleNamespace()),
+        patch("gateway.run_turn_prepare.build_session_context", return_value=SimpleNamespace()),
         patch("gateway.run._load_gateway_config", return_value={}),
         patch("gateway.fast_lane.decide_fast_lane", new=AsyncMock(return_value=accepted)),
     ):
