@@ -1,0 +1,412 @@
+### .github/workflows/e2e-desktop-core.yml 块1
+--OURS--
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'ubuntu-latest-32-core' }}
+    timeout-minutes: 60
+
+--THEIRS--
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 30
+
+====
+### .github/workflows/js-tests.yml 块1
+--OURS--
+    # Keep this required lane on the standard pool. The larger-runner pool
+    # has shown multi-hour starvation and must not gate merges.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+--THEIRS--
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 30
+
+====
+### .github/workflows/nix.yml 块1
+--OURS--
+    # PR correctness must not depend on scarce larger-runner capacity.
+    # Main retains the wider runner so the cache-producing path stays fast.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'ubuntu-latest-32-core' }}
+    timeout-minutes: 120
+
+--THEIRS--
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 60
+
+====
+### .github/workflows/rust-tests.yml 块1
+--OURS--
+    # Keep this required lane on the standard pool. The larger-runner pool
+    # has shown multi-hour starvation and must not gate merges.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+--THEIRS--
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 30
+
+====
+### .github/workflows/tests-os.yml 块1
+--OURS--
+            runner: ${{ github.event_name == 'pull_request' && 'windows-latest' || 'windows-latest-32-core' }}
+
+--THEIRS--
+            runner: blacksmith-32vcpu-windows-2025
+
+====
+### .github/workflows/tests.yml 块1
+--OURS--
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'ubuntu-latest-32-core' }}
+    timeout-minutes: 90
+
+--THEIRS--
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 30
+
+====
+### .github/workflows/tests.yml 块2
+--OURS--
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'ubuntu-latest-32-core' }}
+    timeout-minutes: 90
+
+--THEIRS--
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 30
+
+====
+### .github/workflows/tests.yml 块3
+--OURS--
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'ubuntu-latest-32-core' }}
+    timeout-minutes: 120
+
+--THEIRS--
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 60
+
+====
+### agent/conversation_compression.py 块1
+--OURS--
+    request_exceeds_window: bool = False, max_wait_seconds: Optional[float] = None,
+
+--THEIRS--
+    request_exceeds_window: bool = False,
+    precommit_deadline_monotonic: Optional[float] = None,
+
+====
+### agent/turn_context.py 块1
+--OURS--
+from agent.memory_manager import build_memory_context_block
+
+--THEIRS--
+from agent.iteration_budget import IterationBudget
+from agent.memory_context import build_memory_context_block
+
+====
+### agent/turn_failure_copy.py 块1
+--OURS--
+    "context_overflow", "truncated", "invalid_response", "invalid_tool_call",
+    "empty_response", "loop_error", "interpreter_shutdown", "session_busy",
+
+--THEIRS--
+    "context_overflow", "truncated", "invalid_response", "empty_response", "loop_error",
+    "interpreter_shutdown", "session_busy", "gateway_connection", "host_error",
+
+====
+### gateway/run.py 块1
+--OURS--
+    # Shared expiry needs the producer-owned reference/live distinction too,
+    # not just the timestamp-rendering guard below.
+    if msg.get("_compressed_summary"):
+        entry["_compressed_summary"] = True
+    # Proactive pruning can persist this projected history again. Keep the
+    # producer-owned restatement flag until the provider boundary strips it.
+    from agent.context_compressor import INFLIGHT_TASK_REPLAY_METADATA_KEY
+
+    metadata = msg.get("display_metadata")
+    if isinstance(metadata, dict) and metadata.get(INFLIGHT_TASK_REPLAY_METADATA_KEY):
+        entry["display_metadat
+--THEIRS--
+    entry.update(scaffolding_replay_fields(msg))  # a proactive prune re-persists this view: keep the flags
+    # Replay rebuilds the SAME conversation: every role keeps its uid and merge witness, so a context engine sees the
+    # uids the store holds. Tool-call uid maps stay on rows that still carry their calls (those pass through whole).
+
+====
+### gateway/run.py 块2
+--OURS--
+            # Compaction sent summaries unstamped; stamping them on replay breaks the cached prefix.
+            if (
+                inject_timestamps
+                and role == "user"
+                and isinstance(content, str)
+                and not msg.get("_compressed_summary")
+                and not _is_generated_inflight_restatement(msg)
+            ):
+
+--THEIRS--
+            if inject_timestamps and role == "user" and isinstance(content, str) and not is_compaction_scaffolding(msg):
+
+====
+### gateway/run.py 块3
+--OURS--
+async def _start_gateway_start_control_socket(runner):
+    """Start the gateway control socket (identify/status/pause-for-update); None when unavailable."""
+    import atexit
+    _control_server = None
+    try:
+        # Started immediately after the PID-file claim: winning that O_EXCL race is the moment this process
+        # becomes the authoritative gateway for its HERMES_HOME, so from here on "does a socket answer?" is
+        # a truthful liveness/identity query for updater and fleet consumers. Strictly non-fatal: a bind
+        # failure only means consumers fall back to the process-scan
+--THEIRS--
+
+====
+### gateway/run_inbound.py 块1
+--OURS--
+        # This bounded Cortex route runs after admission but before the busy
+        # session lane, so a long-running model turn cannot swallow a task.
+        if not is_internal:
+            from gateway.cortex_feishu_ingress import maybe_publish_owner_goal
+            _cortex = await maybe_publish_owner_goal(
+                platform=source.platform.value if source.platform else "",
+                source=source.to_dict(), text=event.text or "",
+                message_id=event.message_id or "",
+            )
+            if _cortex is not None:
+                return _cortex["reply"]
+
+--THEIRS--
+        _owned, _authority_reply = await self._hm_authority_admission(event, source, _quick_key, is_internal)
+        if _owned:
+            return _authority_reply
+
+====
+### gateway/run_turn.py 块1
+--OURS--
+        # "(empty)" = the model produced no visible content after exhausting all retries. One
+        # text with the CLI explainer and the desktop (agent/turn_explainers.py) so the user
+        # reads the same words on every surface.
+        if response == "(empty)" and not _intentional_silence:
+            from agent.turn_explainers import EMPTY_RESPONSE_EXPLANATION
+
+            _model = str(agent_result.get("model") or "").strip() or t("gateway.errors.empty_response_model_label")
+            response = t("gateway.shared.warn_passthrough", error=EMPTY_RESPONSE_EXPLANATION.format(model=_mode
+--THEIRS--
+
+====
+### gateway/run_turn_runner.py 块1
+--OURS--
+
+    # ── shared thread→loop plumbing ─────────────────────────────────────────────────────────
+
+    def _schedule(self, coro, log_message: str, loop=None):
+        """Hop a coroutine from the agent's sync worker thread onto the gateway loop."""
+        from gateway.run import safe_schedule_threadsafe
+        return safe_schedule_threadsafe(
+            coro, self._ctx._loop_for_step if loop is None else loop, logger=logger, log_message=log_message,
+        )
+
+    def _agent_interrupted(self) -> bool:
+        """True once the user sent `stop` (agent_holder[0] is the shared agent handle)."""
+  
+--THEIRS--
+        from gateway.session_authorities import active_authority
+        authority = active_authority(runner)
+        if authority is not None:
+            source = getattr(ctx, 'source', None)
+            owner_id = (source.chat_id if getattr(source, 'platform', None) == Platform.LOCAL
+                        else authority.logical_owner(ctx.session_id))
+            if owner_id in authority.sessions:
+                generation = authority.db.get_session(owner_id)["runtime_generation"]
+                self._approval_owner = (authority, owner_id, generation)
+
+
+    def _publish_execution(self, e
+====
+### gateway/run_turn_runner.py 块2
+--OURS--
+        stream_delta_cb, interim_cb, ack_visible, ack_timer = self._arm_long_task_ack(
+            agent, stream_delta_cb, interim_cb
+        )
+        self._wire_turn_agent_callbacks(
+            agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim
+        )
+        try:
+            agent_history, observed_group_context, history_media_paths = self._load_turn_history(
+                agent, reused_cached_agent
+            )
+            persist_msg, persist_ts = self._prepare_turn_message(agent_history)
+            result = self._run_conversation_with_approval(
+       
+--THEIRS--
+        self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
+        from gateway.run_turn_progress import local_viewer_turn
+        local_sinks = None
+        if local_viewer_turn(self) and not ctx.mute_notification_reply:
+            # Per turn on the shared cached agent: installed here, restored when the run returns.
+            from gateway import local_viewer_events
+            local_sinks = local_viewer_events.wire(self, agent)
+            from gateway.session_usage import TURN_BASE_ATTR
+            setattr(agent, TURN_BASE_ATTR,
+====
+### gateway/session_persistence.py 块1
+--OURS--
+    def _load_routing_rows_read_only_locked(self) -> bool:
+        """Load only the tiny routing table without opening the full writable SessionDB.
+
+        Used by ``session_store_lazy_open`` so multi-GB transcript/FTS stores stay cold during
+        Gateway startup. A later transcript/search/write opens the normal SessionDB and performs
+        the existing schema/FTS reconciliation. Lock held.
+        """
+        home = getattr(self, "_routing_home", None)
+        if home is None:
+            return False
+        db_path = Path(home) / "state.db"
+        if not db_path.exists():
+           
+--THEIRS--
+    @staticmethod
+    def _chat_labels_meta_key(platform, scope_id, chat_id) -> str:
+        return f"gateway_chat_labels:{getattr(platform, 'value', platform)}:{scope_id or ''}:{chat_id}"
+
+    def record_chat_labels(self, source: SessionSource) -> bool:
+        """Persist *source*'s ``chat_name`` / ``chat_topic`` as the chat's current labels, at the
+        moment they are observed; True once written. A session origin cannot answer "what is this
+        chat called now": it is written when its session is created, which can be after a newer
+        observation (a delayed first turn), and a res
+====
+### hermes_cli/main.py 块1
+--OURS--
+    from hermes_cli.stream_json import stream_json_requested
+    # Structured stdout is a non-interactive protocol: it overrides HERMES_TUI/display.interface too.
+    use_tui = False if stream_json_requested(args) else _resolve_use_tui(args)
+    # TUI constructs its own agent: never silently accept a CLI-only memory gate.
+    if use_tui and getattr(args, "skip_memory", False):
+        raise SystemExit("--skip-memory requires --cli; TUI does not support this isolation option")
+
+--THEIRS--
+    use_tui = _resolve_use_tui(args)
+    if use_tui:
+        _refuse_unforwarded_tui_flags(args)
+
+====
+### hermes_state.py 块1
+--OURS--
+    SessionGatewayMixin, SessionMaintenanceMixin, SessionColdArchiveMixin, SessionUsageMixin, SessionTitlesMixin,
+    SessionMessagesMixin, SessionCoverageMixin, SessionRewindMixin, SessionProfileRepairMixin,
+
+--THEIRS--
+    SessionGatewayMixin, SessionMaintenanceMixin, SessionUsageMixin, SessionTitlesMixin,
+    SessionMessagesMixin, SessionPruneRewriteMixin, SessionApiContentMixin, SessionCoverageMixin, SessionRewindMixin, SessionProfileRepairMixin,
+
+====
+### hermes_state_sessions.py 块1
+--OURS--
+                [session_id, *_collect_delegate_child_ids(conn, [session_id])]
+                if exclude_active_write_guards or reject_active_write_guards or expected_ids is not None
+                else None
+
+--THEIRS--
+                [*scope, *_collect_delegate_child_ids(conn, scope)]
+                if exclude_active_write_guards or expected_ids is not None else None
+
+====
+### tests/agent/test_skill_utils.py 块1
+--OURS--
+
+
+def test_compact_skill_categories_union_global_and_platform(tmp_path, monkeypatch):
+    from agent import skill_utils
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        """
+skills:
+  compact_categories: [creative, productivity]
+  platform_compact_categories:
+    feishu: [devops]
+    dingtalk: [education]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    skill_utils._raw_config_cache_clear()
+
+    assert get_compact_skill_categories(platform="feishu") == {
+        "creative
+--THEIRS--
+def _write_disabled_config(home, disabled: str) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        f"skills:\n  disabled:\n    - {disabled}\n", encoding="utf-8"
+    )
+
+
+class TestMultiprofileRawConfigCache:
+    """#141610: a multiplexed watcher rotates through up to ~32 published profile
+    scopes plus the ambient one; one profile's cache miss must not evict every
+    other profile's unchanged entry."""
+
+    @staticmethod
+    def _load_under(home) -> list:
+        from agent import skill_utils
+        from hermes_constants import (
+            
+====
+### tests/gateway/test_message_timestamps.py 块1
+--OURS--
+def test_inflight_task_restatement_replays_without_timestamp():
+    from agent.context_compressor import (
+        INFLIGHT_TASK_REPLAY_METADATA_KEY,
+        _INFLIGHT_TASK_REPLAY_HEADER,
+    )
+    from gateway.run import _build_gateway_agent_history
+
+    message = {
+        "role": "user",
+        "content": f"{_INFLIGHT_TASK_REPLAY_HEADER}\nfinish the deployment",
+        "timestamp": _epoch(2026, 4, 28, 13, 40, 53),
+        "display_metadata": {INFLIGHT_TASK_REPLAY_METADATA_KEY: True},
+    }
+    history, _ = _build_gateway_agent_history([message], inject_timestamps=True)
+    assert history[
+--THEIRS--
+
+====
+### tests/gateway/test_message_timestamps.py 块2
+--OURS--
+
+--THEIRS--
+
+
+def test_compactor_restatement_replays_unstamped_through_session_db(tmp_path):
+    """Compaction sends its restated in-flight task unstamped; every reload (also after a re-persist of the
+    replayed view) must replay those exact bytes."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from agent.context_compressor import ContextCompressor, _INFLIGHT_TASK_REPLAY_HEADER
+    from gateway.config import GatewayConfig
+    from gateway.run import _build_gateway_agent_history
+    from gateway.session import SessionStore
+    from hermes_state import SessionDB
+    from
+====
+### tests/hermes_cli/test_update_restart_recovery.py 块1
+--OURS--
+        assert argv[-2:] == ["gateway", "restart"]
+
+
+# ---------------------------------------------------------------------------
+# _child_environment — sibling profile credential scope (#135792)
+# ---------------------------------------------------------------------------
+
+
+def test_child_env_scopes_a_foreign_profile_to_its_own_credentials(monkeypatch, tmp_path):
+    """A sibling restart must not carry the updater's platform tokens.
+
+    The updater already loaded the launch profile's ``.env`` into ``os.environ``,
+    so a profile whose own dotenv declares no ``TELEGRAM_BOT_TOKEN`` used to
+ 
+--THEIRS--
+        assert argv[-4:] == ["gateway", "restart", "--interrupt", "--detach"]
+
+====
