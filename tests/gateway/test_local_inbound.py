@@ -390,3 +390,41 @@ def test_fast_tutoring_guard_is_scoped_to_trusted_learning_group():
     assert _local_inbound_fast_tutoring_no_tools(
         dm, "5亿元", [{"role": "assistant", "content": "C3"}]
     ) is False
+
+
+def test_injection_prefers_the_wired_handler_that_mints_admission_provenance():
+    # v0.22.4 native admission refuses a turn whose source was stamped
+    # ``_authorization_profile_home`` without callback provenance
+    # (``authorization_home_without_provenance``). Only the adapter's wired
+    # message handler (``_canonicalize`` + ``native_callback``) mints that
+    # provenance, so local inbound MUST dispatch through it — a direct
+    # ``runner._handle_message`` call silently emptied every bridge reply
+    # (repair card t_b2316993, 2026-10-23).
+    runner = FakeRunner()
+    seen_events = []
+
+    async def wired_handler(event):
+        seen_events.append(event)
+        event.source._local_inbound_response_future.set_result("答对了。下一题")
+        return "答对了。下一题"
+
+    runner.adapter._message_handler = wired_handler
+
+    result = asyncio.run(inject_local_inbound(runner, _payload()))
+
+    assert result["accepted"] is True
+    assert result["response"] == "答对了。下一题"
+    assert len(seen_events) == 1
+    assert runner.calls == 0  # never the provenance-less direct path
+
+
+def test_injection_falls_back_to_direct_call_for_unwired_test_adapters():
+    # Bare test adapters carry no wired handler; the historical direct call
+    # stays available so the suite keeps exercising the injection semantics.
+    runner = FakeRunner()
+    assert not hasattr(runner.adapter, "_message_handler")
+
+    result = asyncio.run(inject_local_inbound(runner, _payload()))
+
+    assert result["accepted"] is True
+    assert runner.calls == 1
