@@ -288,6 +288,10 @@ async def _start_gateway_start_control_socket(runner):
         from gateway.run_plugin_rewire import reload_plugins_verb
         from gateway.run_active_work_verb import active_work_verb
         from gateway.drain_control import RESTART_WAIT_REASON
+        # fork-local: loopback 消息注入与本机会话健康（本机投递链路）。v0.22.4 re-anchor 时
+        # 上游把控制套接字构造挪进本模块，run.py 里的旧副本成为死码：fork verb 注册必须跟着
+        # 活动构造点，否则 dingtalk 桥注入与每日体检全部退化为 gateway_unavailable。
+        from gateway.run_local_inbound import local_inbound_verb, local_session_health_verb
         descriptor = runner.session_runtime_descriptor
 
         def _identify_runtime():
@@ -362,7 +366,10 @@ async def _start_gateway_start_control_socket(runner):
                            "active-work": active_work_verb(runner, _main_loop),
                            # A plugin installed/enabled by another process loads now and re-wires the
                            # live adapters' handlers (#87770); tools/prompt still wait for the next session.
-                           "reload-plugins": reload_plugins_verb(runner, _main_loop)})
+                           "reload-plugins": reload_plugins_verb(runner, _main_loop),
+                           # fork-local: loopback 注入与本机会话健康（与 run.py 旧副本同注册）。
+                           "local-session-health": local_session_health_verb(runner, _main_loop),
+                           "inject-local-inbound": local_inbound_verb(runner, _main_loop)})
         _control_server.ticket_store = runner.session_ticket_store
         if not await _control_server.start():
             _control_server = None
