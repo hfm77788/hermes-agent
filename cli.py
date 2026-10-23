@@ -425,6 +425,42 @@ _single_query_finalize_attempted_session_ids: set[str | None] = set()
 # the handed-off session.
 _handed_off_session_ids: set[str | None] = set()
 _active_agent_ref = None  # active AIAgent, for memory-provider shutdown at exit
+_deferred_agent_startup_done = False
+
+
+def _prepare_deferred_agent_startup() -> None:
+    """Run Termux-deferred agent discovery before the first real agent turn."""
+    global _deferred_agent_startup_done
+    if _deferred_agent_startup_done:
+        return
+    if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
+        return
+    _deferred_agent_startup_done = True
+    _accept_hooks = os.environ.get("HERMES_ACCEPT_HOOKS", "").lower() in {"1", "true", "yes", "on"}
+    try:
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
+    except Exception:
+        logger.warning("plugin discovery failed at deferred CLI startup", exc_info=True)
+    try:
+        from hermes_cli.mcp_startup import start_background_mcp_discovery
+
+        start_background_mcp_discovery(logger=logger, thread_name="termux-cli-mcp-discovery")
+    except Exception:
+        logger.debug("MCP tool discovery failed at deferred CLI startup", exc_info=True)
+    try:
+        from agent.shell_hooks import register_from_config
+        from agent.outbound_webhooks import register_from_config as register_outbound_webhooks
+        from hermes_cli.config import load_config
+
+        _hooks_cfg = load_config()
+        register_from_config(_hooks_cfg, accept_hooks=_accept_hooks)
+        register_outbound_webhooks(_hooks_cfg)
+    except Exception:
+        logger.debug("shell-hook registration failed at deferred CLI startup", exc_info=True)
+
+
 # Set once the TUI app starts (focus reporting + mouse tracking on); gates the on-exit
 # terminal reset so non-TUI one-shot runs never emit codes for modes they never enabled.
 _tui_input_modes_active = False

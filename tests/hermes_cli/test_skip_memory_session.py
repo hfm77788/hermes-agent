@@ -75,6 +75,10 @@ def test_agent_construction_skips_memory_but_keeps_rules(monkeypatch):
         return MagicMock()
 
     monkeypatch.setattr(run_agent, "AIAgent", fake_agent)
+    # Upstream moved CLI turns onto the gateway agent: _init_agent imports GatewayAgent
+    # under the AIAgent name, so patch the symbol it actually constructs.
+    import hermes_cli.gateway_agent as gateway_agent_mod
+    monkeypatch.setattr(gateway_agent_mod, "GatewayAgent", fake_agent)
     monkeypatch.setattr(cli, "_prepare_deferred_agent_startup", lambda: None)
     monkeypatch.setattr(mcp_startup, "ensure_mcp_discovery_before_agent_build", lambda **kw: None)
     monkeypatch.setattr(cli, "_active_agent_ref", None)
