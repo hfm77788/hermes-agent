@@ -613,6 +613,16 @@ class SessionColdArchiveMixin:
         # Race-safe collision recheck immediately before import.
         if self.get_session(sid) is not None:
             return {"ok": False, "restored": False, "error": "live_session_collision"}
+        # The archive pass deletes the hot row, which leaves an upstream retirement tombstone
+        # ('a deleted session is not restored'). A cold restore is the sanctioned revival —
+        # the verified bundle manifest proves the row was archived for storage, never
+        # user-deleted — so lift our own tombstone immediately before the import.
+        from hermes_state_mutation_retirement import RETIRED_PREFIX
+
+        def _lift_tombstone(conn):
+            conn.execute("DELETE FROM state_meta WHERE key = ?", (RETIRED_PREFIX + sid,))
+
+        self._execute_write(_lift_tombstone)
         imported = self.import_sessions([verified["payload"]])
         if not imported.get("ok") or int(imported.get("imported") or 0) != 1:
             return {
