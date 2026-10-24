@@ -155,7 +155,21 @@ async def _execute_local_inbound(runner, params: dict[str, Any]) -> dict[str, An
         return {"accepted": False, "reason": "session_busy", "session_key": session_key}
 
     started = time.monotonic()
-    await runner._handle_message(event)
+    # v0.22.4 native admission only mints provenance inside the adapter-wired
+    # message handler (``_canonicalize`` + ``native_callback``). Calling
+    # ``runner._handle_message`` directly bypasses that ingress: under
+    # ``multiplex_profiles`` the gate stamps ``_authorization_profile_home``,
+    # ``capture_provenance`` then sees none and the turn is refused with
+    # ``invalid_params (authorization_home_without_provenance)`` — every bridge
+    # injection and the daily health probe read back an empty response
+    # (repair card t_b2316993, 2026-10-23). Dispatch through the same handler
+    # instance the live platform delivers to; a bare test adapter carrying no
+    # wired handler keeps the historical direct call.
+    handler: Any = getattr(adapter, "_message_handler", None)
+    if callable(handler):
+        await handler(event)
+    else:
+        await runner._handle_message(event)
     response = response_future.result() if response_future.done() else ""
     final_entry = (
         getattr(getattr(runner, "session_store", None), "_entries", None) or {}
