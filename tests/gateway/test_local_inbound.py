@@ -532,6 +532,24 @@ def test_local_inbound_response_timeout_marks_reason_and_empty(monkeypatch):
     assert "m1" not in runner._local_inbound_response_waiters  # entry cleaned
 
 
+def test_local_inbound_dispatch_exception_still_cleans_rendezvous():
+    """A raising dispatch must not leak a registry entry for the runner's lifetime."""
+    runner = FakeRunner()
+
+    async def raising_handler(event):
+        raise RuntimeError("dispatch exploded")
+
+    runner.adapter._message_handler = raising_handler
+    try:
+        asyncio.run(inject_local_inbound(runner, _payload(message_id="boom-1")))
+    except RuntimeError:
+        pass
+    else:  # pragma: no cover - the raise must propagate
+        raise AssertionError("dispatch exception was swallowed")
+
+    assert "boom-1" not in runner._local_inbound_response_waiters
+
+
 def test_local_inbound_command_turn_never_parks_the_rendezvous_wait(monkeypatch):
     from gateway import run_local_inbound as run_local_inbound_module
 

@@ -182,42 +182,46 @@ async def _execute_local_inbound(runner, params: dict[str, Any]) -> dict[str, An
     # (repair card t_b2316993, 2026-10-23). Dispatch through the same handler
     # instance the live platform delivers to; a bare test adapter carrying no
     # wired handler keeps the historical direct call.
-    handler: Any = getattr(adapter, "_message_handler", None)
-    if callable(handler):
-        await handler(event)
-    else:
-        await runner._handle_message(event)
-    _wait_started = time.monotonic()
-    response_timed_out = False
-    _is_command_lane = (text or "").lstrip().startswith("/")
-    if not response_future.done() and not _is_command_lane:
-        # Slash-command lanes answer without a publish-side agent turn — never
-        # park the grace window on them (repair t_479a04ac).
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(response_future),
-                timeout=_RESPONSE_RENDEZVOUS_GRACE_SECONDS,
-            )
-        except TimeoutError:
-            response_timed_out = True
-    response_wait_ms = round((time.monotonic() - _wait_started) * 1000)
-    response = response_future.result() if response_future.done() else ""
-    final_entry = (
-        getattr(getattr(runner, "session_store", None), "_entries", None) or {}
-    ).get(session_key)
-    result = {
-        "accepted": True,
-        "session_key": session_key,
-        "session_id": str(getattr(final_entry, "session_id", "") or ""),
-        "response": str(response or "").strip(),
-        "response_wait_ms": response_wait_ms,
-        "elapsed_ms": round((time.monotonic() - started) * 1000),
-    }
-    if response_timed_out:
-        result["reason"] = "response_timeout"
-    if message_id and waiters.get(message_id) is response_future:
-        waiters.pop(message_id, None)
-    return result
+    try:
+        handler: Any = getattr(adapter, "_message_handler", None)
+        if callable(handler):
+            await handler(event)
+        else:
+            await runner._handle_message(event)
+        _wait_started = time.monotonic()
+        response_timed_out = False
+        _is_command_lane = (text or "").lstrip().startswith("/")
+        if not response_future.done() and not _is_command_lane:
+            # Slash-command lanes answer without a publish-side agent turn — never
+            # park the grace window on them (repair t_479a04ac).
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(response_future),
+                    timeout=_RESPONSE_RENDEZVOUS_GRACE_SECONDS,
+                )
+            except TimeoutError:
+                response_timed_out = True
+        response_wait_ms = round((time.monotonic() - _wait_started) * 1000)
+        response = response_future.result() if response_future.done() else ""
+        final_entry = (
+            getattr(getattr(runner, "session_store", None), "_entries", None) or {}
+        ).get(session_key)
+        result = {
+            "accepted": True,
+            "session_key": session_key,
+            "session_id": str(getattr(final_entry, "session_id", "") or ""),
+            "response": str(response or "").strip(),
+            "response_wait_ms": response_wait_ms,
+            "elapsed_ms": round((time.monotonic() - started) * 1000),
+        }
+        if response_timed_out:
+            result["reason"] = "response_timeout"
+        return result
+    finally:
+        # A raising dispatch must not leave a rendezvous entry behind either —
+        # the registry lives for the runner's lifetime (repair t_479a04ac).
+        if message_id and waiters.get(message_id) is response_future:
+            waiters.pop(message_id, None)
 
 
 async def inject_local_inbound(runner, params: dict[str, Any]) -> dict[str, Any]:
