@@ -1083,6 +1083,54 @@ async def test_hygiene_skips_when_compression_already_in_flight(
 
 
 # ---------------------------------------------------------------------------
+# Profile-scoped early, detached hygiene threshold
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_hygiene_absolute_cap_starts_before_model_window(monkeypatch):
+    """A 200K profile cap triggers fenced gateway hygiene before the 850K safety net."""
+    from gateway.run_turn_hygiene import GatewayTurnHygieneMixin
+    import agent.model_metadata as metadata
+
+    monkeypatch.setattr(
+        metadata, "get_model_context_length_async",
+        AsyncMock(return_value=1_000_000),
+    )
+
+    class ProbeGateway(GatewayTurnHygieneMixin):
+        _session_db = None
+
+        async def _session_has_compression_in_flight(self, _key):
+            return False
+
+    hs = SimpleNamespace(
+        model="qwen3.8-flash", base_url="", api_key="", provider="custom",
+        config_context_length=None, threshold_pct=0.85, hard_msg_limit=5000,
+        data={"compression": {"hygiene_threshold_tokens": 200000}},
+    )
+    entry = SimpleNamespace(session_id="profile-cap", last_prompt_tokens=200000)
+    gateway = ProbeGateway()
+
+    at_cap = await gateway._hmwa_hygiene_plan(hs, [], entry, "profile-cap-key")
+    assert at_cap.needs_compress is True
+    assert at_cap.warn_token_threshold == 950000
+
+    entry.last_prompt_tokens = 199999
+    below_cap = await gateway._hmwa_hygiene_plan(hs, [], entry, "profile-cap-key")
+    assert below_cap.needs_compress is False
+
+    # Invalid config and unset config preserve the old 85%-of-context behavior.
+    entry.last_prompt_tokens = 200001
+    hs.data = {"compression": {"hygiene_threshold_tokens": "invalid"}}
+    bad_cap = await gateway._hmwa_hygiene_plan(hs, [], entry, "profile-cap-key")
+    assert bad_cap.needs_compress is False
+
+    hs.data = {"compression": {"hygiene_threshold_tokens": 2_000_000}}
+    large_cap = await gateway._hmwa_hygiene_plan(hs, [], entry, "profile-cap-key")
+    assert large_cap.needs_compress is False
+
+
+# ---------------------------------------------------------------------------
 # Fail-closed in-context bound when hygiene has not landed (#111988)
 # ---------------------------------------------------------------------------
 

@@ -162,6 +162,19 @@ class GatewayTurnHygieneMixin:
             config_context_length=hs.config_context_length, provider=hs.provider or "",
         )
         _compress_token_threshold = int(_hyg_context_length * hs.threshold_pct)
+        # Profile-scoped early hygiene: use the existing detached, watermark-fenced
+        # gateway compressor before the agent's synchronous context threshold.
+        # This cap never increases the model-window safety threshold.
+        _profile_compression = (
+            hs.data.get("compression") if isinstance(hs.data, dict) else None
+        )
+        if isinstance(_profile_compression, dict):
+            try:
+                _hygiene_cap = int(_profile_compression.get("hygiene_threshold_tokens") or 0)
+            except (TypeError, ValueError, OverflowError):
+                _hygiene_cap = 0
+            if _hygiene_cap > 0:
+                _compress_token_threshold = min(_compress_token_threshold, _hygiene_cap)
         _warn_token_threshold = int(_hyg_context_length * 0.95)
         _msg_count = len(history)
 
@@ -221,9 +234,9 @@ class GatewayTurnHygieneMixin:
         if _needs_compress:
             logger.info(
                 "Session hygiene: %s messages, ~%s tokens (%s) — auto-compressing "
-                "(threshold: %s%% of %s = %s tokens)",
+                "(effective threshold: %s tokens; model window: %s; ratio: %s%%)",
                 _msg_count, f"{_approx_tokens:,}", _token_source,
-                int(hs.threshold_pct * 100), f"{_hyg_context_length:,}", f"{_compress_token_threshold:,}",
+                f"{_compress_token_threshold:,}", f"{_hyg_context_length:,}", int(hs.threshold_pct * 100),
             )
         return self._HygienePlan(_needs_compress, _approx_tokens, _msg_count, _warn_token_threshold)
 
