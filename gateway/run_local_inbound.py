@@ -20,6 +20,11 @@ _MAX_TEXT_CHARS = 8000
 _MAX_CONTEXT_CHARS = 12000
 _MAX_ID_CHARS = 1024
 _RESULT_CACHE_MAX = 500
+#: Bounded wait after the dispatching handler returns, covering a response future
+#: that lands just after it. The egress publishes strictly before the authority
+#: drain settles the admission waiter, so the happy path resolves ahead of this
+#: wait; it only burns when the hand-off genuinely failed (repair t_479a04ac).
+_RESPONSE_RENDEZVOUS_GRACE_SECONDS = 5.0
 _MEDIA_MAX_ATTACHMENTS = 8
 _IMAGE_MIME_BY_SUFFIX = {
     ".jpg": "image/jpeg",
@@ -154,6 +159,18 @@ async def _execute_local_inbound(runner, params: dict[str, Any]) -> dict[str, An
     if not await _wait_until_idle(runner, adapter, session_key, wait_seconds):
         return {"accepted": False, "reason": "session_busy", "session_key": session_key}
 
+    # Process-local response rendezvous. The session-authority lane re-executes this
+    # turn from the durable snapshot (``session_envelope.restore_native`` rebuilds a
+    # SessionSource via ``from_dict``), so the wire-invisible future attribute above
+    # never reaches that turn's egress. The message id IS a wire field and survives
+    # the snapshot: the publish falls back to this registry keyed by it (repair
+    # t_479a04ac — the ``done()``-only read back "" on every durable-admission turn).
+    waiters = getattr(runner, "_local_inbound_response_waiters", None)
+    if not isinstance(waiters, dict):
+        waiters = runner._local_inbound_response_waiters = {}
+    if message_id:
+        waiters[message_id] = response_future
+
     started = time.monotonic()
     # v0.22.4 native admission only mints provenance inside the adapter-wired
     # message handler (``_canonicalize`` + ``native_callback``). Calling
@@ -165,22 +182,46 @@ async def _execute_local_inbound(runner, params: dict[str, Any]) -> dict[str, An
     # (repair card t_b2316993, 2026-10-23). Dispatch through the same handler
     # instance the live platform delivers to; a bare test adapter carrying no
     # wired handler keeps the historical direct call.
-    handler: Any = getattr(adapter, "_message_handler", None)
-    if callable(handler):
-        await handler(event)
-    else:
-        await runner._handle_message(event)
-    response = response_future.result() if response_future.done() else ""
-    final_entry = (
-        getattr(getattr(runner, "session_store", None), "_entries", None) or {}
-    ).get(session_key)
-    return {
-        "accepted": True,
-        "session_key": session_key,
-        "session_id": str(getattr(final_entry, "session_id", "") or ""),
-        "response": str(response or "").strip(),
-        "elapsed_ms": round((time.monotonic() - started) * 1000),
-    }
+    try:
+        handler: Any = getattr(adapter, "_message_handler", None)
+        if callable(handler):
+            await handler(event)
+        else:
+            await runner._handle_message(event)
+        _wait_started = time.monotonic()
+        response_timed_out = False
+        _is_command_lane = (text or "").lstrip().startswith("/")
+        if not response_future.done() and not _is_command_lane:
+            # Slash-command lanes answer without a publish-side agent turn — never
+            # park the grace window on them (repair t_479a04ac).
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(response_future),
+                    timeout=_RESPONSE_RENDEZVOUS_GRACE_SECONDS,
+                )
+            except TimeoutError:
+                response_timed_out = True
+        response_wait_ms = round((time.monotonic() - _wait_started) * 1000)
+        response = response_future.result() if response_future.done() else ""
+        final_entry = (
+            getattr(getattr(runner, "session_store", None), "_entries", None) or {}
+        ).get(session_key)
+        result = {
+            "accepted": True,
+            "session_key": session_key,
+            "session_id": str(getattr(final_entry, "session_id", "") or ""),
+            "response": str(response or "").strip(),
+            "response_wait_ms": response_wait_ms,
+            "elapsed_ms": round((time.monotonic() - started) * 1000),
+        }
+        if response_timed_out:
+            result["reason"] = "response_timeout"
+        return result
+    finally:
+        # A raising dispatch must not leave a rendezvous entry behind either —
+        # the registry lives for the runner's lifetime (repair t_479a04ac).
+        if message_id and waiters.get(message_id) is response_future:
+            waiters.pop(message_id, None)
 
 
 async def inject_local_inbound(runner, params: dict[str, Any]) -> dict[str, Any]:

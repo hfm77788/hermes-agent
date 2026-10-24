@@ -58,14 +58,26 @@ def _turn_presentation_muted(display_metadata, platform, user_config, source) ->
     )
 
 
-def _publish_local_inbound_response(source, response) -> None:
+def _publish_local_inbound_response(source, response, runner=None) -> None:
     """Return the authoritative final text to a trusted local sidecar, if one is waiting.
 
     Local inbound bridges bypass the gateway's later final-send normalization, so this is
     a security/reliability boundary: failed/partial turns must never hand raw tool/provider
     diagnostics to DingTalk (or another chat sidecar).
+
+    The future normally rides on the source object (a ``copy.copy`` of it carries the
+    instance attribute into the turn). A durable-admission turn executes against a source
+    REBUILT from the committed snapshot, where that wire-invisible attribute cannot exist;
+    fall back to the bridge's process-local message-id rendezvous on the runner
+    (``run_local_inbound`` registers it; repair t_479a04ac).
     """
     future = getattr(source, "_local_inbound_response_future", None)
+    if not isinstance(future, asyncio.Future):
+        future = None
+        waiters = getattr(runner, "_local_inbound_response_waiters", None)
+        message_id = str(getattr(source, "message_id", "") or "")
+        if isinstance(waiters, dict) and message_id:
+            future = waiters.get(message_id)
     if not isinstance(future, asyncio.Future) or future.done():
         return
     final = response.get("final_response", "") if isinstance(response, dict) else ""
@@ -2551,7 +2563,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
             _executor_task_holder[0] = worker.executor_task  # read late by _notify_long_running
             response = await self._run_agent_await_turn_worker(worker, turn_ctx, _interrupt_detected, interrupt_monitor)
-            _publish_local_inbound_response(source, response)
+            _publish_local_inbound_response(source, response, runner=self)
             if isinstance(response, dict):
                 response["_notification_reply_muted"] = turn_ctx.mute_notification_reply
             self._run_agent_evict_on_fallback(turn_ctx)

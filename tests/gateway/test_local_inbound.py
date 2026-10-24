@@ -428,3 +428,143 @@ def test_injection_falls_back_to_direct_call_for_unwired_test_adapters():
 
     assert result["accepted"] is True
     assert runner.calls == 1
+
+
+# ---------------------------------------------------------------------------
+# Response-collection rendezvous (repair card t_479a04ac)
+#
+# The durable-admission lane (session authority) re-executes the injected turn
+# from the committed snapshot: ``session_envelope.restore_native`` rebuilds a
+# SessionSource via ``from_dict``, so wire-invisible instance attributes — the
+# response future included — can never reach the drain turn's egress. The old
+# ``response_future.result() if done() else ""`` therefore read "" back on
+# EVERY multiplex bridge turn while the reply sat in the session. The fix:
+# a process-local message-id rendezvous the publish falls back to, plus a
+# bounded wait instead of the race-prone ``done()`` peek.
+# ---------------------------------------------------------------------------
+
+
+def test_publish_falls_back_to_message_id_rendezvous_for_rebuilt_source():
+    from gateway.run_turn import _publish_local_inbound_response
+
+    async def scenario():
+        future = asyncio.get_running_loop().create_future()
+        runner = SimpleNamespace(_local_inbound_response_waiters={"drain-1": future})
+        rebuilt = SessionSource(
+            platform=Platform.DINGTALK, chat_id="cid-math", chat_type="group",
+            user_id="child", message_id="drain-1",
+        )
+        assert not getattr(rebuilt, "_local_inbound_response_future", None)
+        _publish_local_inbound_response(rebuilt, {"final_response": "OK"}, runner=runner)
+        return future.result()
+
+    assert asyncio.run(scenario()) == "OK"
+
+
+def test_local_inbound_end_to_end_rendezvous_across_rebuilt_source():
+    runner = FakeRunner()
+
+    async def drain_like_handler(event):
+        # Mirrors the authority drain: the turn executes against a source rebuilt
+        # from the durable snapshot (no future attribute), resolving only through
+        # the runner-side message-id rendezvous.
+        from gateway.run_turn import _publish_local_inbound_response
+
+        rebuilt = SessionSource(
+            platform=Platform.DINGTALK, chat_id="cid-math", chat_type="group",
+            user_id="child", message_id=event.source.message_id,
+        )
+        _publish_local_inbound_response(rebuilt, {"final_response": "答对了。下一题"}, runner=runner)
+
+    runner.adapter._message_handler = drain_like_handler
+    result = asyncio.run(inject_local_inbound(runner, _payload()))
+
+    assert result["accepted"] is True
+    assert result["response"] == "答对了。下一题"
+    assert "reason" not in result
+    assert result["response_wait_ms"] <= 5  # resolved before the handler returned
+    assert runner._local_inbound_response_waiters == {}  # rendezvous entry cleaned
+
+
+def test_local_inbound_bounded_wait_captures_late_response_resolution(monkeypatch):
+    from gateway import run_local_inbound as run_local_inbound_module
+
+    monkeypatch.setattr(run_local_inbound_module, "_RESPONSE_RENDEZVOUS_GRACE_SECONDS", 2.0)
+    runner = FakeRunner()
+    keep: list = []
+
+    async def late_handler(event):
+        future = event.source._local_inbound_response_future
+
+        async def _resolve_late():
+            await asyncio.sleep(0.05)
+            if not future.done():
+                future.set_result("答对了。下一题")
+
+        keep.append(asyncio.ensure_future(_resolve_late()))
+        return "答对了。下一题"
+
+    runner.adapter._message_handler = late_handler
+    result = asyncio.run(inject_local_inbound(runner, _payload()))
+
+    assert result["accepted"] is True
+    assert result["response"] == "答对了。下一题"
+    assert "reason" not in result
+    assert result["response_wait_ms"] >= 40
+
+
+def test_local_inbound_response_timeout_marks_reason_and_empty(monkeypatch):
+    from gateway import run_local_inbound as run_local_inbound_module
+
+    monkeypatch.setattr(run_local_inbound_module, "_RESPONSE_RENDEZVOUS_GRACE_SECONDS", 0.2)
+    runner = FakeRunner()
+
+    async def silent_handler(event):
+        return
+
+    runner.adapter._message_handler = silent_handler
+    result = asyncio.run(inject_local_inbound(runner, _payload()))
+
+    assert result["accepted"] is True
+    assert result["response"] == ""
+    assert result["reason"] == "response_timeout"
+    assert result["response_wait_ms"] >= 150
+    assert "m1" not in runner._local_inbound_response_waiters  # entry cleaned
+
+
+def test_local_inbound_dispatch_exception_still_cleans_rendezvous():
+    """A raising dispatch must not leak a registry entry for the runner's lifetime."""
+    runner = FakeRunner()
+
+    async def raising_handler(event):
+        raise RuntimeError("dispatch exploded")
+
+    runner.adapter._message_handler = raising_handler
+    try:
+        asyncio.run(inject_local_inbound(runner, _payload(message_id="boom-1")))
+    except RuntimeError:
+        pass
+    else:  # pragma: no cover - the raise must propagate
+        raise AssertionError("dispatch exception was swallowed")
+
+    assert "boom-1" not in runner._local_inbound_response_waiters
+
+
+def test_local_inbound_command_turn_never_parks_the_rendezvous_wait(monkeypatch):
+    from gateway import run_local_inbound as run_local_inbound_module
+
+    monkeypatch.setattr(run_local_inbound_module, "_RESPONSE_RENDEZVOUS_GRACE_SECONDS", 30.0)
+    runner = FakeRunner()
+
+    async def command_handler(event):
+        # Slash-command lanes answer without a publish-side agent turn; the
+        # bounded wait must not burn its whole grace on them.
+        return
+
+    runner.adapter._message_handler = command_handler
+    result = asyncio.run(inject_local_inbound(runner, _payload(message_id="cmd-1", text="/new")))
+
+    assert result["accepted"] is True
+    assert result["response"] == ""
+    assert "reason" not in result
+    assert result["response_wait_ms"] <= 5
