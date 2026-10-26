@@ -1386,7 +1386,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     def _load_project_group_registry(self) -> Optional[dict]:
         """Load the project group registry YAML (ma-secretary-interaction-system)."""
-        registry_path = Path.home() / ".hermes" / "projects" / "ma-secretary-interaction-system" / "group-registry.yaml"
+        registry_path = get_hermes_home() / "projects" / "ma-secretary-interaction-system" / "group-registry.yaml"
         if not registry_path.exists():
             return None
         try:
@@ -1413,7 +1413,7 @@ class FeishuAdapter(BasePlatformAdapter):
             if not chat_id:
                 continue
             self._group_buffer_chat_ids.add(chat_id)
-            project_dir = Path.home() / ".hermes" / "projects" / "ma-secretary-interaction-system"
+            project_dir = get_hermes_home() / "projects" / "ma-secretary-interaction-system"
             project_dir.mkdir(parents=True, exist_ok=True)
             db_path = project_dir / "group_buffer.db"
             self._group_buffer_db_path = db_path
@@ -1686,7 +1686,7 @@ class FeishuAdapter(BasePlatformAdapter):
             mod = getattr(self, "_group_registry_mod", None)
             if mod is None:
                 import importlib.util, pathlib  # noqa: E401
-                _reg_path = pathlib.Path.home() / ".hermes" / "projects" / "ma-secretary-interaction-system" / "group_registry.py"
+                _reg_path = get_hermes_home() / "projects" / "ma-secretary-interaction-system" / "group_registry.py"
                 if not _reg_path.exists():
                     return base_prompt
                 spec = importlib.util.spec_from_file_location("group_registry", str(_reg_path))
