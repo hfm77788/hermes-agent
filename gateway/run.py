@@ -43,7 +43,8 @@ from agent.interrupt_compat import request_hard_interrupt
 from agent.message_metadata import ABSORBED_MESSAGE_UIDS, MESSAGE_UID, copy_identity_fields, is_compaction_scaffolding, scaffolding_replay_fields
 from agent.turn_context import compression_made_progress
 from agent.session_activity import ActivityProvenance, AwakeIdleMeter
-from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
+from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get, config_exists
+from gateway.run_common import _csv_or_list_to_set
 from hermes_cli.fallback_config import pre_agent_fallback_notice
 from gateway.turn_executor import _UnboundedThreadExecutor
 
@@ -1197,15 +1198,6 @@ def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool
     return bool(channel_prompt and _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt)
 
 
-def _csv_or_list_to_set(raw: Any) -> set[str]:
-    """Normalize a config list or comma-separated scalar into a string set."""
-    if raw is None:
-        return set()
-    if isinstance(raw, list):
-        return {str(part).strip() for part in raw if str(part).strip()}
-    return {part.strip() for part in str(raw).split(",") if part.strip()}
-
-
 def _slack_ignored_channels_from_gateway_config(config: Any, adapter: Any = None) -> set[str]:
     """Return Slack channels that the generic gateway must never dispatch.
 
@@ -1625,7 +1617,7 @@ def _bridge_max_turns_from_config(home: Path) -> None:
     if profile_scoped():
         return
     config_path = home / 'config.yaml'
-    if not config_path.exists():
+    if not config_exists(config_path):
         return
     try:
         cfg = _load_bridge_config(config_path)
@@ -1647,7 +1639,7 @@ def _current_max_iterations() -> int:
     if override:
         config_path = Path(override) / 'config.yaml'
         try:
-            cfg = _load_bridge_config(config_path) if config_path.exists() else {}
+            cfg = _load_bridge_config(config_path) if config_exists(config_path) else {}
         except Exception:
             cfg = {}
         agent_cfg = cfg.get("agent")
@@ -2148,7 +2140,7 @@ def _load_bridge_config(config_path: Path) -> dict:
 
 _config_path = _hermes_home / 'config.yaml'
 _cfg: dict = {}
-if _config_path.exists():
+if config_exists(_config_path):
     try:
         _cfg = _load_bridge_config(_config_path)
         _bridge_config_to_env(_cfg)
@@ -5462,22 +5454,17 @@ def main():
 
 
 def _exit_after_graceful_shutdown(exit_code: int) -> None:
-    """Flush stdio, release the PID file + runtime lock, then hard-exit.
+    """Flush stdio, release the PID file + lock, stamp the clean exit, flush opt-in metrics, hard-exit.
     ``os._exit`` (not ``sys.exit``): SystemExit runs ``Py_FinalizeEx``, which joins every non-daemon
-    thread — exactly the hang a wedged worker causes. It bypasses ``atexit``, so PID/lock release and the
-    bounded log drain (file handlers sit behind a ``QueueListener`` thread) are done here explicitly.
-
-    Graceful teardown is already complete by the time this runs, so there is nothing left that needs a clean
-    interpreter shutdown. See #53107.
-    ``os._exit`` bypasses ``atexit`` handlers, so we cannot rely on the ``atexit``-registered
-    ``remove_pid_file`` / ``release_gateway_runtime_lock`` (registered in ``start_gateway``) to run. The
-    full-shutdown path releases both explicitly in ``_stop_impl``, but the EARLY exit paths —
-    clean-fatal-config (#51228) and startup-aborted-before-running — raise ``SystemExit`` right after
-    ``runner.start()`` without going through ``_stop_impl``, so on those paths ``atexit`` was the only thing
-    releasing them. Now that those paths are routed through this backstop (#53107), release both here
-    explicitly. Both calls are idempotent — ``remove_pid_file`` only unlinks a PID file that belongs to this
-    process, and ``release_gateway_runtime_lock`` no-ops when the lock is already released — so this is a
-    no-op on the normal shutdown path and the actual cleanup on the early-exit paths.
+    thread — exactly the hang a wedged worker causes. It bypasses ``atexit``, so the metrics flush,
+    PID/lock release and the bounded log drain (file handlers sit behind a ``QueueListener`` thread)
+    are done here explicitly; graceful teardown is already complete by the time this runs. See #53107.
+    The atexit-registered ``remove_pid_file`` / ``release_gateway_runtime_lock`` (``start_gateway``) never
+    run either. ``_stop_impl`` releases both on the full shutdown, but the EARLY exits — clean-fatal-config
+    (#51228) and startup-aborted-before-running — raise ``SystemExit`` right after ``runner.start()``
+    without ``_stop_impl``, so atexit was all that released them there; this backstop does now (#53107).
+    Both are idempotent (``remove_pid_file`` only unlinks this process's PID file; the lock release no-ops
+    once released): a no-op on the normal shutdown, the actual cleanup on the early exits.
     """
     for stream in (sys.stdout, sys.stderr):
         with suppress(Exception):
@@ -5496,13 +5483,17 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
         from gateway.lifecycle_ledger import mark_exited
         mark_exited(exit_code, reason="graceful_shutdown")
 
+    def _flush_metrics() -> None:  # after the clean stamp: a supervisor kill mid-flush is no unclean death
+        from hermes_cli.observability.shared_metrics_process import flush_before_hard_exit
+        flush_before_hard_exit()  # the runtimes' atexit flush: open sessions + queued opt-in rows (bounded)
+
     def _drain_logs() -> None:
         # os._exit bypasses the listener's atexit drain. Bounded, no restart — NOT flush_log_queue():
         # a listener wedged on the rotation lock would re-freeze shutdown in an unbounded stop() join.
         from hermes_logging import drain_log_queue
         drain_log_queue(timeout=1.0)
 
-    for _step in (_release_locks, _mark_exited, _drain_logs):
+    for _step in (_release_locks, _mark_exited, _flush_metrics, _drain_logs):
         _best_effort(_step)
     os._exit(exit_code)
 
