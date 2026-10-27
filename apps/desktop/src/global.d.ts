@@ -82,6 +82,10 @@ declare global {
       // remote cache was dropped.
       revalidateConnection: () => Promise<{ ok: boolean; rebuilt: boolean }>
       getGatewayWsUrl: (profile?: null | string) => Promise<GatewayWsUrlResult>
+      // Browser host only: before a pick routes `profile`, re-read the served
+      // set when its cached answer does not serve that profile. Bounded, and
+      // never rejects: on a timeout or failure the cached set stands.
+      refreshServedProfile?: (profile: string) => Promise<void>
       // Open (or focus) a standalone OS window for a single chat session so
       // the user can work with multiple chats side by side. Returns ok:false
       // with an error code when the sessionId is empty/invalid. `watch` opens
@@ -828,6 +832,10 @@ export interface DesktopSyncReceipt {
 export interface DesktopVersionInfo {
   /** Packaged client version, or the runtime version for source installs. */
   appVersion: string
+  /** The active connection's backend runtime version ('' when unreachable). */
+  backendVersion?: string
+  /** This machine's install: the stamp for packages, `hermes --version` for source installs. */
+  clientVersion?: string
   /** Fixed release identity. Commit builds have no update channel. */
   channel?: string | null
   electronVersion: string
@@ -1295,6 +1303,9 @@ export interface DesktopRosterAgent {
   profile: string
   targetProfile?: string
   handle: string
+  // False when this source lists the profile but does not serve it.
+  // Absent means the source's own reachable flag.
+  reachable?: boolean
 }
 
 export interface DesktopAgentRoster {

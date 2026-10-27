@@ -3213,6 +3213,7 @@ export const frOverrides = {
     exportNeedsHost: name => `Le navigateur ne peut pas enregistrer une archive de profil. Sur l'hôte Hermes, exécutez : hermes profile export ${name}`,
     allProfiles: 'Tous les profils',
     showAllProfiles: 'Afficher tous les profils',
+    notServedHere: 'Non proposé ici',
     switchToProfile: name => `Basculer vers ${name}`,
     switchToConnection: name => `Basculer vers ${name}`,
     switchConnectionFailed: name => `Impossible de se connecter à ${name}`,
@@ -4123,6 +4124,8 @@ export const frOverrides = {
     versionDetailsBody:
       "Cette installation est gérée hors de l'application. Mettez-la à jour de la même manière que vous l'avez installée.",
     versionDetailsVersion: 'Version',
+    versionDetailsClient: 'Cet appareil',
+    versionDetailsBackend: 'Backend connecté',
     versionDetailsCommit: 'Commit',
     versionDetailsBuildOrigin: 'Origine de la compilation',
     versionDetailsDistribution: 'Distribution',

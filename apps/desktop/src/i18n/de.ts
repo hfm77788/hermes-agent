@@ -3208,6 +3208,7 @@ export const deOverrides = {
     exportNeedsHost: name => `Der Browser kann kein Profilarchiv speichern. Führe auf dem Hermes-Host aus: hermes profile export ${name}`,
     allProfiles: 'Alle Profile',
     showAllProfiles: 'Alle Profile anzeigen',
+    notServedHere: 'Hier nicht bereitgestellt',
     switchToProfile: name => `Zu ${name} wechseln`,
     switchToConnection: name => `Zu ${name} wechseln`,
     switchConnectionFailed: name => `Keine Verbindung zu ${name} möglich`,
@@ -4114,6 +4115,8 @@ export const deOverrides = {
     versionDetailsBody:
       'Diese Installation wird außerhalb der App verwaltet. Aktualisieren Sie sie auf dieselbe Weise, wie Sie sie installiert haben.',
     versionDetailsVersion: 'Version',
+    versionDetailsClient: 'Dieses Gerät',
+    versionDetailsBackend: 'Verbundenes Backend',
     versionDetailsCommit: 'Commit',
     versionDetailsBuildOrigin: 'Build-Ursprung',
     versionDetailsDistribution: 'Distribution',

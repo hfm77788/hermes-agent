@@ -801,6 +801,7 @@ from hermes_cli.web_routers import (
     webapp_access as _webapp_access_routes,
 )
 
+import hermes_cli.web_routers.desktop_plugins as _desktop_plugin_routes
 import hermes_cli.web_routers.uploads as _upload_routes
 from fastapi import Depends as _Depends
 from hermes_cli.web_server_surface import route_on as _route_on
@@ -808,6 +809,7 @@ from hermes_cli.web_server_surface import route_on as _route_on
 app.include_router(_files_routes.router)
 # The Webapp's routes exist only on the surfaces whose policy names them (404 elsewhere).
 app.include_router(_upload_routes.router, dependencies=[_Depends(_route_on("browser_files"))])
+app.include_router(_desktop_plugin_routes.router, dependencies=[_Depends(_route_on("desktop_plugins"))])
 app.include_router(_git_routes.router)
 app.include_router(_local_models_routes.router)
 app.include_router(_status_routes.router)
@@ -1408,6 +1410,8 @@ def start_server(
     until the ready sentinel is written so its SDK import can't hold the GIL
     against the pre-bind path.
     """
+    from hermes_cli.update_proxy_env import restore_user_proxy_env
+    restore_user_proxy_env()  # a backend an update replayed keeps the user's proxy env, not the update's
     _apply_ssh_session_token(ssh_session_token or "")
     _apply_ssh_owner_nonce(ssh_owner_nonce)
 
