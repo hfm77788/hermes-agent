@@ -163,6 +163,13 @@ def runtime_state(repo: Path = REPO, home: Path = HOME) -> dict[str, Any]:
     except Exception:
         pass
     _, head, _ = run(["git", "-C", str(repo), "rev-parse", "HEAD"])
+    # Best-effort refresh of the locally cached origin/main ref before the
+    # drift comparison. The upstream chase pipeline merges + deploys without
+    # touching this checkout's remote-tracking refs, so a stale ref turned a
+    # benign chase deploy into a false high-severity runtime_sha_drift
+    # (2026-10-31 ticket t_aca4e3c7). If the fetch fails we still compare
+    # against the stored ref — real drift must never be hidden.
+    run(["git", "-C", str(repo), "fetch", "--quiet", "origin", "main"], timeout=20)
     _, origin, _ = run(["git", "-C", str(repo), "rev-parse", "origin/main"])
     disk = shutil.disk_usage(home)
     return {

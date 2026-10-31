@@ -306,3 +306,41 @@ def test_persist_writes_latest_and_history(tmp_path):
     assert (tmp_path / "latest.json").exists()
     assert (tmp_path / "history.jsonl").exists()
     assert mod.SCHEMA in (tmp_path / "history.jsonl").read_text()
+
+
+def test_runtime_state_refreshes_origin_ref_before_drift_compare(monkeypatch, tmp_path):
+    # 2026-10-31 ticket t_aca4e3c7: the locally cached origin/main ref had not
+    # been fetched since the chase deploy, so a healthy runtime reported a
+    # false high-severity runtime_sha_drift. runtime_state must refresh
+    # origin/main (best-effort) before comparing SHAs.
+    calls = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        if "fetch" in cmd:
+            return 0, "", ""
+        if cmd[-1] == "HEAD":
+            return 0, "cafe123", ""
+        return 0, "cafe123", ""  # origin/main now matches HEAD
+
+    monkeypatch.setattr(mod, "run", fake_run)
+    state = mod.runtime_state(repo=tmp_path, home=tmp_path)
+    fetch_idx = next(i for i, c in enumerate(calls) if "fetch" in c)
+    origin_idx = next(i for i, c in enumerate(calls) if c[-1] == "origin/main")
+    assert fetch_idx < origin_idx
+    assert state["runtime_sha"] == state["origin_main_sha"]
+
+
+def test_runtime_state_falls_back_to_stored_ref_when_fetch_fails(monkeypatch, tmp_path):
+    # A failed fetch must never hide real drift: the comparison against the
+    # stored ref still runs.
+    def fake_run(cmd, **_kwargs):
+        if "fetch" in cmd:
+            return -1, "", "NetworkError"
+        if cmd[-1] == "HEAD":
+            return 0, "aaa", ""
+        return 0, "bbb", ""
+
+    monkeypatch.setattr(mod, "run", fake_run)
+    state = mod.runtime_state(repo=tmp_path, home=tmp_path)
+    assert state["runtime_sha"] != state["origin_main_sha"]
