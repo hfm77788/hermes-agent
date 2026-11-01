@@ -22,6 +22,10 @@ def publish_one(payload: dict, *, store_path: Path) -> dict:
         ClosedLoopTaskStore(store_path), goal=payload["goal"],
         profile="auto", priority="normal", confirm_full_delivery=False,
         idempotency_key=key,
+        **({
+            "source_chat_id": payload["chat_id"],
+            "source_message_id": payload["message_id"],
+        } if payload["chat_id"] == "oc_b044615532e0d934ae8198743707549c" else {}),
     )
     return {"task_id": result["task_id"], "profile": result["profile"],
             "idempotent_replay": bool(result.get("idempotent_replay"))}
