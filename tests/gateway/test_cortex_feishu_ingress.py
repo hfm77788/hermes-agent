@@ -156,3 +156,84 @@ def test_unparseable_registry_fails_closed(owner_group, monkeypatch, tmp_path):
     assert ingress.authenticated_goal(
         owner_group, "这是一次性任务，请分析", "om_x1234567890abc"
     ) is None
+
+@pytest.fixture
+def wechat_owner_group(tmp_path, monkeypatch):
+    p = tmp_path / "registry.yaml"
+    p.write_text("""
+workspaces:
+  - chat_id: oc_cortex_group
+    chat_name: GPT 河马协作群
+    status: active
+    boss_open_id: ou_owner
+    cortex_direct_dispatch: true
+  - chat_id: oc_wechat_secretary
+    chat_name: 微信 ai 秘书
+    status: active
+    boss_open_id: ou_director_app_owner
+    seat_binding: director
+    cortex_direct_dispatch: true
+""", encoding="utf-8")
+    monkeypatch.setattr(ingress, "_REGISTRY", p)
+    return {
+        "platform": "feishu", "chat_type": "group",
+        "chat_id": "oc_wechat_secretary", "user_id": "ou_director_app_owner",
+    }
+
+
+def test_wechat_secretary_owner_task_admitted(wechat_owner_group):
+    got = ingress.authenticated_goal(
+        wechat_owner_group, "任务：只读检查微信秘书健康", "om_x1234567890abc"
+    )
+    assert got == {
+        "chat_id": "oc_wechat_secretary",
+        "message_id": "om_x1234567890abc",
+        "goal": "任务：只读检查微信秘书健康",
+    }
+
+
+@pytest.mark.parametrize("change", [
+    {"user_id": "ou_another"},
+    {"chat_id": "oc_cortex_group"},
+    {"chat_type": "dm"},
+    {"is_bot": True},
+])
+def test_wechat_owner_rejects_wrong_source(wechat_owner_group, change):
+    assert ingress.authenticated_goal(
+        {**wechat_owner_group, **change}, "任务：只读检查", "om_x1234567890abc"
+    ) is None
+
+
+@pytest.mark.parametrize("message", ["你好", "请解释一段技术", "/retry", ""])
+def test_wechat_secretary_chat_not_published(wechat_owner_group, message):
+    assert ingress.authenticated_goal(
+        wechat_owner_group, message, "om_x1234567890abc"
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_wechat_secretary_publisher_replay_shows_same_id(
+    wechat_owner_group, monkeypatch
+):
+    class Process:
+        returncode = 0
+        async def communicate(self, body):
+            obj = json.loads(body)
+            assert obj["chat_id"] == "oc_wechat_secretary"
+            assert obj["message_id"] == "om_x1234567890abc"
+            return json.dumps({
+                "task_id": "gpt-inbox-agent-cortex-1234567890abcd123456",
+                "profile": "general", "idempotent_replay": True,
+            }).encode(), b""
+    monkeypatch.setattr(
+        ingress.asyncio, "create_subprocess_exec",
+        AsyncMock(return_value=Process()),
+    )
+    result = await ingress.maybe_publish_owner_goal(
+        platform="feishu", source=wechat_owner_group,
+        text="每天：只读核查健康", message_id="om_x1234567890abc",
+    )
+    assert "gpt-inbox-agent-cortex-1234567890abcd123456" in result["reply"]
+    assert "复用已有任务" in result["reply"]
+    assert "等待真实领取" in result["reply"]
+    assert "已完成" not in result["reply"]

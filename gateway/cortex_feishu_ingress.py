@@ -21,7 +21,7 @@ _WORKER = Path(__file__).with_name("cortex_feishu_publish.py")
 _TASK_INTENT = re.compile(
     r"^\s*(?:这是一次性任务|任务\s*[:：]|请(?:帮我|让|安排|执行|处理|检查|分析|生成|完成)"
     r"|帮我|安排|执行|处理|每天|每日|每周|每月|每小时|定期|一次性任务)",
-    re.I,
+    re.IGNORECASE,
 )
 
 
@@ -46,7 +46,7 @@ def authenticated_goal(source: dict, text: str, message_id: str) -> dict | None:
             return None
         matches = [g for g in groups if isinstance(g, dict)
                    and g.get("chat_id") == source.get("chat_id")
-                   and g.get("chat_name") == "GPT 河马协作群"]
+                   and g.get("chat_name") in {"GPT 河马协作群", "微信 ai 秘书"}]
         if len(matches) != 1:
             return None
         group = matches[0]
@@ -108,10 +108,16 @@ async def maybe_publish_owner_goal(*, platform: str, source: dict, text: str,
             raise ValueError("invalid_cortex_task_id")
         logger.info("Cortex Feishu publication acknowledged: task_id=%s replay=%s",
                     task_id, bool(result.get("idempotent_replay")))
+        # The durable ID is the only authoritative receipt. Registration
+        # is not execution or business verification, and replay is not
+        # another task.
+        replay = "（原消息重复投递，复用已有任务）" if result.get("idempotent_replay") else ""
+        if result["profile"] == "chat_handoff":
+            status = "一次性任务已登记，等待接管（须由专项 GPT Chat 真实激活）；未执行、未验收。"
+        else:
+            status = "周期任务已登记到原 General Worker 队列；等待真实领取、执行与验收。"
         return {"action": "handled",
-                "reply": ("已受理：专项 GPT Chat 任务已持久登记，等待接管与结果回写。"
-                          if result["profile"] == "chat_handoff"
-                          else "已受理：周期任务已进入 General Worker 队列。")}
+                "reply": f"已受理{replay}。任务编号：{task_id}。{status}"}
     except asyncio.CancelledError:
         raise
     except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
