@@ -206,8 +206,9 @@ async def test_background_enqueue_coalesces_per_session_and_preserves_storage():
     first = runner._hmwa_enqueue_background_hygiene(None, entry, "key", history, config)
     second = runner._hmwa_enqueue_background_hygiene(None, entry, "key", history, config)
     assert len(runner._hygiene_background_jobs) == 1
-    assert len(first) < len(history) and len(second) < len(history)
-    assert first[-1] is history[-1]
+    # Until a real summary commits, earlier facts cannot disappear silently.
+    assert first is history and second is history
+    assert first[0] is history[0] and first[-1] is history[-1]
     assert history == original
     await asyncio.wait_for(started.wait(), 2)
     assert len(calls) == 1
@@ -251,7 +252,7 @@ async def test_deferred_commit_rebuilds_cache_and_usage_only_on_next_turn():
     runner = object.__new__(gateway_run.GatewayRunner)
     runner._session_db = None
     runner._evict_cached_agent = MagicMock()
-    runner._hygiene_background_rebuild = {"key"}
+    runner._hygiene_background_rebuild = {"key": "sess"}
     entry = SimpleNamespace(session_id="sess", last_prompt_tokens=205000)
     history = [{"role": "user", "content": "small"} for _ in range(6)]
     result = runner._hmwa_enqueue_background_hygiene(
@@ -260,7 +261,7 @@ async def test_deferred_commit_rebuilds_cache_and_usage_only_on_next_turn():
     assert result is history
     assert entry.session_id == "sess"
     assert entry.last_prompt_tokens == 0
-    assert runner._hygiene_background_rebuild == set()
+    assert runner._hygiene_background_rebuild == {}
     runner._evict_cached_agent.assert_called_once_with("key")
     assert getattr(runner, "_hygiene_background_jobs", {}) == {}
 
@@ -269,7 +270,7 @@ async def test_deferred_commit_rebuilds_cache_and_usage_only_on_next_turn():
 async def test_short_next_turn_still_consumes_fenced_summary_rebuild():
     gateway_run = importlib.import_module("gateway.run")
     runner = object.__new__(gateway_run.GatewayRunner)
-    runner._hygiene_background_rebuild = {"key"}
+    runner._hygiene_background_rebuild = {"key": "original"}
     runner._evict_cached_agent = MagicMock()
     entry = SimpleNamespace(session_id="original", last_prompt_tokens=210000)
     tiny = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "summary"}]
@@ -279,6 +280,42 @@ async def test_short_next_turn_still_consumes_fenced_summary_rebuild():
     assert entry.last_prompt_tokens == 0
     runner._evict_cached_agent.assert_called_once_with("key")
     assert not runner._hygiene_background_rebuild
+
+
+@pytest.mark.asyncio
+async def test_background_payload_keeps_uncompressed_old_commitments():
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    old = {"role": "user", "content": "Important commitment from months ago: keep the grant application."}
+    history = [old] + [
+        {"role": "assistant", "content": "large but uncompressed " * 900}
+        for _ in range(110)
+    ] + [{"role": "user", "content": "Continue the grant application."}]
+    assert runner._hmwa_background_model_tail(history, {}) is history
+    # The original hard limit still bounds pathological message counts,
+    # without rewriting or deleting any durable history row.
+    very_long = [old] + [{"role": "assistant", "content": str(i)} for i in range(5001)]
+    bounded = runner._hmwa_background_model_tail(very_long, {})
+    assert bounded is not very_long
+    assert len(bounded) <= 5000
+    assert len(very_long) == 5002
+    assert bounded[-1] is very_long[-1]
+
+
+@pytest.mark.asyncio
+async def test_background_rebuild_does_not_cross_session_rotation():
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._session_db = None
+    runner._evict_cached_agent = MagicMock()
+    runner._hygiene_background_rebuild = {"key": "outdated-session"}
+    entry = SimpleNamespace(session_id="new-session", last_prompt_tokens=32000)
+    history = [{"role": "user", "content": "new conversation"} for _ in range(5)]
+    result = runner._hmwa_enqueue_background_hygiene(None, entry, "key", history, {})
+    assert result is history
+    assert entry.last_prompt_tokens == 32000
+    assert runner._hygiene_background_rebuild == {}
+    runner._evict_cached_agent.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -321,7 +358,7 @@ async def test_background_commit_never_rebinds_or_evicts_live_session(monkeypatc
     assert entry.session_id == "session-unchanged"
     assert entry.last_prompt_tokens == 250000
     runner._evict_cached_agent.assert_not_called()
-    assert runner._hygiene_background_rebuild == {"key"}
+    assert runner._hygiene_background_rebuild == {"key": "session-unchanged"}
     runner._hmwa_hygiene_record_failure_cooldown.assert_not_awaited()
     runner._cleanup_agent_resources_off_loop.assert_awaited_once()
 
