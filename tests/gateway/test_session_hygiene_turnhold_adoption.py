@@ -199,7 +199,7 @@ async def test_background_enqueue_coalesces_per_session_and_preserves_storage():
         await release.wait()
 
     runner._hmwa_hygiene_background_once = blocked
-    entry = SimpleNamespace(session_id="same-session")
+    entry = SimpleNamespace(session_id="same-session", last_prompt_tokens=190000)
     history = [{"role": "user", "content": "z" * 9000} for _ in range(80)]
     original = list(history)
     config = {"model": {"context_length": 200000}}
@@ -211,6 +211,12 @@ async def test_background_enqueue_coalesces_per_session_and_preserves_storage():
     assert history == original
     await asyncio.wait_for(started.wait(), 2)
     assert len(calls) == 1
+    # Concurrent foreground mutation must never re-target an admitted background worker.
+    assert calls[0][1] is not entry
+    entry.session_id = "rotated-during-turn"
+    entry.last_prompt_tokens = 1
+    assert calls[0][1].session_id == "same-session"
+    assert calls[0][1].last_prompt_tokens == 190000
     release.set()
     await asyncio.wait_for(next(iter(runner._hygiene_background_jobs.values())), 2)
     await asyncio.sleep(0)
