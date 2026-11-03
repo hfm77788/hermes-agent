@@ -239,6 +239,22 @@ async def test_deferred_commit_rebuilds_cache_and_usage_only_on_next_turn():
 
 
 @pytest.mark.asyncio
+async def test_short_next_turn_still_consumes_fenced_summary_rebuild():
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._hygiene_background_rebuild = {"key"}
+    runner._evict_cached_agent = MagicMock()
+    entry = SimpleNamespace(session_id="original", last_prompt_tokens=210000)
+    tiny = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "summary"}]
+    result = await runner._hmwa_run_session_hygiene(None, None, entry, "key", tiny, "q", 1)
+    assert result is tiny
+    assert entry.session_id == "original"
+    assert entry.last_prompt_tokens == 0
+    runner._evict_cached_agent.assert_called_once_with("key")
+    assert not runner._hygiene_background_rebuild
+
+
+@pytest.mark.asyncio
 async def test_background_commit_never_rebinds_or_evicts_live_session(monkeypatch):
     gateway_run = importlib.import_module("gateway.run")
     runner = object.__new__(gateway_run.GatewayRunner)
