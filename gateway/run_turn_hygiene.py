@@ -105,13 +105,14 @@ class GatewayTurnHygieneMixin:
             provider=None, base_url=None, api_key=None, data={},
         )
         try:
-            hs.data = _load_gateway_config()
+            hs.data = await asyncio.to_thread(_load_gateway_config)
             if hs.data:
                 self._hmwa_hygiene_read_config(hs, hs.data)
             configured_model, configured_provider, configured_base_url = hs.model, hs.provider, hs.base_url
 
             with suppress(Exception):
-                hs.model, _hyg_runtime = self._resolve_session_agent_runtime(
+                hs.model, _hyg_runtime = await asyncio.to_thread(
+                    self._resolve_session_agent_runtime,
                     source=source, session_key=session_key,
                     user_config=hs.data if isinstance(hs.data, dict) else None,
                 )
@@ -189,7 +190,8 @@ class GatewayTurnHygieneMixin:
             if session_entry.last_prompt_tokens <= 0:
                 from agent.usage_anchor import persisted_anchor_tokens
                 _session_db = getattr(self, "_session_db", None)
-                _anchored = persisted_anchor_tokens(
+                _anchored = await asyncio.to_thread(
+                    persisted_anchor_tokens,
                     getattr(_session_db, "_db", _session_db), session_entry.session_id, history,
                 )
             if session_entry.last_prompt_tokens > 0:
@@ -197,7 +199,9 @@ class GatewayTurnHygieneMixin:
             elif _anchored is not None:
                 _approx_tokens, _token_source = _anchored, "anchored"
             else:
-                _approx_tokens, _token_source = estimate_messages_tokens_rough(history), "estimated"
+                _approx_tokens, _token_source = await asyncio.to_thread(
+                    estimate_messages_tokens_rough, history,
+                ), "estimated"
 
         # Hard safety valve: force compression at an extreme message count regardless of tokens,
         # breaking the disconnect → no token data → no compression spiral. 5000 clears 1M+ sessions.
@@ -832,7 +836,8 @@ class GatewayTurnHygieneMixin:
             plan = await self._hmwa_hygiene_plan(hs, history, session_entry, session_key)
             if not plan.needs_compress:
                 return
-            model, runtime = self._resolve_session_agent_runtime(
+            model, runtime = await asyncio.to_thread(
+                self._resolve_session_agent_runtime,
                 source=source, session_key=session_key,
                 user_config=hs.data if isinstance(hs.data, dict) else None,
             )
@@ -901,6 +906,9 @@ class GatewayTurnHygieneMixin:
         rebuild = getattr(self, "_hygiene_background_rebuild", None)
         if isinstance(rebuild, set) and session_key in rebuild:
             rebuild.discard(session_key)
+            # Deferred commit never mutates the in-flight turn. Clear the old
+            # usage anchor only at this next serialized session entry.
+            session_entry.last_prompt_tokens = 0
             self._evict_cached_agent(session_key)
         if getattr(self, "_session_db", None) is not None:
             jobs = getattr(self, "_hygiene_background_jobs", None)
