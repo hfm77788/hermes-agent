@@ -697,7 +697,10 @@ class GatewayTurnHygieneMixin:
         _hyg_checkpoint_required = _is_truthy(
             ((_load_cfg() or {}).get("compression") or {}).get("checkpoint_required"), default=False,
         )
-        _hyg_agent = AIAgent(
+        # Agent initialization may load providers and cache state; never run it on the
+        # foreground event loop when hygiene is scheduled as background work.
+        _hyg_agent = await asyncio.to_thread(
+            AIAgent,
             **_hyg_runtime, model=_hyg_model, max_iterations=4, quiet_mode=True,
             skip_memory=not _hyg_checkpoint_required, enabled_toolsets=["memory"],
             session_id=session_entry.session_id, session_db=_hyg_session_db,
@@ -775,6 +778,155 @@ class GatewayTurnHygieneMixin:
             if not attempt.cleanup_deferred:
                 await self._cleanup_agent_resources_off_loop(_hyg_agent, context="session hygiene")
 
+    @staticmethod
+    def _hmwa_background_model_tail(history, config):
+        """A payload-only conservative tail while the complete history is compressed elsewhere.
+
+        Does not mutate or rewrite the persisted transcript. A bounded view also keeps the
+        agent's own preflight compressor from waiting on the full oversized history.
+        """
+        from gateway.run_turn import bound_model_input_without_hygiene
+        comp = config.get("compression") if isinstance(config, dict) else None
+        comp = comp if isinstance(comp, dict) else {}
+        try:
+            max_rows = max(2, min(5000, int(comp.get("hygiene_hard_message_limit", 5000))))
+        except (ValueError, TypeError):
+            max_rows = 5000
+        model = config.get("model") if isinstance(config, dict) else {}
+        model = model if isinstance(model, dict) else {}
+        try:
+            context_limit = max(8192, int(model.get("context_length") or 200000))
+        except (ValueError, TypeError):
+            context_limit = 200000
+        budget = min(60000, max(2048, context_limit // 4))
+        rows, tokens = 0, 0
+        for message in reversed(history):
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, str):
+                cost = max(64, (len(content) + 2) // 3)
+            elif isinstance(content, list):
+                cost = max(2048, 2048 * len(content))
+            else:
+                cost = 512
+            if rows and tokens + cost > budget:
+                break
+            rows += 1
+            tokens += cost
+            if rows >= max_rows:
+                break
+        return bound_model_input_without_hygiene(history, max(2, rows))
+
+    async def _hmwa_hygiene_background_once(self, source, session_entry, session_key, history):
+        """Do all model/DB work off the foreground path; commit only via DB watermark fence.
+
+        Never rebind a live SessionEntry or evict an agent during a running turn. The
+        next serialized turn evicts the cache after a verified in-place commit.
+        """
+        from agent.conversation_compression import CompressionCommitFence
+        from gateway.run import _reset_hygiene_failure_streak
+        agent = future = fence = None
+        try:
+            hs = await self._hmwa_hygiene_settings(source, session_key)
+            if not hs.compression_enabled:
+                return
+            plan = await self._hmwa_hygiene_plan(hs, history, session_entry, session_key)
+            if not plan.needs_compress:
+                return
+            model, runtime = self._resolve_session_agent_runtime(
+                source=source, session_key=session_key,
+                user_config=hs.data if isinstance(hs.data, dict) else None,
+            )
+            if str(runtime.get("api_mode") or "").lower() == "codex_app_server":
+                # A server-side Codex thread cannot be compacted with a detached local agent.
+                return
+            messages = [m for m in history if isinstance(m, dict)
+                        and m.get("role") in {"user", "assistant", "tool"}]
+            if not runtime.get("api_key") or len(messages) < 4:
+                return
+            agent, db = await self._hmwa_hygiene_build_agent(model, runtime, session_entry)
+            agent.compression_in_place = True
+            binder = getattr(getattr(agent, "context_compressor", None), "bind_session_state", None)
+            if callable(binder):
+                binder(db, session_entry.session_id)
+            agent._end_session_on_close = False
+            agent._print_fn = lambda *_a, **_kw: None
+            fence = CompressionCommitFence(total_ceiling_seconds=hs.total_ceiling_seconds)
+            loop = asyncio.get_running_loop()
+            future = loop.run_in_executor(
+                None, copy_context().run,
+                lambda: agent._compress_context(
+                    messages, "", approx_tokens=plan.approx_tokens,
+                    commit_fence=fence, task_id=session_entry.session_id or "default",
+                    trigger="gateway_hygiene",
+                ),
+            )
+            self._track_deferred_agent_worker(future, agent)
+            await asyncio.wait_for(asyncio.shield(future), timeout=hs.total_ceiling_seconds)
+            if (fence.commit_watermark_fenced
+                    and bool(getattr(agent, "_last_compaction_in_place", False))):
+                rebuild = getattr(self, "_hygiene_background_rebuild", None)
+                if rebuild is None:
+                    rebuild = self._hygiene_background_rebuild = set()
+                rebuild.add(session_key)
+                await asyncio.to_thread(_reset_hygiene_failure_streak, self, session_key)
+                logger.info("Session hygiene background summary committed under watermark fence for %s",
+                            session_entry.session_id)
+            else:
+                await self._hmwa_hygiene_record_failure_cooldown(
+                    hs, session_key, session_entry.session_id,
+                    "background hygiene finished without a watermark-fenced in-place commit",
+                )
+        except asyncio.CancelledError:
+            if fence is not None:
+                fence.revoke_commit_admission()
+            raise
+        except (Exception, TimeoutError) as exc:
+            if fence is not None:
+                fence.revoke_commit_admission()
+            logger.warning("Background session hygiene did not finish: %s", type(exc).__name__)
+        finally:
+            if agent is not None:
+                if future is not None and not future.done():
+                    attempt = self._HygieneAttempt(agent=agent, future=future)
+                    self._hmwa_hygiene_defer_cleanup(attempt, "background session hygiene")
+                else:
+                    await self._cleanup_agent_resources_off_loop(
+                        agent, context="background session hygiene",
+                    )
+
+    def _hmwa_enqueue_background_hygiene(
+        self, source, session_entry, session_key, history, config,
+    ):
+        """Queue once per live session and return bounded model input without awaiting work."""
+        rebuild = getattr(self, "_hygiene_background_rebuild", None)
+        if isinstance(rebuild, set) and session_key in rebuild:
+            rebuild.discard(session_key)
+            self._evict_cached_agent(session_key)
+        if getattr(self, "_session_db", None) is not None:
+            jobs = getattr(self, "_hygiene_background_jobs", None)
+            if jobs is None:
+                jobs = self._hygiene_background_jobs = {}
+            sid = str(session_entry.session_id)
+            running = jobs.get(sid)
+            if running is None or running.done():
+                task = asyncio.create_task(
+                    self._hmwa_hygiene_background_once(
+                        source, session_entry, session_key, list(history),
+                    )
+                )
+                jobs[sid] = task
+                self._track_deferred_agent_worker(task, None)
+
+                def _finished(done, *, _sid=sid, _jobs=jobs):
+                    if _jobs.get(_sid) is done:
+                        _jobs.pop(_sid, None)
+                    if not done.cancelled():
+                        with suppress(Exception):
+                            done.exception()
+
+                task.add_done_callback(_finished)
+        return self._hmwa_background_model_tail(history, config)
+
     async def _hmwa_run_session_hygiene(
         self, event, source, session_entry, session_key, history, _quick_key, run_generation,
     ):
@@ -784,6 +936,20 @@ class GatewayTurnHygieneMixin:
         from gateway.run import HygieneTurnHoldExceeded
         if not history or len(history) < 4:
             return history
+
+        # Strict opt-in, off by default. Frontend never awaits model metadata, provider
+        # initialization, or the summary worker in this mode.
+        from gateway.run import _load_gateway_config
+        try:
+            _early_cfg = _load_gateway_config()
+            _compression_cfg = (_early_cfg.get("compression") or {}) if isinstance(_early_cfg, dict) else {}
+            _async_only = isinstance(_compression_cfg, dict) and _compression_cfg.get("hygiene_background_only") is True
+        except Exception:
+            _early_cfg, _async_only = {}, False
+        if _async_only:
+            return self._hmwa_enqueue_background_hygiene(
+                source, session_entry, session_key, history, _early_cfg,
+            )
 
         hs = await self._hmwa_hygiene_settings(source, session_key)
         # Hygiene can never land with compression disabled; a sub-limit transcript is the identity (#111988).
