@@ -48,7 +48,8 @@ def _defer_optional_hygiene_to_gateway(agent: Any, request_tokens: Any) -> bool:
     """
     if getattr(agent, "_gateway_background_hygiene_only", False) is not True:
         return False
-    if getattr(agent, "_persist_disabled", False):
+    if (getattr(agent, "_persist_disabled", False)
+            or getattr(agent, "compression_enabled", False) is not True):
         return False
     from agent.conversation_compression import request_exceeds_model_window
     if request_exceeds_model_window(agent, request_tokens) is not False:
