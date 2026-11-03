@@ -225,6 +225,27 @@ async def test_background_enqueue_coalesces_per_session_and_preserves_storage():
 
 
 @pytest.mark.asyncio
+async def test_background_admission_caps_parallel_jobs_without_blocking_foreground():
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._session_db = object()
+    runner._evict_cached_agent = MagicMock()
+    runner._track_deferred_agent_worker = MagicMock()
+    loop = asyncio.get_running_loop()
+    runner._hygiene_background_jobs = {str(i): loop.create_future() for i in range(4)}
+    history = [{"role": "user", "content": "history"} for _ in range(6)]
+    start = time.monotonic()
+    result = runner._hmwa_enqueue_background_hygiene(
+        None, SimpleNamespace(session_id="fifth", last_prompt_tokens=250000),
+        "key", history, {},
+    )
+    assert time.monotonic() - start < 0.1
+    assert result is history
+    assert len(runner._hygiene_background_jobs) == 4
+    runner._track_deferred_agent_worker.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_deferred_commit_rebuilds_cache_and_usage_only_on_next_turn():
     gateway_run = importlib.import_module("gateway.run")
     runner = object.__new__(gateway_run.GatewayRunner)
