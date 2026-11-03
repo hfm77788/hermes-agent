@@ -364,6 +364,63 @@ async def test_background_commit_never_rebinds_or_evicts_live_session(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_background_late_commit_refreshes_next_turn_without_waiting(monkeypatch):
+    """An admitted commit finishing after the host timeout still marks safe rehydration."""
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._track_deferred_agent_worker = MagicMock()
+    runner._hmwa_hygiene_defer_cleanup = MagicMock()
+    runner._cleanup_agent_resources_off_loop = AsyncMock()
+    runner._hmwa_hygiene_settings = AsyncMock(return_value=SimpleNamespace(
+        compression_enabled=True, total_ceiling_seconds=0.025,
+        failure_cooldown_seconds=30.0, data={},
+    ))
+    runner._hmwa_hygiene_plan = AsyncMock(return_value=SimpleNamespace(
+        needs_compress=True, approx_tokens=230000,
+    ))
+    runner._resolve_session_agent_runtime = MagicMock(
+        return_value=("test-model", {"api_key": "fake"}),
+    )
+    worker_started = threading.Event()
+    release_commit = threading.Event()
+    agent = SimpleNamespace(
+        context_compressor=SimpleNamespace(bind_session_state=MagicMock()),
+        session_id="same-sid", _last_compaction_in_place=False,
+    )
+
+    def late_commit(_messages, _prompt, **kwargs):
+        fence = kwargs["commit_fence"]
+        fence.mark_commit_watermark_fenced()
+        assert fence.begin_commit()
+        worker_started.set()
+        assert release_commit.wait(3)
+        agent._last_compaction_in_place = True
+        fence.finish_commit()
+        return ([{"role": "assistant", "content": "summary"}], None)
+
+    agent._compress_context = late_commit
+    runner._hmwa_hygiene_build_agent = AsyncMock(return_value=(agent, object()))
+    runner._hmwa_hygiene_record_failure_cooldown = AsyncMock()
+    entry = SimpleNamespace(session_id="same-sid", last_prompt_tokens=230000)
+    try:
+        await asyncio.wait_for(runner._hmwa_hygiene_background_once(
+            None, entry, "same-key",
+            [{"role": "user", "content": "history"} for _ in range(6)],
+        ), timeout=0.3)
+        assert worker_started.is_set()
+        assert entry.last_prompt_tokens == 230000
+        assert not getattr(runner, "_hygiene_background_rebuild", {})
+    finally:
+        release_commit.set()
+    for _ in range(30):
+        if getattr(runner, "_hygiene_background_rebuild", {}) == {"same-key": "same-sid"}:
+            break
+        await asyncio.sleep(0.01)
+    assert runner._hygiene_background_rebuild == {"same-key": "same-sid"}
+    runner._hmwa_hygiene_defer_cleanup.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     monkeypatch, tmp_path
 ):
