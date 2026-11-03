@@ -942,6 +942,13 @@ class GatewayTurnHygieneMixin:
         histories don't cause repeated truncation/context failures. Token source: the API's
         prompt_tokens from the last turn, else a char/4 estimate."""
         from gateway.run import HygieneTurnHoldExceeded
+        # Consume a completed fenced commit at the first serialized turn entry.
+        # Even a short post-summary history (<4 rows) must invalidate the stale cache.
+        _rebuild = getattr(self, "_hygiene_background_rebuild", None)
+        if isinstance(_rebuild, set) and session_key in _rebuild:
+            _rebuild.discard(session_key)
+            session_entry.last_prompt_tokens = 0
+            self._evict_cached_agent(session_key)
         if not history or len(history) < 4:
             return history
 
