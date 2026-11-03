@@ -2243,6 +2243,19 @@ def init_agent(
         )
         _agent_cfg = {}
 
+    # The Gateway has its own fenced background hygiene worker. For a durable
+    # messaging session opting into that worker, opportunistic in-agent
+    # compression must not block the active tool loop. CLI, subagents and
+    # persistence-disabled forks retain their existing synchronous semantics.
+    _background_hygiene_cfg = _cfg_dict(_agent_cfg, "compression")
+    _gateway_platform = str(getattr(agent, "platform", "") or "").lower()
+    agent._gateway_background_hygiene_only = (
+        _background_hygiene_cfg.get("hygiene_background_only") is True
+        and session_db is not None
+        and _gateway_platform not in {"", "none", "cli", "local"}
+        and not bool(getattr(agent, "_persist_disabled", False))
+    )
+
     _apply_display_config(agent, _agent_cfg, platform)
     _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=memory_manager)
     _apply_agent_section(agent, _agent_cfg)
