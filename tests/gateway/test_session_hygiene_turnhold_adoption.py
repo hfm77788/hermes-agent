@@ -146,8 +146,8 @@ def _install_fakes(monkeypatch, gateway_run, tmp_path, agent_cls):
         gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"}
     )
     monkeypatch.setattr(
-        "agent.model_metadata.get_model_context_length",
-        lambda *_args, **_kwargs: 100,
+        "agent.model_metadata.get_model_context_length_async",
+        AsyncMock(return_value=100),
     )
 
 
