@@ -51,7 +51,16 @@ def _defer_optional_hygiene_to_gateway(agent: Any, request_tokens: Any) -> bool:
     if getattr(agent, "_persist_disabled", False):
         return False
     from agent.conversation_compression import request_exceeds_model_window
-    return request_exceeds_model_window(agent, request_tokens) is False
+    if request_exceeds_model_window(agent, request_tokens) is not False:
+        return False
+    # A nominal window edge is not sufficient: model schemas, system tokens
+    # and provider accounting add overhead not represented by rough estimates.
+    # Keep >=10% headroom for the last on-wire request; else use the original
+    # synchronous recovery/fail-closed safety gate instead of optimistic defer.
+    window = getattr(getattr(agent, "context_compressor", None), "context_length", 0)
+    return (isinstance(request_tokens, int) and not isinstance(request_tokens, bool)
+            and isinstance(window, int) and not isinstance(window, bool)
+            and request_tokens * 10 <= window * 9)
 
 
 
