@@ -15,6 +15,7 @@ from agent.i18n import t
 from agent.session_activity import format_iteration_progress
 from contextlib import nullcontext, suppress
 from contextvars import copy_context
+from types import SimpleNamespace
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
@@ -917,9 +918,15 @@ class GatewayTurnHygieneMixin:
             sid = str(session_entry.session_id)
             running = jobs.get(sid)
             if running is None or running.done():
+                # Background work must never dereference a mutable live SessionEntry
+                # after admission. The foreground can rotate or update its row mid-turn.
+                frozen_entry = SimpleNamespace(
+                    session_id=session_entry.session_id,
+                    last_prompt_tokens=getattr(session_entry, "last_prompt_tokens", 0),
+                )
                 task = asyncio.create_task(
                     self._hmwa_hygiene_background_once(
-                        source, session_entry, session_key, list(history),
+                        source, frozen_entry, session_key, list(history),
                     )
                 )
                 jobs[sid] = task
