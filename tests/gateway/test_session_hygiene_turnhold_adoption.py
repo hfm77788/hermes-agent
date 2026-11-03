@@ -161,6 +161,109 @@ async def _drain_deferred(runner, timeout=10.0):
 
 
 @pytest.mark.asyncio
+async def test_background_only_frontend_never_awaits_hygiene_planning(monkeypatch):
+    """Even a blocked model-metadata planner cannot hold the foreground turn."""
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    history = [{"role": "user", "content": "hello"} for _ in range(6)]
+    entry = SimpleNamespace(session_id="safe-session")
+    marker = MagicMock(return_value=history)
+    runner._hmwa_enqueue_background_hygiene = marker
+    runner._hmwa_hygiene_settings = AsyncMock(side_effect=AssertionError("foreground planned"))
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {
+        "compression": {"hygiene_background_only": True},
+    })
+    start = time.monotonic()
+    result = await asyncio.wait_for(
+        runner._hmwa_run_session_hygiene(None, None, entry, "key", history, "q", 1),
+        timeout=0.2,
+    )
+    assert time.monotonic() - start < 0.1
+    assert result is history
+    marker.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_background_enqueue_coalesces_per_session_and_preserves_storage():
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._session_db = object()
+    runner._track_deferred_agent_worker = MagicMock()
+    runner._evict_cached_agent = MagicMock()
+    started, release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def blocked(*args):
+        calls.append(args)
+        started.set()
+        await release.wait()
+
+    runner._hmwa_hygiene_background_once = blocked
+    entry = SimpleNamespace(session_id="same-session")
+    history = [{"role": "user", "content": "z" * 9000} for _ in range(80)]
+    original = list(history)
+    config = {"model": {"context_length": 200000}}
+    first = runner._hmwa_enqueue_background_hygiene(None, entry, "key", history, config)
+    second = runner._hmwa_enqueue_background_hygiene(None, entry, "key", history, config)
+    assert len(runner._hygiene_background_jobs) == 1
+    assert len(first) < len(history) and len(second) < len(history)
+    assert first[-1] is history[-1]
+    assert history == original
+    await asyncio.wait_for(started.wait(), 2)
+    assert len(calls) == 1
+    release.set()
+    await asyncio.wait_for(next(iter(runner._hygiene_background_jobs.values())), 2)
+    await asyncio.sleep(0)
+    assert not runner._hygiene_background_jobs
+    runner._evict_cached_agent.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_background_commit_never_rebinds_or_evicts_live_session(monkeypatch):
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._track_deferred_agent_worker = MagicMock()
+    runner._cleanup_agent_resources_off_loop = AsyncMock()
+    runner._hmwa_hygiene_settings = AsyncMock(return_value=SimpleNamespace(
+        compression_enabled=True, total_ceiling_seconds=5.0,
+        failure_cooldown_seconds=30.0, data={},
+    ))
+    runner._hmwa_hygiene_plan = AsyncMock(return_value=SimpleNamespace(
+        needs_compress=True, approx_tokens=250000,
+    ))
+    runner._resolve_session_agent_runtime = MagicMock(return_value=(
+        "test-model", {"api_key": "fake"},
+    ))
+    runner._evict_cached_agent = MagicMock()
+    runner._hmwa_hygiene_record_failure_cooldown = AsyncMock()
+    agent = SimpleNamespace(
+        context_compressor=SimpleNamespace(bind_session_state=MagicMock()),
+        session_id="session-unchanged", _last_compaction_in_place=False,
+    )
+
+    def compact(_messages, _prompt, **kwargs):
+        fence = kwargs["commit_fence"]
+        fence.mark_commit_watermark_fenced()
+        assert fence.begin_commit()
+        agent._last_compaction_in_place = True
+        fence.finish_commit()
+        return ([{"role": "assistant", "content": "summary"}], None)
+
+    agent._compress_context = compact
+    runner._hmwa_hygiene_build_agent = AsyncMock(return_value=(agent, object()))
+    monkeypatch.setattr(gateway_run, "_reset_hygiene_failure_streak", MagicMock())
+    entry = SimpleNamespace(session_id="session-unchanged", last_prompt_tokens=250000)
+    history = [{"role": "user", "content": "history"} for _ in range(6)]
+    await runner._hmwa_hygiene_background_once(None, entry, "key", history)
+    assert entry.session_id == "session-unchanged"
+    assert entry.last_prompt_tokens == 250000
+    runner._evict_cached_agent.assert_not_called()
+    assert runner._hygiene_background_rebuild == {"key"}
+    runner._hmwa_hygiene_record_failure_cooldown.assert_not_awaited()
+    runner._cleanup_agent_resources_off_loop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     monkeypatch, tmp_path
 ):
