@@ -2252,6 +2252,7 @@ def init_agent(
     agent._gateway_background_hygiene_only = (
         _background_hygiene_cfg.get("hygiene_background_only") is True
         and session_db is not None
+        and bool(getattr(agent, "_gateway_session_key", None))
         and _gateway_platform not in {"", "none", "cli", "local"}
         and not bool(getattr(agent, "_persist_disabled", False))
     )
