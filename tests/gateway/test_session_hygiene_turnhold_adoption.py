@@ -219,6 +219,26 @@ async def test_background_enqueue_coalesces_per_session_and_preserves_storage():
 
 
 @pytest.mark.asyncio
+async def test_deferred_commit_rebuilds_cache_and_usage_only_on_next_turn():
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._session_db = None
+    runner._evict_cached_agent = MagicMock()
+    runner._hygiene_background_rebuild = {"key"}
+    entry = SimpleNamespace(session_id="sess", last_prompt_tokens=205000)
+    history = [{"role": "user", "content": "small"} for _ in range(6)]
+    result = runner._hmwa_enqueue_background_hygiene(
+        None, entry, "key", history, {"model": {"context_length": 200000}},
+    )
+    assert result is history
+    assert entry.session_id == "sess"
+    assert entry.last_prompt_tokens == 0
+    assert runner._hygiene_background_rebuild == set()
+    runner._evict_cached_agent.assert_called_once_with("key")
+    assert getattr(runner, "_hygiene_background_jobs", {}) == {}
+
+
+@pytest.mark.asyncio
 async def test_background_commit_never_rebinds_or_evicts_live_session(monkeypatch):
     gateway_run = importlib.import_module("gateway.run")
     runner = object.__new__(gateway_run.GatewayRunner)
