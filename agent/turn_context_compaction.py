@@ -39,6 +39,23 @@ class CompactionOutcome:
 
 # ── Helpers shared by every compression-attempt site ──
 
+def _defer_optional_hygiene_to_gateway(agent: Any, request_tokens: Any) -> bool:
+    """Avoid an optional foreground summary only for a durable Gateway turn that fits.
+
+    Explicit /compress and provider-proven overflow never use this helper.
+    An unknown model window also fails closed: it must be verified that the
+    current request fits before deferring to Gateway's fenced background worker.
+    """
+    if getattr(agent, "_gateway_background_hygiene_only", False) is not True:
+        return False
+    if getattr(agent, "_persist_disabled", False):
+        return False
+    from agent.conversation_compression import request_exceeds_model_window
+    return request_exceeds_model_window(agent, request_tokens) is False
+
+
+
+
 
 def _clear_overflow_warn(agent: Any) -> None:
     """Re-arm the context-overflow warning dedup (test doubles may lack the method)."""
@@ -167,6 +184,8 @@ def _idle_compaction(
     _idle_tokens = _tc._preflight_request_tokens(
         agent, messages, out.active_system_prompt or ""
     )
+    if _defer_optional_hygiene_to_gateway(agent, _idle_tokens):
+        return
     # Don't summarise a thread already below the post-compression target size.
     _idle_floor = int(_compressor.threshold_tokens * _compressor.summary_target_ratio)
     _idle_cooldown = getattr(
@@ -255,6 +274,14 @@ def _preflight_compression(
     _preflight_tokens = _tc._preflight_request_tokens(
         agent, out.messages, out.active_system_prompt or ""
     )
+    if (_preflight_tokens >= _compressor.threshold_tokens
+            and _defer_optional_hygiene_to_gateway(agent, _preflight_tokens)):
+        logger.info(
+            "Delegating optional turn-start compression to Gateway background hygiene "
+            "(tokens=%s, model_window=%s)",
+            _preflight_tokens, _compressor.context_length,
+        )
+        return
     # getattr guard: compressor doubles and plugin engines lack this method — absence
     # means no snapshot and the finalizer's rollback stays disarmed.
     _snapshot_fn = getattr(_compressor, "snapshot_preflight_display_tokens", None)
