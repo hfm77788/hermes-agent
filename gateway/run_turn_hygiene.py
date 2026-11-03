@@ -868,6 +868,26 @@ class GatewayTurnHygieneMixin:
                 ),
             )
             self._track_deferred_agent_worker(future, agent)
+
+            # A host timeout can race a commit that already owns the watermark
+            # fence. The host must not wait, but a late successful commit must
+            # still invalidate stale agent context on the next serialized turn.
+            def _capture_late_commit(done):
+                if done.cancelled():
+                    return
+                try:
+                    if done.exception() is not None:
+                        return
+                except Exception:
+                    return
+                if (fence.commit_watermark_fenced
+                        and bool(getattr(agent, "_last_compaction_in_place", False))):
+                    rebuild = getattr(self, "_hygiene_background_rebuild", None)
+                    if rebuild is None:
+                        rebuild = self._hygiene_background_rebuild = {}
+                    rebuild[session_key] = str(session_entry.session_id)
+
+            future.add_done_callback(_capture_late_commit)
             await asyncio.wait_for(asyncio.shield(future), timeout=hs.total_ceiling_seconds)
             if (fence.commit_watermark_fenced
                     and bool(getattr(agent, "_last_compaction_in_place", False))):
