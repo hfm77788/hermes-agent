@@ -38,7 +38,8 @@ def _agent(tokens=200629, window=256000, enabled=True):
 
 @pytest.mark.parametrize("tokens,window,enabled,persist_disabled,expected", [
     (200629, 256000, True, False, True),
-    (255999, 256000, True, False, True),
+    (230400, 256000, True, False, True),
+    (255999, 256000, True, False, False),
     (256001, 256000, True, False, False),
     (200629, None, True, False, False),
     (200629, 256000, False, False, False),
