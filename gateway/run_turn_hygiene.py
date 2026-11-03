@@ -218,7 +218,7 @@ class GatewayTurnHygieneMixin:
             if _getter is not None:
                 _cooldown_state = None
                 with suppress(Exception):
-                    _cooldown_state = _getter(session_entry.session_id)
+                    _cooldown_state = await asyncio.to_thread(_getter, session_entry.session_id)
                 if _cooldown_state and _cooldown_state.get("remaining_seconds", 0) > 0:
                     logger.info(
                         "Session hygiene: skipping compression for %s; "
@@ -699,8 +699,10 @@ class GatewayTurnHygieneMixin:
         from hermes_cli.config import load_config as _load_cfg
         from utils import is_truthy_value as _is_truthy
 
+        _hyg_checkpoint_cfg = await asyncio.to_thread(_load_cfg)
         _hyg_checkpoint_required = _is_truthy(
-            ((_load_cfg() or {}).get("compression") or {}).get("checkpoint_required"), default=False,
+            ((_hyg_checkpoint_cfg or {}).get("compression") or {}).get("checkpoint_required"),
+            default=False,
         )
         # Agent initialization may load providers and cache state; never run it on the
         # foreground event loop when hygiene is scheduled as background work.
@@ -710,7 +712,7 @@ class GatewayTurnHygieneMixin:
             skip_memory=not _hyg_checkpoint_required, enabled_toolsets=["memory"],
             session_id=session_entry.session_id, session_db=_hyg_session_db,
         )
-        _seed_hygiene_system_prompt(_hyg_agent, _hyg_session_row)
+        await asyncio.to_thread(_seed_hygiene_system_prompt, _hyg_agent, _hyg_session_row)
         # The stamp only marks this agent as no real surface. Since #104414 Platform is not a
         # restore-identity field, so it no longer forces the next live turn to rebuild; the seed's
         # retain flag is what keeps the reduced-toolset build out of the session row (#122822).
@@ -917,7 +919,9 @@ class GatewayTurnHygieneMixin:
                 jobs = self._hygiene_background_jobs = {}
             sid = str(session_entry.session_id)
             running = jobs.get(sid)
-            if running is None or running.done():
+            if (running is None or running.done()) and len(jobs) < 4:
+                # Global per-runner admission cap: prevent a burst of sessions from
+                # spawning unbounded compressor jobs and contending with foreground work.
                 # Background work must never dereference a mutable live SessionEntry
                 # after admission. The foreground can rotate or update its row mid-turn.
                 frozen_entry = SimpleNamespace(
