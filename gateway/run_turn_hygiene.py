@@ -787,41 +787,40 @@ class GatewayTurnHygieneMixin:
 
     @staticmethod
     def _hmwa_background_model_tail(history, config):
-        """A payload-only conservative tail while the complete history is compressed elsewhere.
+        """Keep complete context while a watermark-fenced summary is pending.
 
-        Does not mutate or rewrite the persisted transcript. A bounded view also keeps the
-        agent's own preflight compressor from waiting on the full oversized history.
+        A limited tail can silently omit old instructions, unresolved tasks and
+        previous commitments. Until a real summary has committed, only the
+        pre-existing hard message-count safety valve may truncate model input.
+        The durable transcript remains untouched in either case. If a truly
+        oversized request needs compression, Agent preflight remains authoritative:
+        a safety wait is preferable to an inaccurate answer.
         """
         from gateway.run_turn import bound_model_input_without_hygiene
         comp = config.get("compression") if isinstance(config, dict) else None
         comp = comp if isinstance(comp, dict) else {}
         try:
             max_rows = max(2, min(5000, int(comp.get("hygiene_hard_message_limit", 5000))))
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
             max_rows = 5000
-        model = config.get("model") if isinstance(config, dict) else {}
-        model = model if isinstance(model, dict) else {}
-        try:
-            context_limit = max(8192, int(model.get("context_length") or 200000))
-        except (ValueError, TypeError):
-            context_limit = 200000
-        budget = min(60000, max(2048, context_limit // 4))
-        rows, tokens = 0, 0
-        for message in reversed(history):
-            content = message.get("content") if isinstance(message, dict) else None
-            if isinstance(content, str):
-                cost = max(64, (len(content) + 2) // 3)
-            elif isinstance(content, list):
-                cost = max(2048, 2048 * len(content))
-            else:
-                cost = 512
-            if rows and tokens + cost > budget:
-                break
-            rows += 1
-            tokens += cost
-            if rows >= max_rows:
-                break
-        return bound_model_input_without_hygiene(history, max(2, rows))
+        return bound_model_input_without_hygiene(history, max_rows)
+
+    def _hmwa_consume_background_rebuild(self, session_entry, session_key):
+        """Apply a late summary only at an admitted turn for the SAME session id."""
+        pending = getattr(self, "_hygiene_background_rebuild", None)
+        if not isinstance(pending, dict):
+            return
+        session_id = pending.pop(session_key, None)
+        if session_id is None:
+            return
+        if session_id != str(session_entry.session_id):
+            logger.info(
+                "Ignoring background hygiene cache rebuild for superseded session %s",
+                session_id,
+            )
+            return
+        session_entry.last_prompt_tokens = 0
+        self._evict_cached_agent(session_key)
 
     async def _hmwa_hygiene_background_once(self, source, session_entry, session_key, history):
         """Do all model/DB work off the foreground path; commit only via DB watermark fence.
@@ -874,8 +873,8 @@ class GatewayTurnHygieneMixin:
                     and bool(getattr(agent, "_last_compaction_in_place", False))):
                 rebuild = getattr(self, "_hygiene_background_rebuild", None)
                 if rebuild is None:
-                    rebuild = self._hygiene_background_rebuild = set()
-                rebuild.add(session_key)
+                    rebuild = self._hygiene_background_rebuild = {}
+                rebuild[session_key] = str(session_entry.session_id)
                 await asyncio.to_thread(_reset_hygiene_failure_streak, self, session_key)
                 logger.info("Session hygiene background summary committed under watermark fence for %s",
                             session_entry.session_id)
@@ -906,13 +905,7 @@ class GatewayTurnHygieneMixin:
         self, source, session_entry, session_key, history, config,
     ):
         """Queue once per live session and return bounded model input without awaiting work."""
-        rebuild = getattr(self, "_hygiene_background_rebuild", None)
-        if isinstance(rebuild, set) and session_key in rebuild:
-            rebuild.discard(session_key)
-            # Deferred commit never mutates the in-flight turn. Clear the old
-            # usage anchor only at this next serialized session entry.
-            session_entry.last_prompt_tokens = 0
-            self._evict_cached_agent(session_key)
+        self._hmwa_consume_background_rebuild(session_entry, session_key)
         if getattr(self, "_session_db", None) is not None:
             jobs = getattr(self, "_hygiene_background_jobs", None)
             if jobs is None:
@@ -955,11 +948,7 @@ class GatewayTurnHygieneMixin:
         from gateway.run import HygieneTurnHoldExceeded
         # Consume a completed fenced commit at the first serialized turn entry.
         # Even a short post-summary history (<4 rows) must invalidate the stale cache.
-        _rebuild = getattr(self, "_hygiene_background_rebuild", None)
-        if isinstance(_rebuild, set) and session_key in _rebuild:
-            _rebuild.discard(session_key)
-            session_entry.last_prompt_tokens = 0
-            self._evict_cached_agent(session_key)
+        self._hmwa_consume_background_rebuild(session_entry, session_key)
         if not history or len(history) < 4:
             return history
 
