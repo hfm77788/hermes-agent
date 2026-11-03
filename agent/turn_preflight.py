@@ -24,6 +24,7 @@ from agent.turn_context import _review_fork_first_request_pending
 from agent.turn_context_compaction import (
     _apply_grown_window, _blocked_compress_reason, _clear_overflow_warn, _refund_api_call,
     _reanchor, _reset_retry_state_after_compaction,
+    _defer_optional_hygiene_to_gateway,
 )
 
 logger = logging.getLogger("agent.conversation_loop")
@@ -82,6 +83,14 @@ def run_preflight_compression(
             agent, v.messages, v.conversation_history, v.api_call_count, request_pressure_tokens,
             max_compression_attempts,
         )
+
+    # A Gateway session with background-only hygiene must not spend 30s
+    # summarizing at every optional in-loop threshold. Provider-proven overflow
+    # still takes the original synchronous recovery/fail-closed path.
+    if (not provider_overflow_preflight
+            and request_pressure_tokens >= getattr(compressor, "threshold_tokens", 0)
+            and _defer_optional_hygiene_to_gateway(agent, request_pressure_tokens)):
+        return _done("fallthrough")
 
     _compression_cooldown = getattr(
         compressor, "get_active_compression_failure_cooldown", lambda: None
@@ -307,6 +316,15 @@ def compress_after_tool_results(
             agent, messages, active_system_prompt or "",
             estimate_request_tokens_rough(messages, tools=agent.tools or None),
         )
+
+    if (_real_tokens >= getattr(_compressor, "threshold_tokens", 0)
+            and _defer_optional_hygiene_to_gateway(agent, _real_tokens)):
+        logger.info(
+            "Delegating optional post_tool compression to Gateway background hygiene "
+            "(tokens=%s, model_window=%s)",
+            _real_tokens, _compressor.context_length,
+        )
+        return _verdict(False)
 
     if agent.compression_enabled and compression_attempts < max_compression_attempts:
         ensure_compression_feasibility_checked(agent, _real_tokens)
