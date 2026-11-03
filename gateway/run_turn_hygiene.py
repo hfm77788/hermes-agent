@@ -914,7 +914,7 @@ class GatewayTurnHygieneMixin:
         finally:
             if agent is not None:
                 if future is not None and not future.done():
-                    attempt = self._HygieneAttempt(agent=agent, future=future)
+                    attempt = self._HygieneAttempt(agent=agent, meta=None, future=future)
                     self._hmwa_hygiene_defer_cleanup(attempt, "background session hygiene")
                 else:
                     await self._cleanup_agent_resources_off_loop(
