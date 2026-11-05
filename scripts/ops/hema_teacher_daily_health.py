@@ -223,31 +223,27 @@ def _footprint_payload(rc: int, out: str, err: str) -> dict[str, Any]:
             "tool_count": (data.get("tools") or {}).get("count"),
             "tool_bytes": (data.get("tools") or {}).get("json_bytes"),
         }
-    except Exception as exc:
-        return {"ok": False, "error": f"json parse: {exc}"}
+    except (ValueError, TypeError, AttributeError) as exc:
+        # json.JSONDecodeError subclasses ValueError; TypeError/AttributeError
+        # cover a well-formed JSON payload of an unexpected shape (list, scalar).
+        return {"ok": False, "error": f"json parse: {type(exc).__name__}: {exc}"}
 
 
-def prompt_footprint(
-    *,
-    attempts: int = 2,
-    backoff_s: int = PROMPT_FOOTPRINT_RETRY_BACKOFF_S,
-) -> dict[str, Any]:
+def prompt_footprint() -> dict[str, Any]:
     cmd = [HERMES_BIN, "-p", PROFILE, "prompt-size", "--platform", "dingtalk", "--json"]
     env = {**os.environ, "HERMES_SESSION_PLATFORM": "dingtalk"}
-    total = max(1, attempts)
-    for attempt in range(1, total + 1):
-        rc, out, err = run(cmd, timeout=PROMPT_FOOTPRINT_TIMEOUT_S, env=env)
-        timed_out = _is_timeout_error(err)
-        payload = _footprint_payload(rc, out, err)
-        if not timed_out or attempt == total:
-            retried = attempt > 1
-            if retried:
-                payload["retried"] = True
-                if not payload.get("ok"):
-                    payload["error"] = f"{payload['error']} (attempt={attempt}/retried)"
-            return {**payload, "attempts": attempt}
-        time.sleep(backoff_s)
-    raise AssertionError("unreachable footprint retry loop")  # pragma: no cover
+    rc, out, err = run(cmd, timeout=PROMPT_FOOTPRINT_TIMEOUT_S, env=env)
+    if not _is_timeout_error(err):
+        return {**_footprint_payload(rc, out, err), "attempts": 1}
+    # Timeout only: back off so the retry lands past the contention window, then
+    # the second result is authoritative — success clears the false yellow, a
+    # second timeout stays an actionable probe_failed.
+    time.sleep(PROMPT_FOOTPRINT_RETRY_BACKOFF_S)
+    rc, out, err = run(cmd, timeout=PROMPT_FOOTPRINT_TIMEOUT_S, env=env)
+    payload = {**_footprint_payload(rc, out, err), "attempts": 2, "retried": True}
+    if not payload.get("ok"):
+        payload["error"] = f"{payload['error']} (attempt=2/retried)"
+    return payload
 
 
 def _effective_log_since(
