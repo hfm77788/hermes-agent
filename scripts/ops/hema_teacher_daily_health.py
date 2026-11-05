@@ -181,12 +181,35 @@ def runtime_state(repo: Path = REPO, home: Path = HOME) -> dict[str, Any]:
     }
 
 
-def prompt_footprint() -> dict[str, Any]:
-    rc, out, err = run(
-        [HERMES_BIN, "-p", PROFILE, "prompt-size", "--platform", "dingtalk", "--json"],
-        timeout=45,
-        env={**os.environ, "HERMES_SESSION_PLATFORM": "dingtalk"},
-    )
+#: Per-attempt window for the prompt-size probe. Deliberately NOT relaxed: a
+#: cold CLI start that needs more than 45s outside of contention is a real
+#: regression and must stay visible.
+PROMPT_FOOTPRINT_TIMEOUT_S = 45
+#: One backoff retry after a TimeoutExpired only.
+#:
+#: The probe cold-starts the whole hermes CLI, so it is the one signal in this
+#: check that is sensitive to host load. At the 15:01 window the kanban worker
+#: fan-out was measured at load 10.05 with two pytest runs at ~87% CPU each, and
+#: the cold start alone blew the 45s window — three consecutive days (11-03,
+#: 11-04, 11-05) of false-yellow prompt_footprint_probe_failed tickets that all
+#: closed with zero repairs while a manual re-run passed in 6.7-9.2s (t_caed7a33).
+#: Retrying once after a quiet-backoff absorbs that transient contention without
+#: changing the failure semantics: only a timeout is retried, the second result
+#: is authoritative, and two timeouts are still an actionable probe_failed.
+PROMPT_FOOTPRINT_RETRY_BACKOFF_S = 20
+
+
+def _is_timeout_error(err: str) -> bool:
+    """True when run() collapsed a subprocess.TimeoutExpired into its error text.
+
+    run() converts every exception into (-1, "", "<ExcName>: <message>"), so a
+    timeout never propagates as an exception here and must be recognised by the
+    exception name it embeds.
+    """
+    return err.startswith(f"{subprocess.TimeoutExpired.__name__}:")
+
+
+def _footprint_payload(rc: int, out: str, err: str) -> dict[str, Any]:
     if rc != 0:
         return {"ok": False, "error": err or out or f"rc={rc}"}
     try:
@@ -202,6 +225,29 @@ def prompt_footprint() -> dict[str, Any]:
         }
     except Exception as exc:
         return {"ok": False, "error": f"json parse: {exc}"}
+
+
+def prompt_footprint(
+    *,
+    attempts: int = 2,
+    backoff_s: int = PROMPT_FOOTPRINT_RETRY_BACKOFF_S,
+) -> dict[str, Any]:
+    cmd = [HERMES_BIN, "-p", PROFILE, "prompt-size", "--platform", "dingtalk", "--json"]
+    env = {**os.environ, "HERMES_SESSION_PLATFORM": "dingtalk"}
+    total = max(1, attempts)
+    for attempt in range(1, total + 1):
+        rc, out, err = run(cmd, timeout=PROMPT_FOOTPRINT_TIMEOUT_S, env=env)
+        timed_out = _is_timeout_error(err)
+        payload = _footprint_payload(rc, out, err)
+        if not timed_out or attempt == total:
+            retried = attempt > 1
+            if retried:
+                payload["retried"] = True
+                if not payload.get("ok"):
+                    payload["error"] = f"{payload['error']} (attempt={attempt}/retried)"
+            return {**payload, "attempts": attempt}
+        time.sleep(backoff_s)
+    raise AssertionError("unreachable footprint retry loop")  # pragma: no cover
 
 
 def _effective_log_since(
