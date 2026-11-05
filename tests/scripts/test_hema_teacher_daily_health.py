@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -344,3 +346,178 @@ def test_runtime_state_falls_back_to_stored_ref_when_fetch_fails(monkeypatch, tm
     monkeypatch.setattr(mod, "run", fake_run)
     state = mod.runtime_state(repo=tmp_path, home=tmp_path)
     assert state["runtime_sha"] != state["origin_main_sha"]
+
+
+# --------------------------------------------------------------------------
+# prompt_footprint retry (t_b80d66e1)
+#
+# 11-03/11-04/11-05 the 15:01 health window coincided with kanban worker
+# fan-out (load 10.05, two pytest runs ~87% CPU each); the CLI cold start alone
+# blew the 45s window and produced three false-yellow
+# prompt_footprint_probe_failed tickets that all closed with zero repairs.
+# The probe now retries once after a backoff. These tests pin BOTH halves of
+# the contract: transient contention self-heals, a real double timeout is still
+# actionable, the per-attempt threshold is never relaxed, and only a timeout is
+# ever retried.
+# --------------------------------------------------------------------------
+
+_FOOTPRINT_JSON = json.dumps(
+    {
+        "model": "qwen3.8-flash",
+        "skills_breakdown": [{"name": "a"}, {"name": "b"}],
+        "skills_index": {"bytes": 4096},
+        "system_prompt": {"bytes": 30000},
+        "tools": {"count": 40, "json_bytes": 50000},
+    }
+)
+
+
+def _timeout_error() -> str:
+    """Exactly what run() yields when subprocess.run raises TimeoutExpired."""
+    exc = subprocess.TimeoutExpired(
+        ["hermes", "prompt-size"], mod.PROMPT_FOOTPRINT_TIMEOUT_S
+    )
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _healthy_build_inputs():
+    services = {
+        mod.GATEWAY_SERVICE: {"active": True, "state": "active"},
+        mod.BRIDGE_SERVICE: {"active": True, "state": "active"},
+    }
+    runtime = {
+        "gateway_phase": "running",
+        "runtime_sha": "aaa",
+        "origin_main_sha": "aaa",
+        "disk_free_gb": 40.0,
+    }
+    logs = {mod.GATEWAY_SERVICE: {"error_hits": 0}, mod.BRIDGE_SERVICE: {"error_hits": 0}}
+    return services, runtime, logs
+
+
+def test_prompt_footprint_recovers_from_single_timeout_with_backoff_retry(monkeypatch):
+    timeouts: list[int | None] = []
+    sleeps: list[float] = []
+
+    def fake_run(_cmd, **kwargs):
+        timeouts.append(kwargs.get("timeout"))
+        if len(timeouts) == 1:
+            return -1, "", _timeout_error()
+        return 0, _FOOTPRINT_JSON, ""
+
+    monkeypatch.setattr(mod, "run", fake_run)
+    monkeypatch.setattr(mod.time, "sleep", lambda secs: sleeps.append(secs))
+
+    footprint = mod.prompt_footprint()
+
+    assert footprint["ok"] is True
+    assert footprint["attempts"] == 2
+    assert footprint["retried"] is True
+    assert footprint["system_bytes"] == 30000
+    assert sleeps == [20] == [mod.PROMPT_FOOTPRINT_RETRY_BACKOFF_S]
+    # retry must not silently widen the window: both attempts keep 45s
+    assert timeouts == [45, 45] == [mod.PROMPT_FOOTPRINT_TIMEOUT_S] * 2
+    services, runtime, logs = _healthy_build_inputs()
+    codes = {s.code for s in mod.build_signals(services, runtime, footprint, logs)}
+    assert "prompt_footprint_probe_failed" not in codes
+
+
+def test_prompt_footprint_double_timeout_stays_actionable_and_marked(monkeypatch):
+    calls: list[int | None] = []
+    sleeps: list[float] = []
+
+    def fake_run(_cmd, **kwargs):
+        calls.append(kwargs.get("timeout"))
+        return -1, "", _timeout_error()
+
+    monkeypatch.setattr(mod, "run", fake_run)
+    monkeypatch.setattr(mod.time, "sleep", lambda secs: sleeps.append(secs))
+
+    footprint = mod.prompt_footprint()
+
+    assert footprint["ok"] is False
+    assert footprint["attempts"] == 2
+    assert footprint["retried"] is True
+    # exactly one retry: a second timeout is terminal, not a retry loop
+    assert len(calls) == 2
+    assert sleeps == [20]
+    reason = str(footprint["error"])
+    assert "TimeoutExpired" in reason
+    assert "attempt=2" in reason and "retried" in reason
+
+    services, runtime, logs = _healthy_build_inputs()
+    signals = mod.build_signals(services, runtime, footprint, logs)
+    failures = [s for s in signals if s.code == "prompt_footprint_probe_failed"]
+    assert len(failures) == 1
+    assert failures[0].severity == "medium"
+    assert failures[0].self_healed is False
+    assert "attempt=2" in failures[0].evidence
+    assert failures[0] in mod.actionable(signals)
+
+
+def test_prompt_footprint_does_not_retry_a_real_failure(monkeypatch):
+    """Only TimeoutExpired retries — a genuine CLI error stays a single attempt."""
+    calls: list[list[str]] = []
+    sleeps: list[float] = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        return 1, "", "Traceback: profile not found"
+
+    monkeypatch.setattr(mod, "run", fake_run)
+    monkeypatch.setattr(mod.time, "sleep", lambda secs: sleeps.append(secs))
+
+    footprint = mod.prompt_footprint()
+
+    assert footprint["ok"] is False
+    assert footprint["attempts"] == 1
+    assert "retried" not in footprint
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+def test_prompt_footprint_malformed_payload_fails_without_retry(monkeypatch):
+    """A parse failure is a real probe result, never a retry candidate.
+
+    The parse guard is narrowed to the exceptions this payload shape can raise;
+    pinning it here means a future widening of the catch cannot silently turn a
+    broken CLI contract into a crash of the whole health run.
+    """
+    calls: list[int | None] = []
+    sleeps: list[float] = []
+
+    def fake_run(_cmd, **kwargs):
+        calls.append(kwargs.get("timeout"))
+        return 0, "not-json at all", ""
+
+    monkeypatch.setattr(mod, "run", fake_run)
+    monkeypatch.setattr(mod.time, "sleep", lambda secs: sleeps.append(secs))
+
+    footprint = mod.prompt_footprint()
+
+    assert footprint["ok"] is False
+    assert footprint["attempts"] == 1
+    assert "retried" not in footprint
+    assert footprint["error"].startswith("json parse:")
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+def test_prompt_footprint_healthy_path_uses_one_attempt(monkeypatch):
+    calls: list[int | None] = []
+    sleeps: list[float] = []
+
+    def fake_run(_cmd, **kwargs):
+        calls.append(kwargs.get("timeout"))
+        return 0, _FOOTPRINT_JSON, ""
+
+    monkeypatch.setattr(mod, "run", fake_run)
+    monkeypatch.setattr(mod.time, "sleep", lambda secs: sleeps.append(secs))
+
+    footprint = mod.prompt_footprint()
+
+    assert footprint["ok"] is True
+    assert footprint["attempts"] == 1
+    assert "retried" not in footprint
+    assert calls == [45]
+    assert sleeps == []
