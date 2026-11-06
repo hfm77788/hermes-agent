@@ -17,7 +17,7 @@ from agent.context_engine import automatic_compaction_status_message
 from agent.conversation_compression import (
     PRE_API_COMPRESSION_STATUS_TEMPLATE, _reset_read_dedup_caches, compression_blocked_transiently,
     compression_skipped_due_to_lock, context_compression_timed_out,
-    conversation_history_after_compression, ensure_compression_feasibility_checked,
+    conversation_history_after_compression,
     reset_context_compression_timeout_outcome,
 )
 from agent.conversation_compression_feasibility import ensure_compression_feasibility_checked
