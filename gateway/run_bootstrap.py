@@ -287,6 +287,7 @@ async def _start_gateway_start_control_socket(runner):
         )
         from gateway.run_plugin_rewire import reload_plugins_verb
         from gateway.run_active_work_verb import active_work_verb
+        from gateway.relay.link import relay_link_verb
         from gateway.drain_control import RESTART_WAIT_REASON
         # fork-local: loopback 消息注入与本机会话健康（本机投递链路）。v0.22.4 re-anchor 时
         # 上游把控制套接字构造挪进本模块，run.py 里的旧副本成为死码：fork verb 注册必须跟着
@@ -369,7 +370,10 @@ async def _start_gateway_start_control_socket(runner):
                            "reload-plugins": reload_plugins_verb(runner, _main_loop),
                            # fork-local: loopback 注入与本机会话健康（与 run.py 旧副本同注册）。
                            "local-session-health": local_session_health_verb(runner, _main_loop),
-                           "inject-local-inbound": local_inbound_verb(runner, _main_loop)})
+                           "inject-local-inbound": local_inbound_verb(runner, _main_loop),
+                           # The per-gateway relay secret exists only in this process: the dashboard
+                           # mints Team Gateway link codes through it.
+                           "relay-link": relay_link_verb})
         _control_server.ticket_store = runner.session_ticket_store
         # The Webapp's verbs answer from the socket's first moment ("starting" until the listener
         # settles): a client polling a restarting gateway must never read "unknown verb" as a failure.
