@@ -4401,9 +4401,25 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
             request = self._build_reply_message_request(effective_reply_to, body)
             return await self._run_blocking(self._client.im.v1.message.reply, request)
         if thread_id:
-            # reply→create fallback inside a topic: thread_id as receive_id keeps it in the topic.
-            receive_id, receive_id_type = thread_id, "thread_id"
-        elif chat_id.startswith("feishu_user_id:"):
+            # F13 (#142955): the create API has no receive_id_type="thread_id" — Feishu rejects it
+            # with 99992402 and the message is silently lost (live + standalone paths, same root).
+            # Generalize the audio-path fallback: anchor a reply on the thread's last message so
+            # the send stays inside the topic without any unsupported enum.
+            anchor = await self._fetch_last_message_in_thread(thread_id)
+            if anchor:
+                body = self._build_reply_message_body(
+                    content=payload, msg_type=msg_type, reply_in_thread=True, uuid_value=str(uuid.uuid4()),
+                )
+                request = self._build_reply_message_request(anchor, body)
+                return await self._run_blocking(self._client.im.v1.message.reply, request)
+            # No anchor (thread unfetchable/empty): degrade to a chat-level send with a WARN —
+            # a visible top-level message beats silent loss; mirrors the audio-path last resort.
+            logger.warning(
+                "[Feishu] F13: no reply anchor in thread %s; falling back to chat-level send in %s "
+                "(message would otherwise be lost)",
+                thread_id, chat_id,
+            )
+        if chat_id.startswith("feishu_user_id:"):
             receive_id, receive_id_type = chat_id.split(":", 1)[1], "user_id"
         else:
             receive_id, receive_id_type = chat_id, "open_id" if chat_id.startswith("ou_") else "chat_id"
