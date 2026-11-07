@@ -68,7 +68,7 @@ _LARK_SDK_IMPORTS = (
         "CreateMessageRequest", "CreateMessageRequestBody", "GetChatRequest", "GetMessageRequest",
         "DeleteMessageRequest", "GetMessageResourceRequest", "P2ImMessageMessageReadV1",
         "ReplyMessageRequest", "ReplyMessageRequestBody",
-        "UpdateMessageRequest", "UpdateMessageRequestBody",
+        "UpdateMessageRequest", "UpdateMessageRequestBody", "PatchMessageRequest", "PatchMessageRequestBody",
     )),
     ("lark_oapi.core", ("AccessTokenType", "HttpMethod")),
     ("lark_oapi.core.const", ("FEISHU_DOMAIN", "LARK_DOMAIN")),
@@ -93,6 +93,7 @@ from gateway.platforms.base import (
     record_merged_source_message_ids,
 )
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from plugins.platforms.feishu.adapter_choice_cards import FeishuChoiceCardsMixin
 from gateway.status import acquire_scoped_lock
 from gateway.status_scoped_locks import release_scoped_lock
 from hermes_constants import get_hermes_home
@@ -1299,7 +1300,7 @@ def _sdk_build(request_cls: Any, **fields: Any) -> Any:
     return builder.build()
 
 
-class FeishuAdapter(BasePlatformAdapter):
+class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
     """Feishu/Lark bot adapter."""
     # Answers /p/<profile>/... on the default listener for a served secondary (shared_ingress).
     serves_profile_prefix: bool = True
@@ -1359,6 +1360,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._approval_counter = itertools.count(1)
         self._update_prompt_state: dict[int, dict[str, str]] = {}
         self._update_prompt_counter = itertools.count(1)
+        self._init_choice_card_state()
         # Reaction deletion needs the opaque reaction_id from create, cached per message_id.
         self._pending_processing_reactions: OrderedDict[str, str] = OrderedDict()
         self._load_seen_message_ids()
@@ -2354,7 +2356,8 @@ class FeishuAdapter(BasePlatformAdapter):
             return await self._send_interactive_card(
                 prompt.chat_id, card, prompt.metadata, "send_exec_approval failed",
                 state_map=self._approval_state, state_id=approval_id, session_key=prompt.session_key,
-                extra_state={"body": prompt.text.replace(self._ea_deadline_line(), "")},  # deadline is moot once resolved
+                extra_state={"body": prompt.text.replace(self._ea_deadline_line(), ""),  # deadline is moot once resolved
+                             "request_id": prompt.request_id or ""},
             )
         except Exception as exc:
             logger.warning("[Feishu] send_exec_approval failed: %s", exc)
@@ -2769,9 +2772,9 @@ class FeishuAdapter(BasePlatformAdapter):
     def _on_card_action_trigger(self, data: Any) -> Any:
         """Synchronous SDK card-action callback.
 
-        Approval/update-prompt buttons return the resolved card inline (the only reliable way
-        to sync all clients) and schedule the async resolution; other clicks are routed as
-        synthetic commands via ``_handle_card_action_event``.
+        Approval/update-prompt/clarify/picker buttons return the settled card inline (the only
+        reliable way to sync all clients) and schedule any async resolution; other clicks are routed
+        as synthetic commands via ``_handle_card_action_event``.
         """
         loop = self._loop
         if not self._loop_accepts_callbacks(loop):
@@ -2780,11 +2783,9 @@ class FeishuAdapter(BasePlatformAdapter):
         event = getattr(data, "event", None)
         action = getattr(event, "action", None)
         action_value = getattr(action, "value", {}) or {}
-        if isinstance(action_value, dict):
-            if action_value.get("hermes_action"):
-                return self._handle_approval_card_action(event=event, action_value=action_value, loop=loop)
-            if action_value.get("hermes_update_prompt_action"):
-                return self._handle_update_prompt_card_action(event=event, action_value=action_value, loop=loop)
+        for key, handler in self._CARD_ACTION_ROUTES if isinstance(action_value, dict) else ():
+            if action_value.get(key):
+                return getattr(self, handler)(event=event, action_value=action_value, loop=loop)
         self._submit_on_loop(loop, self._handle_card_action_event(data))
         return self._card_response()
 
@@ -2954,8 +2955,8 @@ class FeishuAdapter(BasePlatformAdapter):
         if not state:
             return
         try:
-            from tools.approval import resolve_gateway_approval
-            count = resolve_gateway_approval(state["session_key"], choice)
+            from tools.approval import resolve_gateway_approval_card
+            count = resolve_gateway_approval_card(state["session_key"], choice, state.get("request_id"))
             logger.info(
                 "Feishu button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                 count, state["session_key"], choice, user_name,
@@ -3500,6 +3501,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._clear_webhook_anomaly(remote_ip)
 
         event_type = str((payload.get("header") or {}).get("event_type") or "")
+        if event_type == "card.action.trigger":
+            return web.json_response(self._on_webhook_card_action(payload))
         data = self._namespace_from_mapping(payload)
         if event_type in {"im.message.reaction.created_v1", "im.message.reaction.deleted_v1"}:
             self._on_reaction_event(event_type, data)
@@ -3517,7 +3520,6 @@ class FeishuAdapter(BasePlatformAdapter):
         "im.message.message_read_v1": "_on_message_read_event",
         "im.chat.member.bot.added_v1": "_on_bot_added_to_chat",
         "im.chat.member.bot.deleted_v1": "_on_bot_removed_from_chat",
-        "card.action.trigger": "_on_card_action_trigger",
         "drive.notice.comment_add_v1": "_on_drive_comment_event",
         "vc.bot.meeting_invited_v1": "_on_meeting_invited_event",
     }
@@ -4399,9 +4401,25 @@ class FeishuAdapter(BasePlatformAdapter):
             request = self._build_reply_message_request(effective_reply_to, body)
             return await self._run_blocking(self._client.im.v1.message.reply, request)
         if thread_id:
-            # reply→create fallback inside a topic: thread_id as receive_id keeps it in the topic.
-            receive_id, receive_id_type = thread_id, "thread_id"
-        elif chat_id.startswith("feishu_user_id:"):
+            # F13 (#142955): the create API has no receive_id_type="thread_id" — Feishu rejects it
+            # with 99992402 and the message is silently lost (live + standalone paths, same root).
+            # Generalize the audio-path fallback: anchor a reply on the thread's last message so
+            # the send stays inside the topic without any unsupported enum.
+            anchor = await self._fetch_last_message_in_thread(thread_id)
+            if anchor:
+                body = self._build_reply_message_body(
+                    content=payload, msg_type=msg_type, reply_in_thread=True, uuid_value=str(uuid.uuid4()),
+                )
+                request = self._build_reply_message_request(anchor, body)
+                return await self._run_blocking(self._client.im.v1.message.reply, request)
+            # No anchor (thread unfetchable/empty): degrade to a chat-level send with a WARN —
+            # a visible top-level message beats silent loss; mirrors the audio-path last resort.
+            logger.warning(
+                "[Feishu] F13: no reply anchor in thread %s; falling back to chat-level send in %s "
+                "(message would otherwise be lost)",
+                thread_id, chat_id,
+            )
+        if chat_id.startswith("feishu_user_id:"):
             receive_id, receive_id_type = chat_id.split(":", 1)[1], "user_id"
         else:
             receive_id, receive_id_type = chat_id, "open_id" if chat_id.startswith("ou_") else "chat_id"

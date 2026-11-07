@@ -172,6 +172,30 @@ def test_local_session_health_busy_compress_is_fail_closed():
     assert runner.calls == 0
 
 
+def test_local_session_health_accepts_v023_four_tuple_resolver():
+    """v0.23 widened _resolve_context_figures to (used, length, model, suffix).
+
+    The verb unpacked exactly three values, so every inspect/compress on an
+    existing session raised ValueError -> control_failed:ValueError (hema
+    health ticket t_4b63e535, 2026-11-07). Regression guard for both shapes.
+    """
+    runner = FakeRunner()
+
+    async def resolve_v023(_agent, _ctx, _entry, _source):
+        return 60000, 100000, "qwen-test", " (pinned)"
+
+    runner._resident_agent_for = lambda _key: None
+    runner._resolve_context_figures = resolve_v023
+
+    result = asyncio.run(_local_session_health(runner, _payload(action="inspect")))
+    assert result["accepted"] is True
+    assert result["found"] is True
+    assert result["last_prompt_tokens"] == 60000
+    assert result["context_length"] == 100000
+    assert result["context_pct"] == 60.0
+    assert result["model"] == "qwen-test"
+
+
 def test_unsupported_platform_fails_closed():
     runner = FakeRunner()
     payload = _payload()
