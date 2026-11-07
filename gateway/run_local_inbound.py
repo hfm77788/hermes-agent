@@ -274,6 +274,23 @@ def local_inbound_verb(runner, loop):
 
     return handler
 
+def _resolver_figures(result: Any) -> tuple[Any, Any, Any]:
+    """Normalise ``_resolve_context_figures`` arity for the health/maintenance verb.
+
+    v0.22 returned ``(used, context_length, model)``; the v0.23 usage-window
+    plan support (upstream ``15307dece7``, landed via the v0.23.0 merge) widened
+    it to ``(used, context_length, model, window_suffix)``. Unpacking a fixed
+    3-tuple from a 4-tuple raised ``ValueError: too many values to unpack`` in
+    every ``local-session-health`` verb that touched a real session, which the
+    verb handler surfaced as ``control_failed:ValueError`` and the daily hema
+    health check logged as eight ``context_probe_failed`` signals (2026-11-07
+    ticket t_4b63e535). The suffix is only a ``/context`` display decoration —
+    take the first three figures and stay forward-compatible.
+    """
+    used, total, model = result[0], result[1], result[2]
+    return used, total, model
+
+
 async def _local_session_health(runner, params: dict[str, Any]) -> dict[str, Any]:
     """Inspect or maintain one existing local session without creating a user turn."""
     profile = _clean(params.get("profile")) or "default"
@@ -325,7 +342,7 @@ async def _local_session_health(runner, params: dict[str, Any]) -> dict[str, Any
     ctx = getattr(resident, "context_compressor", None) if resident is not None else None
     resolver = getattr(runner, "_resolve_context_figures", None)
     if callable(resolver):
-        used, total, model = await resolver(resident, ctx, entry, source)
+        used, total, model = _resolver_figures(await resolver(resident, ctx, entry, source))
     else:
         used = max(0, int(getattr(entry, "last_prompt_tokens", 0) or 0))
         total = 0
@@ -402,9 +419,9 @@ async def _local_session_health(runner, params: dict[str, Any]) -> dict[str, Any
         if refreshed_resident is not None else None
     )
     if callable(resolver):
-        after_used, after_total, after_model = await resolver(
+        after_used, after_total, after_model = _resolver_figures(await resolver(
             refreshed_resident, refreshed_ctx, refreshed_entry, source
-        )
+        ))
     else:
         after_used = max(0, int(getattr(refreshed_entry, "last_prompt_tokens", 0) or 0))
         after_total = total
