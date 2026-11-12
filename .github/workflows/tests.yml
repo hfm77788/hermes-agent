@@ -111,8 +111,7 @@ jobs:
         #
         # No --files: the runner discovers the suite itself. The discovered
         # set is identical to the list the removed matrix job used to pass in.
-        run: |
-          scripts/run_tests.sh
+        run: just test-all
         env:
           HERMES_TEST_SLICE: ${{ matrix.slice }}/3
           HERMES_TEST_FORKSERVER: "1"
@@ -310,7 +309,7 @@ jobs:
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
           ref: ${{ inputs.commit }}
-          # N-1 = `git describe --tags --abbrev=0 HEAD~1`.
+          # The upgrade start version is the newest release behind HEAD (tests/e2e/core/upgrade/_install_helpers.upgrade_base).
           fetch-depth: 0
           fetch-tags: true
 

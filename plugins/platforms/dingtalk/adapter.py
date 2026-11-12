@@ -50,7 +50,7 @@ except Exception:
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator, compile_mention_patterns
 from agent.i18n import t
-from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.base import BasePlatformAdapter, SendResult, describe_proxy_error, env_proxy_for_redaction
 from gateway.platforms.event import MessageEvent
 from gateway.platforms._shared import (
     apply_yaml_bridge as _apply_yaml_bridge, decode_json_list_literal as _decode_json_list_literal,
@@ -930,73 +930,14 @@ async def _webhook_text_send(httpx_mod, webhook_url: str, message: str) -> SendR
             resp.raise_for_status()
             data = resp.json()
         if data.get("errcode", 0) != 0:
-            return SendResult(success=False, error=f"DingTalk API error: {data.get('errmsg', 'unknown')}")
-        return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
-    except Exception as e:
-        try:  # lazy import avoids a circular; strips access_token=… from any URL-bearing error text
+            return send_error(f"DingTalk API error: {data.get('errmsg', 'unknown')}")
+        return {"success": True, "platform": "dingtalk", "chat_id": chat_id}
+    except Exception as e:  # httpx reads HTTPS_PROXY itself: the text may echo it
+        try:  # send_message_tool._error redacts access_token from webhook URLs (lazy import avoids a circular)
             from tools.send_message_tool import _error as _redact_error
-            msg = str(_redact_error(f"DingTalk send failed: {e}").get("error", e))
+            return _redact_error(f"DingTalk send failed: {describe_proxy_error(e, env_proxy_for_redaction(webhook_url)) or e}")
         except Exception:
-            msg = f"DingTalk send failed: {e}"
-        return SendResult(success=False, error=msg)
-
-
-async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False):
-    """Out-of-process delivery (standalone_sender_fn): webhook text when DINGTALK_WEBHOOK_URL is set,
-    otherwise/for media via a transient adapter on the robot OpenAPI (upload + sampleFile/sampleImageMsg).
-    Media routing needs the config fallbacks (DINGTALK_DM_CHAT_IDS + DINGTALK_DM_USER_ID) since no
-    inbound context exists in a cron process."""
-    webhook_url = (getattr(pconfig, "extra", {}) or {}).get("webhook_url") or _get_scoped_secret("DINGTALK_WEBHOOK_URL", "")
-    if webhook_url and not media_files:
-        # Legacy static-webhook text path (unchanged behavior shape).
-        try:
-            import httpx as _httpx
-        except ImportError:
-            return send_error("httpx not installed")
-        result = await _webhook_text_send(_httpx, webhook_url, message)
-        return {"success": True, "platform": "dingtalk", "chat_id": chat_id, "message_id": result.message_id} if result.success else send_error(result.error or "DingTalk send failed")
-    if not ensure_dingtalk_deps():
-        return send_error("DingTalk dependencies not installed. Run: pip install 'dingtalk-stream>=0.20' httpx")
-    try:
-        import httpx as _httpx
-    except ImportError:
-        return send_error("httpx not installed")
-    adapter = DingTalkAdapter(pconfig)
-    adapter._http_client = _httpx.AsyncClient(timeout=30.0)
-    try:
-        last_result = None
-        if message.strip():
-            kind, _conv, staff = adapter._resolve_send_target(chat_id)
-            if kind == "dm" and not staff and webhook_url:
-                # Legacy DM text over the static robot webhook; media below still needs OpenAPI routing.
-                last_result = await _webhook_text_send(_httpx, webhook_url, message)
-            elif kind == "group":  # a webhook-less group send is a real OpenAPI call
-                last_result = await adapter._robot_send("sampleMarkdown", {"title": "Hermes", "text": adapter._normalize_markdown(message[: adapter.MAX_MESSAGE_LENGTH])}, chat_id)
-            elif staff:
-                last_result = await adapter._robot_send("sampleText", {"content": message[: adapter.MAX_MESSAGE_LENGTH]}, chat_id)
-            elif webhook_url:
-                last_result = await _webhook_text_send(_httpx, webhook_url, message)
-            else:
-                return send_error("DingTalk standalone send needs a group chat_id, or DINGTALK_DM_USER_ID for DMs (and DINGTALK_DM_CHAT_IDS to route this chat).")
-            if isinstance(last_result, dict):  # webhook helper returns error-dict on failure
-                return last_result
-            if not last_result.success:
-                return send_error(f"DingTalk send failed: {last_result.error}")
-        for media_path, _is_voice in media_files or []:
-            if not os.path.exists(media_path):
-                return send_error(f"Media file not found: {media_path}")
-            ext = os.path.splitext(media_path)[1].lower()
-            sender = adapter.send_image_file if (ext in _IMAGE_EXTS and not force_document) else adapter.send_document
-            last_result = await sender(chat_id, media_path)
-            if not last_result.success:
-                return send_error(f"DingTalk media send failed: {last_result.error}")
-        if last_result is None:
-            return send_error("No deliverable text or media remained after processing MEDIA tags")
-        return {"success": True, "platform": "dingtalk", "chat_id": chat_id, "message_id": last_result.message_id}
-    except Exception as e:
-        return send_error(f"DingTalk send failed: {e}")
-    finally:
-        await adapter._quiet(adapter._http_client.aclose(), "[%s] standalone http client close failed: %s")
+            return send_error(f"DingTalk send failed: {describe_proxy_error(e, env_proxy_for_redaction(webhook_url)) or e}")
 
 
 def interactive_setup() -> None:
