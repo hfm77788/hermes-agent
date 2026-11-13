@@ -50,7 +50,7 @@ except Exception:
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator, compile_mention_patterns
 from agent.i18n import t
-from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.base import BasePlatformAdapter, SendResult, describe_proxy_error, env_proxy_for_redaction
 from gateway.platforms.event import MessageEvent
 from gateway.platforms._shared import (
     apply_yaml_bridge as _apply_yaml_bridge, decode_json_list_literal as _decode_json_list_literal,
@@ -932,13 +932,15 @@ async def _webhook_text_send(httpx_mod, webhook_url: str, message: str) -> SendR
         if data.get("errcode", 0) != 0:
             return SendResult(success=False, error=f"DingTalk API error: {data.get('errmsg', 'unknown')}")
         return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
-    except Exception as e:
-        try:  # lazy import avoids a circular; strips access_token=… from any URL-bearing error text
+    except Exception as e:  # httpx reads HTTPS_PROXY itself: the text may echo it
+        try:  # send_message_tool._error redacts access_token; describe_proxy_error strips env proxy secrets (lazy import avoids a circular)
             from tools.send_message_tool import _error as _redact_error
-            msg = str(_redact_error(f"DingTalk send failed: {e}").get("error", e))
+            msg = str(_redact_error(f"DingTalk send failed: {describe_proxy_error(e, env_proxy_for_redaction(webhook_url)) or e}").get("error", e))
         except Exception:
-            msg = f"DingTalk send failed: {e}"
+            msg = f"DingTalk send failed: {describe_proxy_error(e, env_proxy_for_redaction(webhook_url)) or e}"
         return SendResult(success=False, error=msg)
+
+
 
 
 async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False):
@@ -997,8 +999,6 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
         return send_error(f"DingTalk send failed: {e}")
     finally:
         await adapter._quiet(adapter._http_client.aclose(), "[%s] standalone http client close failed: %s")
-
-
 def interactive_setup() -> None:
     """Configure DingTalk — QR scan (recommended) or manual credential entry."""
     from hermes_cli.config import save_env_value
