@@ -930,14 +930,15 @@ async def _webhook_text_send(httpx_mod, webhook_url: str, message: str) -> SendR
             resp.raise_for_status()
             data = resp.json()
         if data.get("errcode", 0) != 0:
-            return send_error(f"DingTalk API error: {data.get('errmsg', 'unknown')}")
-        return {"success": True, "platform": "dingtalk", "chat_id": chat_id}
+            return SendResult(success=False, error=f"DingTalk API error: {data.get('errmsg', 'unknown')}")
+        return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
     except Exception as e:  # httpx reads HTTPS_PROXY itself: the text may echo it
-        try:  # send_message_tool._error redacts access_token from webhook URLs (lazy import avoids a circular)
+        try:  # send_message_tool._error redacts access_token; describe_proxy_error strips env proxy secrets (lazy import avoids a circular)
             from tools.send_message_tool import _error as _redact_error
-            return _redact_error(f"DingTalk send failed: {describe_proxy_error(e, env_proxy_for_redaction(webhook_url)) or e}")
+            msg = str(_redact_error(f"DingTalk send failed: {describe_proxy_error(e, env_proxy_for_redaction(webhook_url)) or e}").get("error", e))
         except Exception:
-            return send_error(f"DingTalk send failed: {describe_proxy_error(e, env_proxy_for_redaction(webhook_url)) or e}")
+            msg = f"DingTalk send failed: {describe_proxy_error(e, env_proxy_for_redaction(webhook_url)) or e}"
+        return SendResult(success=False, error=msg)
 
 
 
