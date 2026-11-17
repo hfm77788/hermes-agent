@@ -1189,7 +1189,7 @@ class GatewayTurnProgressMixin:
     def _long_task_ack_settings(self, agent):
         """Return (delay_s, message) for an enabled long human turn, else None."""
         ctx = self._ctx
-        if ctx.mute_notification_reply or ctx.scheduled_heartbeat or not self._status_live():
+        if getattr(ctx, "mute_notification_reply", False) or getattr(ctx, "scheduled_heartbeat", False) or not self._status_live():
             return None
         gateway_cfg = ctx.user_config.get("gateway") or {}
         cfg = gateway_cfg.get("long_task_ack") or {}

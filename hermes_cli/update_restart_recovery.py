@@ -54,7 +54,6 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterable, Mapping
-from pathlib import Path
 from typing import Any
 
 _RECOVERY_ENV = "HERMES_UPDATE_RESTART_RECOVERY"
@@ -112,14 +111,6 @@ def _child_environment(profile: str | None = None) -> dict[str, str]:
     launch profile's bot tokens, so an API-only sibling polled the root bot (#135792). A sibling's env is
     the one the normal restart watcher gets; a same-profile child keeps an operator export.
 
-    A foreign-profile child is also credential-scoped (#135792): the launch process has already
-    loaded its own ``.env`` into ``os.environ``, and a sibling profile whose dotenv does not declare
-    ``TELEGRAM_BOT_TOKEN`` would fall back to it through
-    ``get_env_value_prefer_dotenv`` — so an API-only profile claimed the root's bot token and
-    long-polled its bot. ``served_profile_child_env`` drops the launch residue and overlays the
-    TARGET profile's own secrets, which is exactly the env a standalone ``hermes -p <name>``
-    builds for itself.
-
     Restarting the host multiplexer from a named profile does not copy this process's environ: the
     child is ``host_gateway_child_env`` (``served_profile_child_env`` for the default root) so the
     launching profile's platform credentials never become the primary adapter's.
@@ -130,14 +121,6 @@ def _child_environment(profile: str | None = None) -> dict[str, str]:
         from tools.environments.local import host_gateway_child_env
         _adopt_parent_provenance()
         env = host_gateway_child_env()
-    elif target != launch:
-        # Foreign profile: the launch dotenv is residue here, and its platform credentials
-        # are the leak #135792 reports.
-        from hermes_constants import get_default_hermes_root
-        from tools.environments.local import served_profile_child_env
-        env = served_profile_child_env(
-            target_home=_profile_home(target, get_default_hermes_root()),
-            inherit_credentials=True)
     else:
         env = None
         if profile is not None and profile != launch:
@@ -150,11 +133,6 @@ def _child_environment(profile: str | None = None) -> dict[str, str]:
         env.pop(marker, None)
     env[_RECOVERY_ENV] = "1"
     return env
-
-
-def _profile_home(profile: str, root: Path) -> Path:
-    """Home dir of *profile*: ``<root>/profiles/<name>``, or *root* for the default profile."""
-    return root if profile == "default" else root / "profiles" / profile
 
 
 def _run_profile_restart(profile: str, *, run: Callable[..., Any]) -> bool:

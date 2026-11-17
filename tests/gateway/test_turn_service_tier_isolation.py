@@ -37,6 +37,8 @@ def _turn(runner, chat_id, built):
                                 AIAgent=lambda **kw: built.update({chat_id: kw}) or SimpleNamespace(),
                                 progress_callback=None, _voice_ack_guild=[None], _native_slack_task_cards=False,
                                 _hooks_ref=SimpleNamespace(loaded_hooks=[]), _status_callback_sync=None,
+                                _status_adapter=None, _run_still_current=lambda: True,
+                                mute_notification_reply=False, scheduled_heartbeat=False,
                                 _event_callback_sync=None)
     turn._combined_ephemeral_prompt = lambda: None
     turn._setup_stream_consumer = lambda platform_key: (None, None, None, False)

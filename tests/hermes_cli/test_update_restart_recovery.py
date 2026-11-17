@@ -509,9 +509,3 @@ def test_child_env_keeps_launch_exports_for_its_own_profile(monkeypatch):
 
     assert env["TELEGRAM_BOT_TOKEN"] == "root-token"
 
-
-def test_profile_home_resolves_named_and_default(tmp_path):
-    recovery = importlib.import_module("hermes_cli.update_restart_recovery")
-    root = tmp_path / "hermes"
-    assert recovery._profile_home("default", root) == root
-    assert recovery._profile_home("api1", root) == root / "profiles" / "api1"

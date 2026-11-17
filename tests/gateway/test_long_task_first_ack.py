@@ -19,7 +19,7 @@ def _turn(message="推进闭环", enabled=True):
                 }
             }
         },
-        _status_adapter=object(),
+        _status_adapter_pinned=object(),
         _status_chat_id="cid",
         _run_still_current=lambda: True,
     )
