@@ -1180,6 +1180,11 @@ def _frontmatter_semantic_terms(frontmatter: dict) -> list[str]:
         if isinstance(hermes, dict):
             for key in ("tags", "triggers", "trigger", "related_skills"):
                 add(hermes.get(key))
+        # Older profile skills place discovery metadata directly under
+        # metadata.triggers (not metadata.hermes.triggers). Keep the canonical
+        # extractor as the only route into the existing retrieval index.
+        for key in ("tags", "triggers", "trigger", "related_skills"):
+            add(metadata.get(key))
     return list(dict.fromkeys(values))[:64]
 
 

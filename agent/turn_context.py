@@ -1033,6 +1033,12 @@ def _memory_query_text(original_user_message: Any) -> str:
 def _skill_turn_retrieval(agent: Any, original_user_message: Any) -> str:
     """Retrieve a bounded Skill shortlist for this turn without mutating the system prompt."""
     query = _memory_query_text(original_user_message).strip()
+    # The Kanban owner may supply an independently verified business-intent
+    # string for this one turn. Its full execution policy still reaches the
+    # model, but policy boilerplate must not become skill-search keywords.
+    trusted = getattr(agent, "_trusted_skill_routing_query", None)
+    if isinstance(trusted, str) and 0 < len(trusted.strip()) <= 2500:
+        query = trusted.strip()
     catalog = getattr(agent, "_skill_retrieval_catalog", None) or []
     if not catalog:
         # A resumed session may restore the persisted system-prompt bytes without

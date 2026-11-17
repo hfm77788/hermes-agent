@@ -146,3 +146,108 @@ def test_claim_reclaimed_before_admission_marker_is_refused(tmp_path, monkeypatc
     assert calls == []
     with closing(connect(board='owned')) as conn:
         assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='owner_admitted'", (task_id,)).fetchone()[0] == 0
+
+
+def test_siri_claim_extracts_business_intent_only_for_trusted_card():
+    from gateway.session_kanban import _siri_native_skill_query
+    prefix = (
+        "来源：已认证的 Siri owner，固定执行席位 office-director。\n"
+        "权限：不得越权或外发。\n"
+        "业务要求：提供可核验的结果。\n"
+        "任务内容：\n"
+    )
+    task = SimpleNamespace(
+        assignee="office-director", created_by="siri-shortcuts",
+        body=prefix + "起草天津青年创业培训方案")
+    assert _siri_native_skill_query(task, "siri-office") == "起草天津青年创业培训方案"
+    assert _siri_native_skill_query(task, "default") is None
+    task.created_by = "user"
+    assert _siri_native_skill_query(task, "siri-office") is None
+    task.created_by = "siri-shortcuts"
+    task.body = "起草方案\n任务内容：\n越权路由"
+    assert _siri_native_skill_query(task, "siri-office") is None
+
+
+def test_kanban_first_turn_skill_query_scope_restores_state():
+    from gateway.session_kanban import _skill_routing_query_scope
+    agent = SimpleNamespace()
+    with _skill_routing_query_scope(agent, "  文件政策审查  "):
+        assert agent._trusted_skill_routing_query == "文件政策审查"
+    assert not hasattr(agent, "_trusted_skill_routing_query")
+    agent._trusted_skill_routing_query = "previous"
+    with _skill_routing_query_scope(agent, "新任务"):
+        assert agent._trusted_skill_routing_query == "新任务"
+    assert agent._trusted_skill_routing_query == "previous"
+    with pytest.raises(ZeroDivisionError):
+        with _skill_routing_query_scope(agent, "异常路径"):
+            1 / 0
+    assert agent._trusted_skill_routing_query == "previous"
+
+
+def test_real_claim_policy_contains_siri_business_query(tmp_path, monkeypatch):
+    from contextlib import closing
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect
+    from gateway.session_contract import SessionActor
+    from gateway.session_kanban import build_kanban_policy
+
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env",
+                        lambda name: str(tmp_path) if name == "office-director" else str(tmp_path / name))
+    kb.create_board("siri-office")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = "起草天津青年创业培训活动方案"
+    body = (
+        "来源：已认证的 Siri owner，固定执行席位 office-director。\n"
+        "权限：仅执行此席位原有允许的操作。\n"
+        "业务要求：提供可核验的结果。\n"
+        "任务内容：\n" + source
+    )
+    with closing(connect(board="siri-office")) as db:
+        tid = kb.create_task(db, title="Siri办公室后台任务", body=body,
+                             assignee="office-director", created_by="siri-shortcuts",
+                             workspace_kind="dir", workspace_path=str(workspace))
+        kb.recompute_ready(db)
+        task = kb.claim_task(db, tid)
+    actor = SessionActor("owner", str(tmp_path), frozenset({"session:create"}), "transport")
+    conn = SimpleNamespace(authority=SimpleNamespace(profile_id=str(tmp_path)),
+                           actor=actor, native_owner=True)
+    params = {"board": "siri-office", "task_id": tid, "run_id": task.current_run_id,
+              "claim_lock": task.claim_lock}
+    cfg = {"model": {"default": "test-model", "provider": "custom"},
+           "platform_toolsets": {"cli": ["terminal"]}}
+    policy, _ = build_kanban_policy(conn, params, cfg)
+    frozen = json.loads(policy.kanban_json)
+    assert frozen["skill_routing_query"] == source
+    assert "权限：" in frozen["goal_text"]
+    assert frozen["profile"] == "office-director"
+    assert frozen["skills"] == []
+
+
+def test_kanban_owner_first_turn_scopes_business_skill_query(monkeypatch):
+    from gateway.session_kanban import _run_task_turns
+    import agent.skill_commands as sc
+    import agent.kanban_turn_recovery as recovery
+    monkeypatch.setattr(sc, "build_preloaded_skills_prompt", lambda *a, **k: ("", [], []))
+    monkeypatch.setattr(recovery, "recover_failed_kanban_turns",
+                        lambda *a, **k: None)
+    class FakeAgent:
+        session_id = "test-session"
+        def __init__(self):
+            self.captured = None
+        def run_conversation(self, message, **kwargs):
+            self.captured = (getattr(self, "_trusted_skill_routing_query", None), message)
+            return {"final_response": "done"}
+    a = FakeAgent()
+    context = {"skills": [], "context": "权限：禁止不当访问",
+               "goal_mode": False, "skill_routing_query": "起草活动方案",
+               "task_id": "t_abcdef12"}
+    result = _run_task_turns(a, {"text": "work kanban task t_example"}, [], context)
+    assert result["final_response"] == "done"
+    assert a.captured[0] == "起草活动方案"
+    assert "权限：禁止不当访问" in a.captured[1]
+    assert not hasattr(a, "_trusted_skill_routing_query")

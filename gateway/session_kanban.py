@@ -11,6 +11,48 @@ import sqlite3
 from hermes_state_runtime import RuntimeStoreError
 
 
+def _siri_native_skill_query(task, board):
+    """Use a claimed, Siri-shaped Kanban card's business text for Skill ranking.
+
+    Board, assignee, source label, and the expected envelope restrict this
+    compatibility path. created_by is NOT authentication: the native owner
+    claim and existing tool policy remain the only execution authority.
+    The extracted text affects candidate ranking, never tool privileges or
+    Skill force-loading.
+    """
+    if (board != "siri-office" or task.assignee != "office-director"
+            or task.created_by != "siri-shortcuts"):
+        return None
+    body = task.body
+    prefix = "来源：已认证的 Siri owner，固定执行席位 office-director。\n"
+    marker = "\n任务内容：\n"
+    if not isinstance(body, str) or not body.startswith(prefix):
+        return None
+    policy, sep, query = body.partition(marker)
+    if not sep or "权限：" not in policy or "业务要求：" not in policy:
+        return None
+    query = query.strip()
+    return query if 0 < len(query) <= 2500 else None
+
+
+@contextlib.contextmanager
+def _skill_routing_query_scope(agent, query):
+    """No cross-turn routing leakage after one Kanban worker invocation."""
+    if not isinstance(query, str) or not 0 < len(query.strip()) <= 2500:
+        yield
+        return
+    sentinel = object()
+    old = getattr(agent, "_trusted_skill_routing_query", sentinel)
+    agent._trusted_skill_routing_query = query.strip()
+    try:
+        yield
+    finally:
+        if old is sentinel:
+            delattr(agent, "_trusted_skill_routing_query")
+        else:
+            agent._trusted_skill_routing_query = old
+
+
 def build_kanban_policy(connection, params, config):
     from hermes_cli import kanban_db as kb
     from hermes_cli.profiles import resolve_profile_env
@@ -63,6 +105,11 @@ def build_kanban_policy(connection, params, config):
         skills=skills, goal_mode=task.goal_mode, goal_max_turns=task.goal_max_turns,
         goal_text='\n\n'.join(p for p in (task.title, task.body) if p), context=context,
         max_runtime_seconds=task.max_runtime_seconds, accept_hooks=True)
+    # Source-validated card metadata is frozen in the owner policy and cannot
+    # be replaced by a user message during dispatch or resumed sessions.
+    routing_query = _siri_native_skill_query(task, board)
+    if routing_query:
+        context["skill_routing_query"] = routing_query
     context['db'] = str(path)
     request = json.loads(policy.request_json)
     request.update(source='kanban', board=board, task_id=task.id, run_id=task.current_run_id)
@@ -387,7 +434,9 @@ def _run_task_turns(agent, frame, history, context):
     if missing and not loaded:
         raise ValueError('kanban_skills_unavailable')
     prompt = '\n\n'.join(p for p in (skills, context['context'], frame['text']) if p)
-    result = agent.run_conversation(prompt, conversation_history=history, turn_author=KANBAN_TURN_AUTHOR)
+    with _skill_routing_query_scope(agent, context.get("skill_routing_query")):
+        result = agent.run_conversation(
+            prompt, conversation_history=history, turn_author=KANBAN_TURN_AUTHOR)
 
     def recover(nudge):
         nonlocal result
