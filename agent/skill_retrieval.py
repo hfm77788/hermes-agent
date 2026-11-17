@@ -327,6 +327,13 @@ def retrieve_skills(query: str, catalog: list[dict[str, Any]], *, top_k: int = 8
     semantic = _semantic_scores(query, catalog)
     intent = [_intent_match_score(query, entry) for entry in catalog]
     domain = [_lead_domain_match(query, entry) for entry in catalog]
+    # A short, generic utterance should not light up unrelated Skills merely
+    # because a ubiquitous two-character fragment occurs deep in the catalog.
+    # Preserve genuine short tasks with a declared trigger, explicit Skill
+    # name, or strong lexical signal (for example a Chinese form request).
+    if (len(_compact(query)) <= 4 and max(exact) < 0.8
+            and max(intent) < 0.4 and max(lexical) < 0.08):
+        return []
     exact_ranks = _rank_map(exact, 0.8)
     # Low absolute lexical scores are common for a short Chinese request
     # against long Skill descriptions. Independent semantic-only LSA hits are

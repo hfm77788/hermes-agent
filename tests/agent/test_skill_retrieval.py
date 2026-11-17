@@ -244,3 +244,20 @@ def test_contract_topic_outranks_generic_writing_action():
     ]
     hits = retrieve_skills("起草服务协议", catalog)
     assert hits and hits[0]["name"] == "contract-review-drafting"
+
+
+
+def test_short_generic_phrase_has_no_low_confidence_skill_candidate():
+    catalog = [
+        _entry("skill-curator", "Inspect and manage skill tests and history"),
+        _entry("reference-writing", "Write and review materials and test documents"),
+    ]
+    assert retrieve_skills("测试一下", catalog) == []
+
+
+def test_short_true_business_trigger_is_not_discarded():
+    catalog = [
+        _entry("wps-form-query", "WPS forms collection", semantic_terms=["表单"]),
+        _entry("deploy", "server management"),
+    ]
+    assert retrieve_skills("表单", catalog)[0]["name"] == "wps-form-query"
