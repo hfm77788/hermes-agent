@@ -173,3 +173,74 @@ def test_trusted_skill_query_only_affects_current_retrieval():
     assert "- system-maintenance" not in context
     del agent._trusted_skill_routing_query
     assert "system-maintenance" in _skill_turn_retrieval(agent, wrapped)
+
+
+def test_chinese_declared_skill_trigger_survives_long_colloquial_prompt():
+    catalog = [
+        _entry("reference-writing", "统一写作Skill", semantic_terms=["起草", "审稿", "润色", "调研报告"]),
+        _entry("lark-im", "飞书即时通讯：收发消息和群聊"),
+    ]
+    hits = retrieve_skills("马主任，我想请你审稿，帮我核对文字逻辑是否准确", catalog)
+    assert hits and hits[0]["name"] == "reference-writing"
+    assert hits[0]["intent_score"] >= 0.9
+
+
+def test_generic_description_lead_topic_retrieves_contract_not_writer():
+    catalog = [
+        _entry("reference-writing", "统一写作Skill。修改审核润色"),
+        _entry("contract-review-drafting", "合同/协议审核起草时加载。核对合同责任和条款"),
+    ]
+    hits = retrieve_skills("帮我检查这份合作合同", catalog)
+    assert hits and hits[0]["name"] == "contract-review-drafting"
+    assert hits[0]["intent_score"] >= 0.75
+
+
+def test_semantic_only_wrong_domain_does_not_steal_chinese_request(monkeypatch):
+    import agent.skill_retrieval as sr
+
+    catalog = [
+        _entry("reference-writing", "统一写作Skill", semantic_terms=["调研报告", "起草"]),
+        _entry("lark-im", "飞书即时通讯。收发消息和群聊"),
+    ]
+    monkeypatch.setattr(sr, "_semantic_scores", lambda _q, _c: [0.1, 0.95])
+    hits = sr.retrieve_skills("调研青年创业政策形成报告", catalog)
+    assert hits and hits[0]["name"] == "reference-writing"
+    assert "lark-im" not in [x["name"] for x in hits]
+
+
+def test_name_invocation_has_precedence_over_matched_chinese_trigger():
+    catalog = [
+        _entry("reference-writing", "统一写作Skill", semantic_terms=["起草", "通知"]),
+        _entry("ma-secretary-writing", "兼容入口"),
+    ]
+    hits = retrieve_skills("使用 ma-secretary-writing 起草通知", catalog)
+    assert hits[0]["name"] == "ma-secretary-writing"
+
+
+def test_chinese_empty_or_greeting_does_not_force_a_skill():
+    catalog = [
+        _entry("reference-writing", "统一写作Skill", semantic_terms=["起草", "润色"]),
+        _entry("contract-review-drafting", "合同/协议审核起草时加载"),
+    ]
+    for query in ("", "你好", "今天几点了", "现在几点"):
+        assert retrieve_skills(query, catalog) == []
+
+
+def test_domain_relevance_outranks_generic_action_trigger():
+    catalog = [
+        _entry("lark-im", "飞书即时通讯：收发消息和管理群聊。搜索聊天记录和回复消息"),
+        _entry("social-search", "小红书公开笔记与用户数据分析", semantic_terms=["搜索", "消息"]),
+        _entry("lark-contact", "飞书 / Lark 通讯录"),
+    ]
+    for query in ("搜索飞书聊天消息", "给我的飞书私聊回复消息"):
+        hits = retrieve_skills(query, catalog)
+        assert hits and hits[0]["name"] == "lark-im", (query, hits)
+
+
+def test_contract_topic_outranks_generic_writing_action():
+    catalog = [
+        _entry("reference-writing", "统一写作Skill", semantic_terms=["起草", "通知稿"]),
+        _entry("contract-review-drafting", "合同/协议审核起草时加载。审查保密及违约条款"),
+    ]
+    hits = retrieve_skills("起草服务协议", catalog)
+    assert hits and hits[0]["name"] == "contract-review-drafting"

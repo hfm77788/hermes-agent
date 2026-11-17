@@ -25,8 +25,8 @@ _SEMANTIC_VOCAB_MAX = 256
 _SEMANTIC_RANK_MAX = 24
 _RRF_K = 40.0
 
-_SEMANTIC_CACHE: "OrderedDict[str, dict[str, Any] | None]" = OrderedDict()
-_LEXICAL_CACHE: "OrderedDict[str, tuple[tuple[set[str], set[str], set[str]], ...]]" = OrderedDict()
+_SEMANTIC_CACHE: OrderedDict[str, dict[str, Any] | None] = OrderedDict()
+_LEXICAL_CACHE: OrderedDict[str, tuple[tuple[set[str], set[str], set[str]], ...]] = OrderedDict()
 _SEMANTIC_CACHE_LOCK = threading.Lock()
 
 
@@ -250,6 +250,62 @@ def _lexical_score(query: str, entry: dict[str, Any]) -> float:
     )
 
 
+def _lead_domain_match(query: str, entry: dict[str, Any]) -> bool:
+    """Whether a request names the domain/service announced by a Skill's lead.
+
+    A specific platform phrase is stronger than generic action words shared
+    across services. No platform or Skill names are hard-coded in the router.
+    """
+    compact_query = _compact(query)
+    lead = str(entry.get("description") or "").split("。", 1)[0][:64]
+    for part in re.split(r"[/、，:：;；\s()（）—]+", lead)[:3]:
+        token = _compact(part)
+        if len(token) < 2 or not _CJK_RUN_RE.fullmatch(token):
+            continue
+        if (len(token) <= 8 and token in compact_query
+                or len(token) >= 4 and token[:2] in compact_query):
+            return True
+    return False
+
+
+def _intent_match_score(query: str, entry: dict[str, Any]) -> float:
+    """High-precision Chinese match from declared triggers or the description's lead topic.
+
+    This is Skill metadata, not a second route table or new tool authority.
+    A short declared trigger matched in a longer conversational query should not
+    be diluted by a 1000-token catalog description. Partial matches have lower
+    confidence and are only considered for long, domain-bearing terms.
+    """
+    compact_query = _compact(query)
+    if not compact_query:
+        return 0.0
+    raw = entry.get("semantic_terms") or []
+    terms = [raw] if isinstance(raw, str) else raw if isinstance(raw, (list, tuple, set)) else []
+    strongest = 0.0
+    for term in terms:
+        token = _compact(term)
+        if not token or len(token) < 2 or len(token) > 36:
+            continue
+        if token in compact_query:
+            strongest = max(strongest, 1.0 if len(token) >= 3 else 0.9)
+        elif len(token) >= 4 and _CJK_RUN_RE.fullmatch(token) and token[:2] in compact_query:
+            strongest = max(strongest, 0.4)
+
+    # The first clause is a skill's topical label, not its procedural body.
+    # For example "合同/协议审核起草..." signals a contract domain; "审核"
+    # appearing 100 lines later in an unrelated skill does not.
+    lead = str(entry.get("description") or "").split("。", 1)[0][:64]
+    for part in re.split(r"[/、，:：;；\s()（）—]+", lead)[:3]:
+        token = _compact(part)
+        if len(token) < 2 or not _CJK_RUN_RE.fullmatch(token):
+            continue
+        if len(token) <= 8 and token in compact_query:
+            strongest = max(strongest, 0.75)
+        elif len(token) >= 4 and token[:2] in compact_query:
+            strongest = max(strongest, 0.55)
+    return strongest
+
+
 def _rank_map(scores: Iterable[float], minimum: float) -> dict[int, int]:
     ranked = sorted(
         ((idx, float(score)) for idx, score in enumerate(scores) if float(score) >= minimum),
@@ -269,17 +325,28 @@ def retrieve_skills(query: str, catalog: list[dict[str, Any]], *, top_k: int = 8
         for name_tokens, semantic_tokens, doc_tokens in _lexical_state(catalog)
     ]
     semantic = _semantic_scores(query, catalog)
+    intent = [_intent_match_score(query, entry) for entry in catalog]
+    domain = [_lead_domain_match(query, entry) for entry in catalog]
     exact_ranks = _rank_map(exact, 0.8)
-    lexical_ranks = _rank_map(lexical, 0.08)
-    semantic_ranks = _rank_map(semantic, 0.12)
+    # Low absolute lexical scores are common for a short Chinese request
+    # against long Skill descriptions. Independent semantic-only LSA hits are
+    # too noisy: require at least one verified lexical/metadata anchor.
+    lexical_ranks = _rank_map(lexical, 0.025)
+    intent_ranks = _rank_map(intent, 0.4)
+    semantic_ranks = _rank_map(
+        [score if lexical[i] >= 0.025 or intent[i] >= 0.4 else 0.0
+         for i, score in enumerate(semantic)], 0.12)
 
     results: list[dict[str, Any]] = []
     for idx, entry in enumerate(catalog):
-        if idx not in exact_ranks and idx not in lexical_ranks and idx not in semantic_ranks:
+        if (idx not in exact_ranks and idx not in lexical_ranks
+                and idx not in intent_ranks and idx not in semantic_ranks):
             continue
         fused = 0.0
         if idx in exact_ranks:
             fused += 4.0 / (_RRF_K + exact_ranks[idx])
+        if idx in intent_ranks:
+            fused += 2.0 / (_RRF_K + intent_ranks[idx])
         if idx in lexical_ranks:
             fused += 4.0 / (_RRF_K + lexical_ranks[idx])
         if idx in semantic_ranks:
@@ -287,6 +354,8 @@ def retrieve_skills(query: str, catalog: list[dict[str, Any]], *, top_k: int = 8
         results.append({
             **entry,
             "exact_score": exact[idx],
+            "intent_score": intent[idx],
+            "relevance_score": lexical[idx] + 0.06 * intent[idx] + 0.14 * domain[idx],
             "lexical_score": lexical[idx],
             "semantic_score": semantic[idx],
             "fusion_score": fused,
@@ -294,6 +363,10 @@ def retrieve_skills(query: str, catalog: list[dict[str, Any]], *, top_k: int = 8
     results.sort(
         key=lambda item: (
             -float(item["exact_score"]),
+            # Contextual words and declared triggers reinforce each other;
+            # a generic action trigger ("搜索") must not beat a stronger
+            # matching service/domain description ("飞书即时通讯").
+            -float(item["relevance_score"]),
             -float(item["fusion_score"]),
             -float(item["lexical_score"]),
             -float(item["semantic_score"]),

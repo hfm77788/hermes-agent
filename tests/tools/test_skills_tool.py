@@ -1134,3 +1134,21 @@ class TestTrustWarningSymlinkAware:
             self._log("sym", root / "sym" / "SKILL.md", [root], root)
 
         assert "outside the trusted" in caplog.text, caplog.text
+
+
+def test_successful_skill_view_exposes_source_version_and_digest(tmp_path, monkeypatch):
+    import hashlib
+    from agent import skill_utils
+    from tools import skills_tool
+    skill_root = tmp_path / "skills"
+    demo = skill_root / "sample"
+    demo.mkdir(parents=True)
+    source = "---\nname: sample\ndescription: example\nversion: 1.4\n---\nSample content"
+    (demo / "SKILL.md").write_text(source, encoding="utf-8")
+    monkeypatch.setattr(skills_tool, "_skills_dir", lambda: skill_root)
+    monkeypatch.setattr(skills_tool, "skill_search_dirs", lambda: ([(1, skill_root)], skill_root))
+    monkeypatch.setattr(skill_utils, "get_skill_search_roots", lambda *a, **k: [(1, skill_root)])
+    parsed = json.loads(skills_tool.skill_view("sample", preprocess=False))
+    assert parsed["success"] is True
+    assert str(parsed["source_version"]) == "1.4"
+    assert parsed["source_sha256"] == hashlib.sha256(source.encode()).hexdigest()
