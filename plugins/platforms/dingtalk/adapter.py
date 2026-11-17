@@ -934,7 +934,7 @@ async def _webhook_text_send(httpx_mod, webhook_url: str, message: str) -> SendR
         return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
     except Exception as e:  # httpx reads HTTPS_PROXY itself: the text may echo it
         try:  # send_message_tool._error redacts access_token; describe_proxy_error strips env proxy secrets (lazy import avoids a circular)
-            from tools.send_message_tool import _error as _redact_error
+            from gateway.outbound.send import _error as _redact_error
             msg = str(_redact_error(f"DingTalk send failed: {describe_proxy_error(e, env_proxy_for_redaction(webhook_url)) or e}").get("error", e))
         except Exception:
             msg = f"DingTalk send failed: {describe_proxy_error(e, env_proxy_for_redaction(webhook_url)) or e}"
