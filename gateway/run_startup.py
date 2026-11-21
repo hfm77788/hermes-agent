@@ -1623,7 +1623,7 @@ class GatewayStartupMixin:
         if not getattr(self.config, "session_store_lazy_open", False):
             return
         try:
-            await asyncio.to_thread(self.session_store._open_session_db_for_active_scope)
+            await asyncio.to_thread(self.session_store._open_persistence_for_active_scope)
             logger.info("Lazy SessionDB warmup completed after platform startup")
         except Exception as exc:
             logger.warning("Lazy SessionDB warmup failed; first durable turn will retry: %s", exc)

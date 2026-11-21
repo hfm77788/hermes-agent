@@ -39,7 +39,7 @@ def _run_state_db_auto_maintenance(session_db) -> None:
                 continue
             try:
                 count = repair()
-            # Every SessionDB refusal: sqlite/IO, RuntimeStoreError (ValueError), and the
+            # Every SessionDB refusal: sqlite/IO, AuthorityRefusal (ValueError), and the
             # hermes_state_errors busy/replaced family (RuntimeError).
             except (sqlite3.Error, OSError, ValueError, RuntimeError) as _exc:
                 # Latched below regardless: a repair this store refuses (live ledger work,
@@ -57,17 +57,6 @@ def _run_state_db_auto_maintenance(session_db) -> None:
             session_db.maybe_auto_archive(
                 idle_days=float(cfg.get("auto_archive_days", 3)),
                 min_interval_hours=int(cfg.get("min_interval_hours", 24)),
-            )
-
-        # Cold storage is independent of destructive prune and runs first. It writes a
-        # checksummed restorable bundle before any hot-row delete and never blocks startup.
-        if cfg.get("auto_cold_archive", False):
-            session_db.maybe_auto_cold_archive(
-                older_than_days=int(cfg.get("cold_archive_days", 90)),
-                min_interval_hours=int(cfg.get("cold_archive_min_interval_hours", 24)),
-                sessions_dir=_hermes_home_maint / "sessions",
-                vacuum=bool(cfg.get("vacuum_after_prune", True)),
-                min_vacuum_interval_days=int(cfg.get("min_vacuum_interval_days", 30)),
             )
 
         if not cfg.get("auto_prune", False):
