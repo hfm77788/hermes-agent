@@ -493,3 +493,83 @@ def test_typesafe_key_centralized_reads_default_root_only(mod, monkeypatch):
 
     assert mod._typesafe_key(centralized=True) == "central-test-secret"
     assert seen == {"set": "/central/hermes", "reset": fake_token}
+
+
+
+def test_call_jev_honours_url_and_key_env_overrides(mod, monkeypatch):
+    captured = {}
+
+    class FakeResp:
+        status = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"answers": {"effort": {"choice": "low", "confidence": 0.9}}}
+
+    class FakeClient:
+        def __init__(self, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, headers=None, json=None):
+            captured["url"] = url
+            captured["headers"] = dict(headers or {})
+            captured["body"] = dict(json or {})
+            return FakeResp()
+
+    monkeypatch.setenv("JEV_SYSTEMONE_API_KEY", "plan-secret")
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.setattr(mod.httpx, "Client", FakeClient)
+
+    payload, latency = mod._call_jev(
+        state="s", model="decision-model-preview", timeout=1.5, centralized=False,
+        url="https://token-plan.example/compatible-mode/v1/systemone",
+        key_env="JEV_SYSTEMONE_API_KEY",
+    )
+    assert captured["url"] == "https://token-plan.example/compatible-mode/v1/systemone"
+    assert captured["headers"]["Authorization"] == "Bearer plan-secret"
+    assert captured["body"]["model"] == "decision-model-preview"
+    assert payload["answers"]["effort"]["choice"] == "low"
+
+
+def test_settings_default_to_typesafe_when_unset(mod, monkeypatch):
+    ctx = Ctx()
+    ctx.settings = {}
+    settings = mod._settings(ctx)
+    assert settings["jev_url"] == "https://api.typesafe.ai/v1/systemone"
+    assert settings["jev_key_env"] == "TYPESAFE_API_KEY"
+
+
+def test_settings_propagate_bailian_overrides_to_call(mod, monkeypatch):
+    seen = {}
+
+    def spy(**kw):
+        seen.update(kw)
+        raise RuntimeError("boom-stop-here")
+
+    ctx = Ctx({"jev_url": "https://token-plan.example/compatible-mode/v1/systemone",
+               "jev_key_env": "JEV_SYSTEMONE_API_KEY",
+               "jev_model": "decision-model-preview"})
+    monkeypatch.setattr(mod, "_call_jev", spy)
+    import builtins
+    result = mod.route_request(
+        ctx,
+        request=_request(),
+        provider=mod._DEFAULT_PROVIDER if hasattr(mod, "_DEFAULT_PROVIDER") else "custom:aliyun_qwen",
+        base_url="",
+        api_mode="chat_completions",
+        model="qwen3.8-flash",
+        turn_id="t-override",
+        session_id="session-1",
+        api_call_count=1,
+    )
+    assert seen.get("url") == "https://token-plan.example/compatible-mode/v1/systemone"
+    assert seen.get("key_env") == "JEV_SYSTEMONE_API_KEY"
+    assert seen.get("model") == "decision-model-preview"
