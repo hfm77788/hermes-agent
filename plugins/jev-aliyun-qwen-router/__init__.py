@@ -27,6 +27,8 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone"
+_DEFAULT_JEV_URL = _TYPESAFE_URL
+_DEFAULT_JEV_KEY_ENV = "TYPESAFE_API_KEY"
 _DEFAULT_JEV_MODEL = "jev-latest"
 _DEFAULT_FLASH_MODEL = "qwen3.8-flash"
 _DEFAULT_MAX_MODEL = "qwen3.8-max-0902"
@@ -221,6 +223,8 @@ def _settings(ctx: Any) -> dict[str, Any]:
         "flash_model": str(value("flash_model", _DEFAULT_FLASH_MODEL) or _DEFAULT_FLASH_MODEL).strip(),
         "max_model": str(value("max_model", _DEFAULT_MAX_MODEL) or _DEFAULT_MAX_MODEL).strip(),
         "jev_model": str(value("jev_model", _DEFAULT_JEV_MODEL) or _DEFAULT_JEV_MODEL).strip(),
+        "jev_url": str(value("jev_url", _DEFAULT_JEV_URL) or _DEFAULT_JEV_URL).strip(),
+        "jev_key_env": str(value("jev_key_env", _DEFAULT_JEV_KEY_ENV) or _DEFAULT_JEV_KEY_ENV).strip(),
         "timeout_seconds": _as_float(value("timeout_seconds", 1.5), 1.5, low=0.2, high=10.0),
         "min_effort_confidence": _as_float(
             value("min_effort_confidence", 0.50), 0.50, low=0.0, high=1.0
@@ -381,7 +385,7 @@ def _probability(value: Any) -> float | None:
     return parsed
 
 
-def _typesafe_key(*, centralized: bool) -> str:
+def _typesafe_key(*, centralized: bool, key_env: str = _DEFAULT_JEV_KEY_ENV) -> str:
     """Resolve the Jev credential without copying it into every named profile.
 
     Legacy mode keeps profile isolation: only the current process/profile environment is used.
@@ -389,7 +393,7 @@ def _typesafe_key(*, centralized: bool) -> str:
     the key from the default Hermes root under a context-local home override. The value is never
     written into the named profile or process-global environment.
     """
-    direct = os.environ.get("TYPESAFE_API_KEY", "").strip()
+    direct = os.environ.get(key_env, "").strip()
     if direct or not centralized:
         return direct
     try:
@@ -402,7 +406,7 @@ def _typesafe_key(*, centralized: bool) -> str:
 
         token = set_hermes_home_override(get_default_hermes_root())
         try:
-            return str(get_env_value("TYPESAFE_API_KEY") or "").strip()
+            return str(get_env_value(key_env) or "").strip()
         finally:
             reset_hermes_home_override(token)
     except Exception:
@@ -410,15 +414,16 @@ def _typesafe_key(*, centralized: bool) -> str:
 
 
 def _call_jev(
-    *, state: str, model: str, timeout: float, centralized: bool = False
+    *, state: str, model: str, timeout: float, centralized: bool = False,
+    url: str = _DEFAULT_JEV_URL, key_env: str = _DEFAULT_JEV_KEY_ENV,
 ) -> tuple[dict[str, Any], int]:
-    key = _typesafe_key(centralized=centralized)
+    key = _typesafe_key(centralized=centralized, key_env=key_env)
     if not key:
-        raise RuntimeError("typesafe_key_missing")
+        raise RuntimeError("jev_key_missing")
     started = time.perf_counter()
     with httpx.Client(timeout=timeout) as client:
         response = client.post(
-            _TYPESAFE_URL,
+            url,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             json={"state": state, "model": model, "questions": _QUESTIONS},
         )
@@ -598,6 +603,8 @@ def route_request(ctx: Any, **kwargs: Any) -> dict[str, Any] | None:
                 model=settings["jev_model"],
                 timeout=settings["timeout_seconds"],
                 centralized=settings["centralized_profile_policy"],
+                url=settings["jev_url"],
+                key_env=settings["jev_key_env"],
             )
             decision = _parse_route(
                 response,
