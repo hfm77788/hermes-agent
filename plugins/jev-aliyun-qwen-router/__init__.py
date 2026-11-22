@@ -267,7 +267,15 @@ def _configured_provider_base_urls() -> dict[str, str]:
             continue
         base_url = _normalized_base_url(entry.get("base_url"))
         if base_url:
-            result[key.strip()] = base_url
+            bare = key.strip()
+            result[bare] = base_url
+            if not bare.lower().startswith("custom:"):
+                # Core normalizes named custom providers (model.provider
+                # "custom:aliyun_qwen" -> provider="custom" + base_url) before
+                # llm_request middleware, and allowlists use the prefixed id.
+                # Index bare config keys under the prefixed id too so both
+                # spellings match.
+                result.setdefault(f"custom:{bare}", base_url)
     return result
 
 

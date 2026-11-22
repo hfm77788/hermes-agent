@@ -321,6 +321,27 @@ def test_normalized_custom_provider_rejects_other_custom_endpoint(mod, monkeypat
     assert calls == []
 
 
+def test_bare_custom_provider_key_gets_prefixed_alias_in_lookup(mod, monkeypatch):
+    import types
+
+    fake_cfg = types.ModuleType("hermes_cli.config")
+    fake_cfg.load_config_readonly = lambda: {
+        "providers": {
+            "aliyun_qwen": {"base_url": "https://token-plan.example.com/compatible-mode/v1"},
+            "custom:kimi_k3": {"base_url": "https://openrouter.example.com/api/v1"},
+        }
+    }
+    fake_pkg = types.ModuleType("hermes_cli")
+    fake_pkg.config = fake_cfg
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_pkg)
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", fake_cfg)
+    urls = mod._configured_provider_base_urls()
+    assert urls["aliyun_qwen"] == "https://token-plan.example.com/compatible-mode/v1"
+    assert urls["custom:aliyun_qwen"] == "https://token-plan.example.com/compatible-mode/v1"
+    assert "custom:kimi_k3" in urls
+    assert "custom:custom:kimi_k3" not in urls
+
+
 def test_provider_default_medium_is_routeable_by_default(mod, monkeypatch):
     monkeypatch.setattr(mod, "_call_jev", lambda **_: (_response(effort="low"), 1))
     request = _request(reasoning_effort="medium")
