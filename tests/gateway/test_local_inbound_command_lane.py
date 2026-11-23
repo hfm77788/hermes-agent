@@ -2,20 +2,30 @@
 
 ``run_local_inbound`` once hardcoded ``allow_gateway_control=False``, which kept
 ``MessageEvent.is_command()``/``get_command()`` permanently None for injected text
-(no diagnosis ticket: t_6196a57c). The hema teacher health check's ``/new``
-therefore ran as a normal model turn: the session never reset, the model answered
-with fake 「已开新会话。」 receipts, and ``/new`` persisted as a user message.
+(diagnosis t_6196a57c). The hema teacher health check's ``/new`` therefore ran as
+a normal model turn: the session never reset, the model answered with fake
+「已开新会话。」 receipts, and ``/new`` persisted as a user message.
 
-The gate now mirrors ``text.startswith("/")``. These tests pin BOTH halves of the
-contract: slash text opens the native command lane, and every other injection
-behaves byte-for-byte like before (whitelist, slash-access gate and the
-t_479a04ac message-id rendezvous untouched).
+The gate now opens ONLY for slash text that names a registered gateway command,
+mirroring the native chain's own entry predicate (``get_command`` parsing →
+``resolve_command`` alias canonicalisation → ``is_gateway_known_command``).
+Everything else — plain text, unknown names, path-like pseudo names, skill
+slashes — keeps the pre-repair model-lane behaviour, and because the rendezvous
+short-circuit shares this one predicate, such text also keeps the t_479a04ac
+grace wait (t_6196a57c §2.2: a ``startswith("/")`` shortcut would skip it and
+drop the receipt). Whitelist, slash-access gate and the API-lane forced False
+are untouched.
 """
 import asyncio
 
+import pytest
+
 from gateway.config import Platform
 from gateway.run import GatewayRunner
-from gateway.run_local_inbound import inject_local_inbound
+from gateway.run_local_inbound import (
+    _injected_slash_opens_command_lane,
+    inject_local_inbound,
+)
 from gateway.run_turn import _publish_local_inbound_response
 from gateway.session import SessionSource
 from hermes_cli.commands import is_gateway_known_command
@@ -45,11 +55,11 @@ def _dispatch_stub():
     from types import SimpleNamespace
     return SimpleNamespace(
         _HM_CANONICAL_COMMANDS=stub._HM_CANONICAL_COMMANDS,
-        _hm_quick_commands=lambda: {},
+        _hm_quick_commands=dict,
         _check_slash_access=lambda source, canonical: None,
         _hm_command_hooks=_hooks,
         _hm_drop_held_input=lambda event: dispatched.setdefault("drop_held", event),
-        _gateway_plain_command_handlers=lambda: {},
+        _gateway_plain_command_handlers=dict,
         _gateway_idle_command_handlers=lambda: {"compress": _handle_compress},
         _async_profile_scope_for_source=lambda source: contextlib.nullcontext(),
         _hm_cmd_new=_cmd_new,
@@ -80,7 +90,7 @@ def test_injected_new_opens_the_command_lane_gate():
 
 
 def test_injected_new_resolves_and_dispatches_via_the_real_gateway_chain():
-    # Proves the widened gate reaches the RESET lane: the real resolution +
+    # Proves the opened gate reaches the RESET lane: the real resolution +
     # canonical-dispatch methods route the injected event to _hm_cmd_new and the
     # turn is handled there — the agent/turn path (the only writer of a user
     # line) is never entered, so no /new text persists and no model turn runs.
@@ -88,10 +98,10 @@ def test_injected_new_resolves_and_dispatches_via_the_real_gateway_chain():
     stub, dispatched = _dispatch_stub()
 
     async def command_lane_handler(event):
-        handled, result, command, canonical = await _resolve_and_dispatch(stub, event)
+        handled, receipt, command, canonical = await _resolve_and_dispatch(stub, event)
         assert (handled, command, canonical) == (True, "new", "new")
         assert is_gateway_known_command(canonical)
-        event.source._local_inbound_response_future.set_result(result)
+        event.source._local_inbound_response_future.set_result(receipt)
 
     runner.adapter._message_handler = command_lane_handler
     result = asyncio.run(inject_local_inbound(runner, _payload(message_id="cmd-new-2", text="/new")))
@@ -112,15 +122,23 @@ def test_plain_text_injection_keeps_the_control_gate_closed():
 
 
 def test_unknown_slash_text_still_falls_through_to_the_model_lane():
-    # The whitelist is NOT widened: an unknown command name resolves to
-    # handled=False and reaches the agent exactly as before the fix.
+    # The whitelist is NOT widened: an unregistered name keeps the gate CLOSED,
+    # so the event is not a command at all. The real chain entry (the actual
+    # resolver) yields no command/canonical, and the unknown-slash rejection
+    # branch stays unreachable for injected text — it lives inside the skill
+    # rewrite, which early-returns on a falsy command. The text answers as an
+    # agent turn, exactly like before the repair.
     runner = FakeRunner()
     stub, dispatched = _dispatch_stub()
 
     async def resolve_like_handler(event):
-        handled, result, command, canonical = await _resolve_and_dispatch(stub, event)
-        assert handled is False
-        assert not is_gateway_known_command(canonical or "")
+        assert event.allow_gateway_control is False
+        assert event.is_command() is False
+        handled, _result, command, canonical = await _resolve_and_dispatch(stub, event)
+        assert (handled, command, canonical) == (False, None, None)
+        assert GatewayRunner._hm_skill_slash_rewrite(
+            stub, event, event.source, "session-key", None
+        ) is None  # no rejection reply is produced for injected unknown text
         # fall-through semantics = the model lane answers (FakeRunner turns)
         await runner._handle_message(event)
 
@@ -129,11 +147,36 @@ def test_unknown_slash_text_still_falls_through_to_the_model_lane():
         runner, _payload(message_id="unknown-1", text="/frobnicate 这个指令不存在")))
 
     event = runner.adapter.seen
-    assert event.allow_gateway_control is True  # gate open…
-    assert event.get_command() == "frobnicate"  # …but resolution finds no command
+    assert event.get_command() is None  # the command chain was never entered
     assert result["response"] == "答对了。下一题"
     assert runner.calls == 1  # …and the model lane runs, unchanged
     assert "cmd_new" not in dispatched
+
+
+def test_unknown_slash_keeps_the_rendezvous_grace_wait(monkeypatch):
+    # t_6196a57c §2.2 secondary hazard: unknown-slash text is a model turn, so
+    # it must park the bounded grace like plain text does (a late receipt still
+    # reaches the rendezvous). A ``startswith("/")`` shortcut would skip the
+    # wait and silently drop the answer.
+    from gateway import run_local_inbound as run_local_inbound_module
+
+    monkeypatch.setattr(run_local_inbound_module, "_RESPONSE_RENDEZVOUS_GRACE_SECONDS", 0.2)
+    runner = FakeRunner()
+
+    async def model_lane_handler(event):
+        # A real agent turn answers after the handler returns, via egress.
+        runner.calls += 1
+        runner.adapter.seen = event
+
+    runner.adapter._message_handler = model_lane_handler
+    result = asyncio.run(inject_local_inbound(
+        runner, _payload(message_id="unknown-late-1", text="/frobnicate")))
+
+    assert result["accepted"] is True
+    assert result["reason"] == "response_timeout"  # it WAITED, like plain text
+    assert result["response_wait_ms"] >= 150
+    assert runner.calls == 1
+    assert "unknown-late-1" not in runner._local_inbound_response_waiters
 
 
 def test_file_path_slash_text_is_never_resolved_as_a_command():
@@ -143,7 +186,29 @@ def test_file_path_slash_text_is_never_resolved_as_a_command():
     asyncio.run(inject_local_inbound(
         runner, _payload(message_id="path-1", text="/tmp/state.db 备份一下")))
     event = runner.adapter.seen
+    assert event.allow_gateway_control is False
     assert event.get_command() is None
+
+
+@pytest.mark.parametrize(("text", "opens"), [
+    ("/new", True),  # the health check's reset verb
+    ("/NEW", True),  # case-insensitive, like get_command
+    ("/reset", True),  # alias, canonicalised to new like _hm_resolve_command
+    ("/new@hema_bot", True),  # mention suffix cut, like get_command
+    ("/compress --preview", True),  # args ride the command lane
+    ("/help", True),
+    ("/stop", True),
+    ("/frobnicate 这个指令不存在", False),  # unknown name stays chat
+    ("/new-thing", False),  # prefix lookalikes are not aliases
+    ("/tmp/state.db 备份一下", False),  # path-like pseudo name
+    ("/", False),
+    ("/ new", False),
+    ("", False),
+    ("4000米", False),
+    ("@image:/x /new", False),  # attachment-ref prefix: fail closed
+])
+def test_command_lane_gate_predicate_locks_the_whitelist_agreement(text, opens):
+    assert _injected_slash_opens_command_lane(text) is opens
 
 
 def test_command_lane_receipt_hits_the_message_id_rendezvous():
@@ -178,8 +243,7 @@ def test_command_lane_without_publish_returns_clean_empty_result():
     runner = FakeRunner()
 
     async def command_lane_handler(event):
-        assert event.get_command() == "new"
-        return  # answers nothing through the rendezvous
+        assert event.get_command() == "new"  # answers nothing through the rendezvous
 
     runner.adapter._message_handler = command_lane_handler
     result = asyncio.run(inject_local_inbound(runner, _payload(message_id="cmd-silent-1", text="/new")))
@@ -198,7 +262,7 @@ def test_injected_compress_resolves_through_the_command_lane():
     async def command_lane_handler(event):
         assert event.get_command() == "compress"
         dispatched["event"] = event
-        handled, result, command, canonical = await _resolve_and_dispatch(stub, event)
+        handled, result, _command, canonical = await _resolve_and_dispatch(stub, event)
         assert (handled, canonical) == (True, "compress")
         event.source._local_inbound_response_future.set_result(result)
 

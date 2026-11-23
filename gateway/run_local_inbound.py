@@ -41,6 +41,34 @@ def _clean(value: Any, *, limit: int = _MAX_ID_CHARS) -> str:
     return str(value or "").strip()[:limit]
 
 
+def _injected_slash_opens_command_lane(text: str) -> bool:
+    """True only when sidecar-injected slash text targets a registered gateway command.
+
+    Repair t_a032be60 (diagnosis t_6196a57c): the hardcoded gate False kept the
+    health check's ``/new`` a model turn (fake 「已开新会话。」 receipts while the
+    session never reset). The gate opens for exactly the text the native command
+    chain itself would dispatch, mirroring that entry predicate end to end:
+    ``MessageEvent.get_command`` parsing (platforms/event.py — first token,
+    strip ``/``, lower, cut at ``@``, reject path-like pseudo names), alias
+    canonicalisation (``resolve_command``, as ``_hm_resolve_command`` does in
+    run_inbound.py), and the ``is_gateway_known_command`` whitelist. Plain text,
+    unknown names and skill slashes keep the gate closed: they stay model-lane
+    chat with the rendezvous grace wait intact. Opening the gate grants nothing —
+    the resolved command still passes ``_check_slash_access``, command hooks and
+    busy policy.
+    """
+    parts = (text or "").lstrip().split(maxsplit=1)
+    if not parts or not parts[0].startswith("/"):
+        return False
+    raw = parts[0][1:].lower().split("@", 1)[0]
+    if not raw or "/" in raw:
+        return False
+    from hermes_cli.commands import is_gateway_known_command, resolve_command
+
+    cmd_def = resolve_command(raw)
+    return is_gateway_known_command(cmd_def.name if cmd_def else raw)
+
+
 def _profile_adapter(runner, profile: str, platform: Platform):
     primary = getattr(runner, "_primary_profile_name", None) or "default"
     if profile in {"default", primary}:
@@ -143,17 +171,17 @@ async def _execute_local_inbound(runner, params: dict[str, Any]) -> dict[str, An
             adapter._resolve_channel_prompt(chat_id)
             if hasattr(adapter, "_resolve_channel_prompt") else None
         ),
-        # Command-lane gate (repair t_a032be60): slash text injected by the
-        # trusted sidecar (the hema health check's ``/new``) must resolve through
-        # the native command lane, not a model turn. The hardcoded False made
+        # Command-lane gate (repair t_a032be60): opens ONLY for injected text
+        # that names a registered gateway command (see
+        # _injected_slash_opens_command_lane). The hardcoded False made
         # ``is_command()``/``get_command()`` (platforms/event.py) permanently
-        # None, so ``/new`` ran as chat text and the model answered with fake
-        # "已开新会话。" receipts while the session never reset (t_6196a57c).
-        # This mirrors the ``_is_command_lane`` rendezvous short-circuit below
-        # and widens NOTHING else: every resolved command still passes the
-        # ``is_gateway_known_command`` whitelist and ``_check_slash_access``
-        # gate, and unknown slash text falls through to the model unchanged.
-        allow_gateway_control=text.startswith("/"),
+        # None, so the health check's /new ran as chat text and the model
+        # answered with fake 「已开新会话。」 receipts while the session never
+        # reset (t_6196a57c). Unknown slash names, path-like text and plain
+        # chat keep the pre-repair model-lane behaviour; every gated command
+        # still faces the native ``is_gateway_known_command`` whitelist, the
+        # ``_check_slash_access`` policy and command hooks in the chain.
+        allow_gateway_control=_injected_slash_opens_command_lane(text),
     )
 
     recent_context = _clean(params.get("recent_context"), limit=_MAX_CONTEXT_CHARS)
@@ -200,7 +228,12 @@ async def _execute_local_inbound(runner, params: dict[str, Any]) -> dict[str, An
             await runner._handle_message(event)
         _wait_started = time.monotonic()
         response_timed_out = False
-        _is_command_lane = (text or "").lstrip().startswith("/")
+        # Single source of truth with the gate above: only text actually routed
+        # into the command lane skips the grace park (it answers without a
+        # publish-side agent turn — repair t_479a04ac). The old
+        # ``text.startswith("/")`` predicate also skipped it for unknown-slash
+        # model turns, dropping their receipts (t_6196a57c §2.2).
+        _is_command_lane = bool(event.allow_gateway_control)
         if not response_future.done() and not _is_command_lane:
             # Slash-command lanes answer without a publish-side agent turn — never
             # park the grace window on them (repair t_479a04ac).
