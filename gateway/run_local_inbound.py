@@ -143,7 +143,17 @@ async def _execute_local_inbound(runner, params: dict[str, Any]) -> dict[str, An
             adapter._resolve_channel_prompt(chat_id)
             if hasattr(adapter, "_resolve_channel_prompt") else None
         ),
-        allow_gateway_control=False,
+        # Command-lane gate (repair t_a032be60): slash text injected by the
+        # trusted sidecar (the hema health check's ``/new``) must resolve through
+        # the native command lane, not a model turn. The hardcoded False made
+        # ``is_command()``/``get_command()`` (platforms/event.py) permanently
+        # None, so ``/new`` ran as chat text and the model answered with fake
+        # "已开新会话。" receipts while the session never reset (t_6196a57c).
+        # This mirrors the ``_is_command_lane`` rendezvous short-circuit below
+        # and widens NOTHING else: every resolved command still passes the
+        # ``is_gateway_known_command`` whitelist and ``_check_slash_access``
+        # gate, and unknown slash text falls through to the model unchanged.
+        allow_gateway_control=text.startswith("/"),
     )
 
     recent_context = _clean(params.get("recent_context"), limit=_MAX_CONTEXT_CHARS)
