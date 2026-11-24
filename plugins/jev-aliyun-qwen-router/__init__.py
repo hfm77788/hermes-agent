@@ -46,7 +46,7 @@ _CACHE_LIMIT = 512
 
 _CACHE_LOCK = threading.Lock()
 _NO_ROUTE = object()
-_TURN_CACHE: "OrderedDict[str, RouteDecision | object]" = OrderedDict()
+_TURN_CACHE: OrderedDict[str, RouteDecision | object] = OrderedDict()
 _LAST_WARNING_AT = 0.0
 
 _QUESTIONS = {
@@ -238,6 +238,31 @@ def _settings(ctx: Any) -> dict[str, Any]:
         "max_excerpt_chars": _as_int(value("max_excerpt_chars", 2400), 2400, low=128, high=8000),
         "respect_existing_reasoning": _as_bool(value("respect_existing_reasoning", False), False),
         "respect_manual_max": _as_bool(value("respect_manual_max", True), True),
+        # Narrow max->flash downgrade channel: only fresh/small sessions where
+        # Jev confidently picks flash with low max-probability may downgrade.
+        "downgrade_channel": _as_bool(value("downgrade_channel", False), False),
+        "downgrade_max_history_messages": _as_int(
+            value("downgrade_max_history_messages", 6), 6, low=1, high=64
+        ),
+        "downgrade_max_context_chars": _as_int(
+            value("downgrade_max_context_chars", 8000), 8000, low=512, high=64000
+        ),
+        "downgrade_min_effort_confidence": _as_float(
+            value("downgrade_min_effort_confidence", 0.80), 0.80, low=0.0, high=1.0
+        ),
+        "downgrade_max_probability": _as_float(
+            value("downgrade_max_probability", 0.10), 0.10, low=0.0, high=1.0
+        ),
+        "downgrade_strict_effort_confidence": _as_float(
+            value("downgrade_strict_effort_confidence", 0.85), 0.85, low=0.0, high=1.0
+        ),
+        "downgrade_strict_max_probability": _as_float(
+            value("downgrade_strict_max_probability", 0.05), 0.05, low=0.0, high=1.0
+        ),
+        "downgrade_recent_tail_chars": _as_int(
+            value("downgrade_recent_tail_chars", 1200), 1200, low=0, high=8000
+        ),
+        "max_model_aliases": _string_map(value("max_model_aliases", {})),
         "min_reasoning_effort": min_reasoning_effort,
         "allow_max": _as_bool(value("allow_max", True), True),
         "centralized_profile_policy": centralized,
@@ -279,10 +304,23 @@ def _configured_provider_base_urls() -> dict[str, str]:
     return result
 
 
-def _provider_matches(
+def _string_map(raw: Any) -> dict[str, str]:
+    """Mapping of allowlisted provider id (or base URL) -> alternate max model id."""
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, str] = {}
+    for key, item in raw.items():
+        key_s = str(key).strip()
+        value_s = str(item).strip()
+        if key_s and value_s:
+            result[key_s] = value_s
+    return result
+
+
+def _matched_provider_id(
     *, provider: str, base_url: str, allowed_providers: set[str]
-) -> bool:
-    """Match a normalized custom provider back to an allowlisted provider id.
+) -> str:
+    """Return the allowlisted provider id this request belongs to ("" = no match).
 
     Core normalizes named custom providers such as custom:aliyun_ws to provider=custom
     before llm_request middleware. Exact ids still match directly; normalized custom
@@ -290,17 +328,32 @@ def _provider_matches(
     provider, so another custom Qwen endpoint cannot accidentally inherit Max routing.
     """
     if provider in allowed_providers:
-        return True
+        return provider
     if provider != "custom":
-        return False
+        return ""
     runtime_base_url = _normalized_base_url(base_url)
     if not runtime_base_url:
-        return False
+        return ""
     configured = _configured_provider_base_urls()
-    return any(
-        key.startswith("custom:")
-        and configured.get(key) == runtime_base_url
-        for key in allowed_providers
+    for key in allowed_providers:
+        if not key.startswith("custom:"):
+            continue
+        # Profile configs are inconsistent about the "custom:" prefix (some name
+        # the provider "aliyun_qwen", others "custom:aliyun_qwen"); accept both.
+        bare = key.split(":", 1)[1]
+        if configured.get(key) == runtime_base_url or configured.get(bare) == runtime_base_url:
+            return key
+    return ""
+
+
+def _provider_matches(
+    *, provider: str, base_url: str, allowed_providers: set[str]
+) -> bool:
+    """Backward-compatible boolean wrapper around _matched_provider_id."""
+    return bool(
+        _matched_provider_id(
+            provider=provider, base_url=base_url, allowed_providers=allowed_providers
+        )
     )
 
 
@@ -367,7 +420,7 @@ def _has_explicit_reasoning(request: dict[str, Any]) -> bool:
     return False
 
 
-def _state_payload(request: dict[str, Any], excerpt: str) -> str:
+def _state_payload(request: dict[str, Any], excerpt: str, settings: dict[str, Any]) -> str:
     tools = request.get("tools")
     tool_count = len(tools) if isinstance(tools, list) else 0
     state = {
@@ -378,6 +431,9 @@ def _state_payload(request: dict[str, Any], excerpt: str) -> str:
             "has_tools": tool_count > 0,
         },
     }
+    tail = _recent_tail(request, settings)
+    if tail:
+        state["recent_context_tail"] = tail
     return json.dumps(state, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -442,46 +498,72 @@ def _call_jev(
     return payload, int((time.perf_counter() - started) * 1000)
 
 
-def _parse_route(
+# Reason code for a successful parse (empty string = no rejection).
+_PARSE_OK = ""
+
+
+def _parse_route_with_reason(
     response: dict[str, Any],
     *,
     settings: dict[str, Any],
     active_model: str,
     latency_ms: int,
-) -> RouteDecision | None:
+    downgrade_ok: bool = False,
+    strict_gate: bool = True,
+    effective_max_model: str = "",
+) -> tuple[RouteDecision | None, str]:
+    """Parse Jev's answer into a RouteDecision, returning (decision, reason).
+
+    reason is "" on success, else a stable skip-code naming the exact rejection
+    branch. Per jev-model-router-ops discipline every return-None path must be
+    individually attributable -- the old single "decision_unparsed" bucket lumped
+    "Jev not confident" (the dominant, HEALTHY fail-safe that leaves the request
+    on its original model) together with genuine malformed/contradictory answers,
+    which made conservative skips look like a broken router in audits.
+    """
     answers = response.get("answers")
     if not isinstance(answers, dict):
-        return None
+        return None, "jev_answers_malformed"
 
     effort_answer = answers.get("effort")
     model_answer = answers.get("model_class")
     if not isinstance(effort_answer, dict) or not isinstance(model_answer, dict):
-        return None
+        return None, "jev_answers_malformed"
 
     effort = str(effort_answer.get("choice") or "").strip().lower()
     if effort not in _VALID_EFFORTS:
-        return None
+        return None, "effort_choice_invalid"
 
     confidence = _probability(effort_answer.get("confidence"))
     probabilities = effort_answer.get("probabilities")
     if confidence is None and isinstance(probabilities, dict):
         confidence = _probability(probabilities.get(effort))
-    if confidence is None or confidence < settings["min_effort_confidence"]:
-        return None
+    if confidence is None:
+        return None, "effort_confidence_unparsable"
+    if confidence < settings["min_effort_confidence"]:
+        # Expected fail-safe, NOT a fault: Jev is not confident enough to route
+        # this turn, so the request stays on its original model (max-start seats
+        # stay Max). Dominant healthy outcome for continuation/complex/ambiguous
+        # turns -- kept as its own reason so audits never misread it as broken.
+        return None, "effort_confidence_low"
 
     model_choice = str(model_answer.get("choice") or "").strip().lower()
     model_probabilities = model_answer.get("probabilities")
-    if model_choice not in {"flash", "max"} or not isinstance(model_probabilities, dict):
-        return None
+    if model_choice not in {"flash", "max"}:
+        return None, "model_choice_invalid"
+    if not isinstance(model_probabilities, dict):
+        return None, "model_probs_malformed"
     model_confidence = _probability(model_answer.get("confidence"))
     if model_confidence is None:
         model_confidence = _probability(model_probabilities.get(model_choice))
     max_probability = _probability(model_probabilities.get("max"))
-    if model_confidence is None or max_probability is None:
-        return None
+    if model_confidence is None:
+        return None, "model_confidence_unparsable"
+    if max_probability is None:
+        return None, "max_probability_unparsable"
 
     flash_model = settings["flash_model"]
-    max_model = settings["max_model"]
+    max_model = (effective_max_model or "").strip() or settings["max_model"]
     active = active_model.strip()
 
     # An explicit manual Max selection is never silently downgraded.
@@ -496,13 +578,32 @@ def _parse_route(
     # Contradictory "low effort but Max required" judgments are treated as uncertain
     # before a role policy applies its minimum effort floor.
     if should_max and effort == "low" and not manual_max:
-        return None
+        return None, "contradictory_low_max"
 
     minimum_effort = settings["min_reasoning_effort"]
     if _EFFORT_RANK[effort] < _EFFORT_RANK[minimum_effort]:
         effort = minimum_effort
 
-    model = max_model if (manual_max or should_max) else flash_model
+    # v2 downgrade channel: eligibility is about the message being
+    # self-contained (not a continuation), NOT about session length. Longer
+    # sessions simply face stricter confidence gates. No absolute context cap:
+    # flash handles long contexts (million-token class window).
+    downgrade_allowed = False
+    if (
+        settings["downgrade_channel"]
+        and downgrade_ok
+        and not should_max
+        and model_choice == "flash"
+        and effort != "xhigh"
+    ):
+        if strict_gate:
+            conf_gate = settings["downgrade_strict_effort_confidence"]
+            prob_gate = settings["downgrade_strict_max_probability"]
+        else:
+            conf_gate = settings["downgrade_min_effort_confidence"]
+            prob_gate = settings["downgrade_max_probability"]
+        downgrade_allowed = confidence >= conf_gate and max_probability <= prob_gate
+    model = max_model if ((manual_max and not downgrade_allowed) or should_max) else flash_model
     tier = ("max_" if model == max_model else "flash_") + effort
     return RouteDecision(
         model=model,
@@ -513,7 +614,30 @@ def _parse_route(
         max_probability=max_probability,
         jev_model=str(response.get("model") or settings["jev_model"]),
         latency_ms=latency_ms,
+    ), _PARSE_OK
+
+
+def _parse_route(
+    response: dict[str, Any],
+    *,
+    settings: dict[str, Any],
+    active_model: str,
+    latency_ms: int,
+    downgrade_ok: bool = False,
+    strict_gate: bool = True,
+    effective_max_model: str = "",
+) -> RouteDecision | None:
+    """Back-compat wrapper: decision only, for callers/tests that don't need the reason."""
+    decision, _reason = _parse_route_with_reason(
+        response,
+        settings=settings,
+        active_model=active_model,
+        latency_ms=latency_ms,
+        downgrade_ok=downgrade_ok,
+        strict_gate=strict_gate,
+        effective_max_model=effective_max_model,
     )
+    return decision
 
 
 def _cache_get(turn_id: str) -> tuple[bool, RouteDecision | None]:
@@ -548,6 +672,23 @@ def _warn_rate_limited(message: str, *args: Any) -> None:
     logger.warning(message, *args)
 
 
+_SKIP_LOG_AT: dict[str, float] = {}
+
+
+def _skip_rate_limited(reason: str, message: str, *args: Any) -> None:
+    """INFO-level early-return trace, rate-limited per reason (5 min window).
+
+    Silent skips made it impossible to diagnose why a seat's traffic never
+    reached the classifier; every early return in route_request must leave a
+    rate-limited breadcrumb with its reason key.
+    """
+    now = time.monotonic()
+    if now - _SKIP_LOG_AT.get(reason, 0.0) < 300.0:
+        return
+    _SKIP_LOG_AT[reason] = now
+    logger.info(message, *args)
+
+
 def _apply_decision(request: dict[str, Any], decision: RouteDecision) -> dict[str, Any]:
     rewritten = dict(request)
     rewritten["model"] = decision.model
@@ -564,6 +705,75 @@ def _apply_decision(request: dict[str, Any], decision: RouteDecision) -> dict[st
     return rewritten
 
 
+def _visible_messages(request: dict[str, Any]) -> list[dict[str, Any]]:
+    """Conversation messages excluding system/developer standing prompts."""
+    messages = request.get("messages")
+    if not isinstance(messages, list):
+        return []
+    return [
+        m
+        for m in messages
+        if isinstance(m, dict)
+        and str(m.get("role", "")).lower() not in {"system", "developer"}
+    ]
+
+
+def _context_stats(request: dict[str, Any]) -> tuple[int, int]:
+    """(visible message count, visible char count) used for threshold tiering."""
+    visible = _visible_messages(request)
+    return len(visible), sum(len(_content_text(m.get("content"))) for m in visible)
+
+
+# Pure continuation utterances carry no standalone meaning; they inherit the
+# task context by definition and must never be downgraded, whatever Jev says.
+_CONTINUATION_EXACT = {
+    "继续", "推进", "接着", "好", "好的", "嗯", "嗯嗯", "行", "可以", "就这样",
+    "按此", "按这", "照旧", "同前", "收到", "是", "对", "做", "发", "走",
+    "ok", "okay", "go", "yes", "y", "1", "?", "？", "。", ".", "！", "!", "、",
+}
+_PUNCTUATION_CHARS = " \t\n\r?？!！.。,，、;；:：~～…—-_*#@+"
+
+_CONTINUATION_PREFIXES = (
+    "继续", "接着", "上面", "上述", "刚才", "刚说", "按你", "按上", "如上",
+    "同前", "照旧", "就按", "还是按", "仍按",
+)
+
+
+def _is_continuation(text: str) -> bool:
+    """True when the latest user message is context-dependent rather than
+    self-contained (single chars, bare acknowledgements, anaphora openers)."""
+    stripped = (text or "").strip()
+    if len(stripped) <= 1:
+        return True
+    if stripped in _CONTINUATION_EXACT or stripped.lower() in _CONTINUATION_EXACT:
+        return True
+    if not stripped.strip(_PUNCTUATION_CHARS):
+        return True
+    return stripped.startswith(_CONTINUATION_PREFIXES)
+
+
+def _recent_tail(request: dict[str, Any], settings: dict[str, Any]) -> str:
+    """Last two visible messages before the latest user turn, truncated and
+    redacted, so Jev can tell standalone questions from task continuations."""
+    budget = settings.get("downgrade_recent_tail_chars", 1200)
+    if budget <= 0:
+        return ""
+    visible = _visible_messages(request)
+    if visible and str(visible[-1].get("role", "")).lower() == "user":
+        visible = visible[:-1]
+    # Privacy: tool results never enter the tail (they can carry sensitive
+    # payloads); only user/assistant turns give Jev conversational context.
+    visible = [m for m in visible if str(m.get("role", "")).lower() in {"user", "assistant"}]
+    parts = []
+    per_message = max(budget // 2, 64)
+    for message in visible[-2:]:
+        text = _redacted_excerpt(_content_text(message.get("content")), per_message)
+        if not text:
+            continue
+        parts.append(f"{str(message.get('role') or 'unknown').lower()}: {text}")
+    return "\n".join(parts)
+
+
 def route_request(ctx: Any, **kwargs: Any) -> dict[str, Any] | None:
     request = kwargs.get("request")
     if not isinstance(request, dict):
@@ -577,13 +787,32 @@ def route_request(ctx: Any, **kwargs: Any) -> dict[str, Any] | None:
     base_url = str(kwargs.get("base_url") or "").strip()
     api_mode = str(kwargs.get("api_mode") or "").strip()
     active_model = str(request.get("model") or kwargs.get("model") or "").strip()
-    if not _provider_matches(
+    matched_provider = _matched_provider_id(
         provider=provider,
         base_url=base_url,
         allowed_providers=settings["providers"],
-    ) or api_mode != "chat_completions":
+    )
+    if not matched_provider or api_mode != "chat_completions":
+        _skip_rate_limited(
+            "provider_unmatched",
+            "jev-aliyun-qwen-router: skip=provider_unmatched profile=%s provider=%r api_mode=%r base_url=%.80s",
+            settings["profile"], provider, api_mode, base_url,
+        )
         return None
-    if active_model not in {settings["flash_model"], settings["max_model"]}:
+    # Per-endpoint max alias: some providers (e.g. token-plan Beijing) do not
+    # serve the pinned snapshot name; they escalate to their own max id instead.
+    aliases = settings["max_model_aliases"]
+    effective_max = (
+        aliases.get(matched_provider)
+        or aliases.get(_normalized_base_url(base_url))
+        or settings["max_model"]
+    )
+    if active_model not in {settings["flash_model"], effective_max}:
+        _skip_rate_limited(
+            "model_not_routable",
+            "jev-aliyun-qwen-router: skip=model_not_routable profile=%s active_model=%r flash=%r effective_max=%r",
+            settings["profile"], active_model, settings["flash_model"], effective_max,
+        )
         return None
     if settings["respect_existing_reasoning"] and _has_explicit_reasoning(request):
         return None
@@ -591,6 +820,11 @@ def route_request(ctx: Any, **kwargs: Any) -> dict[str, Any] | None:
     turn_id = str(kwargs.get("turn_id") or "").strip()
     if not turn_id:
         # Stable per-turn binding is a hard requirement; do not make uncached routing calls.
+        _skip_rate_limited(
+            "turn_id_missing",
+            "jev-aliyun-qwen-router: skip=turn_id_missing profile=%s active_model=%r platform=%r",
+            settings["profile"], active_model, str(kwargs.get("platform") or ""),
+        )
         return None
 
     cache_key = f"{settings['profile']}::{turn_id}"
@@ -603,22 +837,35 @@ def route_request(ctx: Any, **kwargs: Any) -> dict[str, Any] | None:
         user_text = _latest_user_text(request)
         excerpt = _redacted_excerpt(user_text, settings["max_excerpt_chars"])
         if not excerpt:
+            _skip_rate_limited(
+                "excerpt_empty",
+                "jev-aliyun-qwen-router: skip=excerpt_empty profile=%s turn_id=%.40s",
+                settings["profile"], turn_id,
+            )
             _cache_put(cache_key, None)
             return None
         try:
             response, latency_ms = _call_jev(
-                state=_state_payload(request, excerpt),
+                state=_state_payload(request, excerpt, settings),
                 model=settings["jev_model"],
                 timeout=settings["timeout_seconds"],
                 centralized=settings["centralized_profile_policy"],
                 url=settings["jev_url"],
                 key_env=settings["jev_key_env"],
             )
-            decision = _parse_route(
+            msg_count, ctx_chars = _context_stats(request)
+            small_session = (
+                msg_count <= settings["downgrade_max_history_messages"]
+                and ctx_chars <= settings["downgrade_max_context_chars"]
+            )
+            decision, parse_reason = _parse_route_with_reason(
                 response,
                 settings=settings,
                 active_model=active_model,
                 latency_ms=latency_ms,
+                downgrade_ok=not _is_continuation(user_text),
+                strict_gate=not small_session,
+                effective_max_model=effective_max,
             )
         except Exception as exc:
             _warn_rate_limited(
@@ -628,6 +875,12 @@ def route_request(ctx: Any, **kwargs: Any) -> dict[str, Any] | None:
             _cache_put(cache_key, None)
             return None
         if decision is None:
+            reason = parse_reason or "decision_unparsed"
+            _skip_rate_limited(
+                reason,
+                "jev-aliyun-qwen-router: skip=%s profile=%s turn_id=%.40s (Jev answered; no route decision -- request left on original model)",
+                reason, settings["profile"], turn_id,
+            )
             _cache_put(cache_key, None)
             return None
         _cache_put(cache_key, decision)

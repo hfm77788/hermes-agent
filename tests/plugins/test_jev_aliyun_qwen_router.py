@@ -25,7 +25,7 @@ def _load_plugin():
 def mod(monkeypatch):
     module = _load_plugin()
     module._TURN_CACHE.clear()
-    monkeypatch.setattr(module, "_root_plugin_settings", lambda: {})
+    monkeypatch.setattr(module, "_root_plugin_settings", dict)
     monkeypatch.setattr(module, "_active_profile_name", lambda: "default")
     return module
 
@@ -263,11 +263,17 @@ def test_only_latest_user_text_is_sent_and_secrets_are_force_redacted(mod, monke
     result = _route(mod, Ctx(), request)
     assert result is not None
     state = captured["state"]
+    # Secrets are force-redacted everywhere (latest message AND context tail).
     assert secret not in state
+    # v2 contract: tool outputs never enter the recent_context_tail (privacy);
+    # user/assistant turns may appear there, truncated, so Jev can distinguish
+    # standalone questions from task continuations.
     assert "PRIVATE_TOOL_OUTPUT" not in state
-    assert "old message" not in state
     decoded = json.loads(state)
     assert "new task" in decoded["latest_user_message"]
+    tail = decoded.get("recent_context_tail", "")
+    assert "old response" in tail
+    assert "tool:" not in tail
 
 
 def test_wrong_provider_and_missing_turn_id_are_not_routed(mod, monkeypatch):
@@ -517,6 +523,7 @@ def test_typesafe_key_centralized_reads_default_root_only(mod, monkeypatch):
 
 
 
+
 def test_call_jev_honours_url_and_key_env_overrides(mod, monkeypatch):
     captured = {}
 
@@ -549,7 +556,7 @@ def test_call_jev_honours_url_and_key_env_overrides(mod, monkeypatch):
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     monkeypatch.setattr(mod.httpx, "Client", FakeClient)
 
-    payload, latency = mod._call_jev(
+    payload, _latency = mod._call_jev(
         state="s", model="decision-model-preview", timeout=1.5, centralized=False,
         url="https://token-plan.example/compatible-mode/v1/systemone",
         key_env="JEV_SYSTEMONE_API_KEY",
@@ -579,8 +586,7 @@ def test_settings_propagate_bailian_overrides_to_call(mod, monkeypatch):
                "jev_key_env": "JEV_SYSTEMONE_API_KEY",
                "jev_model": "decision-model-preview"})
     monkeypatch.setattr(mod, "_call_jev", spy)
-    import builtins
-    result = mod.route_request(
+    mod.route_request(
         ctx,
         request=_request(),
         provider=mod._DEFAULT_PROVIDER if hasattr(mod, "_DEFAULT_PROVIDER") else "custom:aliyun_qwen",
@@ -594,3 +600,87 @@ def test_settings_propagate_bailian_overrides_to_call(mod, monkeypatch):
     assert seen.get("url") == "https://token-plan.example/compatible-mode/v1/systemone"
     assert seen.get("key_env") == "JEV_SYSTEMONE_API_KEY"
     assert seen.get("model") == "decision-model-preview"
+# ── F-JEV: 每条 return-None 分支必须报各自 skip 原因（不再统一 decision_unparsed）──
+def _settings_for(mod, **over):
+    s = mod._settings(Ctx())
+    s = dict(s)
+    s.update(over)
+    return s
+
+
+def _parse(mod, response, settings, active_model="qwen3.8-flash"):
+    return mod._parse_route_with_reason(
+        response, settings=settings, active_model=active_model, latency_ms=10,
+    )
+
+
+def test_parse_reason_ok_on_valid_decision(mod):
+    decision, reason = _parse(mod, _response(effort="low", confidence=0.9), _settings_for(mod))
+    assert decision is not None and reason == ""
+
+
+def test_parse_reason_effort_confidence_low_is_distinct_from_malformed(mod):
+    """核心修复：置信度不足（健康保守）必须独立成因，不得与解析失败混为一谈。"""
+    settings = _settings_for(mod)  # 默认 min_effort_confidence=0.50
+    decision, reason = _parse(mod, _response(effort="medium", confidence=0.30), settings)
+    assert decision is None
+    assert reason == "effort_confidence_low"
+
+
+def test_parse_reason_answers_malformed(mod):
+    decision, reason = _parse(mod, {"model": "jev", "answers": "not-a-dict"}, _settings_for(mod))
+    assert decision is None and reason == "jev_answers_malformed"
+
+
+def test_parse_reason_effort_choice_invalid(mod):
+    resp = _response(effort="low", confidence=0.9)
+    resp["answers"]["effort"]["choice"] = "ultra"  # 不在 _VALID_EFFORTS
+    decision, reason = _parse(mod, resp, _settings_for(mod))
+    assert decision is None and reason == "effort_choice_invalid"
+
+
+def test_parse_reason_effort_confidence_unparsable(mod):
+    resp = _response(effort="low", confidence=0.9)
+    resp["answers"]["effort"]["confidence"] = "high"  # 非数值
+    resp["answers"]["effort"]["probabilities"] = {}    # 无兜底概率
+    decision, reason = _parse(mod, resp, _settings_for(mod))
+    assert decision is None and reason == "effort_confidence_unparsable"
+
+
+def test_parse_reason_model_choice_invalid(mod):
+    resp = _response(effort="low", confidence=0.9)
+    resp["answers"]["model_class"]["choice"] = "turbo"  # 非 flash/max
+    decision, reason = _parse(mod, resp, _settings_for(mod))
+    assert decision is None and reason == "model_choice_invalid"
+
+
+def test_parse_reason_contradictory_low_max(mod):
+    """low effort 但 max 必需 = 自相矛盾，独立成因。"""
+    settings = _settings_for(mod, allow_max=True, max_escalation_probability=0.5,
+                             min_max_choice_confidence=0.5, respect_manual_max=False)
+    resp = _response(effort="low", confidence=0.9, max_probability=0.9,
+                     model_choice="max", model_confidence=0.9)
+    decision, reason = _parse(mod, resp, settings, active_model="qwen3.8-flash")
+    assert decision is None and reason == "contradictory_low_max"
+
+
+def test_parse_route_wrapper_returns_decision_only(mod):
+    """向后兼容：_parse_route 仍只返回 decision（非 tuple），旧调用方/测试不破。"""
+    out = mod._parse_route(_response(effort="low", confidence=0.9),
+                           settings=_settings_for(mod), active_model="qwen3.8-flash", latency_ms=5)
+    assert not isinstance(out, tuple)
+    assert out is None or hasattr(out, "tier")
+
+
+def test_route_request_logs_honest_reason_not_decision_unparsed(mod, monkeypatch, caplog):
+    """端到端：低置信轮经 route_request 后，日志 skip 原因=effort_confidence_low，不再是 decision_unparsed。"""
+    import logging
+    monkeypatch.setattr(mod, "_call_jev",
+                        lambda **_: (_response(effort="medium", confidence=0.30, max_probability=0.1), 50))
+    # 清掉限流窗口，确保日志真的写出
+    mod._SKIP_LOG_AT.clear()
+    with caplog.at_level(logging.INFO):
+        assert _route(mod, Ctx(), _request(), turn_id="honest-reason-turn") is None
+    blob = "\n".join(r.getMessage() for r in caplog.records)
+    assert "skip=effort_confidence_low" in blob
+    assert "decision_unparsed" not in blob
