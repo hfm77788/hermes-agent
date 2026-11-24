@@ -211,11 +211,29 @@ def test_command_lane_gate_predicate_locks_the_whitelist_agreement(text, opens):
     assert _injected_slash_opens_command_lane(text) is opens
 
 
-def test_command_lane_receipt_hits_the_message_id_rendezvous():
+def _install_grace_park_spy(monkeypatch) -> list:
+    # tests/AGENTS.md flake policy (codex P2 on PR #133): prove the command
+    # lane skipped the rendezvous grace park by observing the wait primitive
+    # itself, not by bounding wall-clock at 5 ms on a shared runner.
+    from gateway import run_local_inbound as _run_local_inbound_module
+
+    parked: list = []
+    real_wait_for = asyncio.wait_for
+
+    async def _spy_wait_for(future, timeout=None, **kwargs):
+        parked.append(timeout)
+        return await real_wait_for(future, timeout=timeout, **kwargs)
+
+    monkeypatch.setattr(_run_local_inbound_module.asyncio, "wait_for", _spy_wait_for)
+    return parked
+
+
+def test_command_lane_receipt_hits_the_message_id_rendezvous(monkeypatch):
     # t_479a04ac mechanism, command-lane half: a receipt published through the
     # message-id registry (a source rebuilt from the durable snapshot carries no
     # future attribute) still resolves the inject — and never reports a timeout
     # even though command lanes skip the grace park.
+    parked = _install_grace_park_spy(monkeypatch)
     runner = FakeRunner()
 
     async def command_lane_handler(event):
@@ -232,14 +250,15 @@ def test_command_lane_receipt_hits_the_message_id_rendezvous():
     assert result["accepted"] is True
     assert result["response"] == "新会话已开启。"
     assert "reason" not in result
-    assert result["response_wait_ms"] <= 5  # never parked the grace window
+    assert parked == []  # the rendezvous wait primitive was never invoked
     assert runner._local_inbound_response_waiters == {}  # registry cleaned
 
 
-def test_command_lane_without_publish_returns_clean_empty_result():
+def test_command_lane_without_publish_returns_clean_empty_result(monkeypatch):
     # A command lane that answers without a publish-side turn (the receipts ride
     # the native send path, not the future) must return "" with no fake content
     # and no response_timeout, and still clean the rendezvous entry.
+    parked = _install_grace_park_spy(monkeypatch)
     runner = FakeRunner()
 
     async def command_lane_handler(event):
@@ -251,7 +270,7 @@ def test_command_lane_without_publish_returns_clean_empty_result():
     assert result["accepted"] is True
     assert result["response"] == ""
     assert "reason" not in result
-    assert result["response_wait_ms"] <= 5
+    assert parked == []  # the rendezvous wait primitive was never invoked
     assert "cmd-silent-1" not in runner._local_inbound_response_waiters
 
 
