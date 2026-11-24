@@ -75,3 +75,9 @@ When centralized profile policy is enabled, named profiles do **not** need their
 `TYPESAFE_API_KEY`. The router resolves that credential from the default Hermes root using a
 context-local home override and never persists it into the named profile. Legacy/non-centralized
 mode keeps the old profile-local environment behavior.
+
+## Maintenance notes (fork)
+- 1106: added downgrade channel + provider-scoped `max_model_aliases` + skip-reason taxonomy.
+- 1108 v0.23.1 upgrade silently stashed these; live router lost Beijing escalation aliases
+  (`Model not exist` 404s). Restored 1125 (commit 18cc06c). After ANY upstream Hermes upgrade,
+  `git stash list` and diff this plugin against the newest stash before declaring the box healthy.
