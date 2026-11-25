@@ -6,17 +6,29 @@
 a normal model turn: the session never reset, the model answered with fake
 「已开新会话。」 receipts, and ``/new`` persisted as a user message.
 
-The gate now opens ONLY for slash text that names a registered gateway command,
+The gate opens ONLY for slash text that names a registered gateway command,
 mirroring the native chain's own entry predicate (``get_command`` parsing →
-``resolve_command`` alias canonicalisation → ``is_gateway_known_command``).
-Everything else — plain text, unknown names, path-like pseudo names, skill
-slashes — keeps the pre-repair model-lane behaviour, and because the rendezvous
-short-circuit shares this one predicate, such text also keeps the t_479a04ac
-grace wait (t_6196a57c §2.2: a ``startswith("/")`` shortcut would skip it and
-drop the receipt). Whitelist, slash-access gate and the API-lane forced False
-are untouched.
+``resolve_command`` alias canonicalisation → ``is_gateway_known_command``), and —
+round-2 audit B2 — the plugin half of that whitelist is queried under the TARGET
+profile's runtime scope, the same table the dispatched command reads. Everything
+else — plain text, unknown names, path-like pseudo names, skill slashes — keeps
+the pre-repair model-lane behaviour, and because the rendezvous short-circuit
+shares the one predicate, such text also keeps the t_479a04ac grace wait
+(t_6196a57c §2.2: a ``startswith("/")`` shortcut would skip it and drop the
+receipt). Whitelist, slash-access gate and the API-lane forced False are
+untouched.
+
+Round-2 audit B1/B3 contracts: a command-lane receipt rides the handler's RETURN
+value and is delivered by the PRODUCTION publish seam
+(``run_turn._publish_local_inbound_response``, one-shot ``future.done()`` guarded
+— an egress-published receipt is never overridden, and no test body may set the
+future to prove the delivery); the branch itself is decided by the REAL
+``_hm_dispatch_idle_commands`` orchestration, not a hand-picked resolver slice.
 """
 import asyncio
+import contextlib
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -33,49 +45,90 @@ from hermes_cli.commands import is_gateway_known_command
 from tests.gateway.test_local_inbound import FakeRunner, _payload
 
 
-def _dispatch_stub():
-    """A stand-in ``self`` carrying the seams ``_hm_resolve_command`` and
-    ``_hm_dispatch_canonical_command`` touch, so the REAL resolution methods run
-    over the event that ``inject_local_inbound`` built."""
-    dispatched: dict = {}
+class _NativeIdleStub:
+    """A stand-in runner whose IDLE-PATH ORCHESTRATION is the real production code.
 
-    async def _hooks(event, source, quick_key, command, canonical):
+    The resolution, canonical/quick/plugin dispatch and the skill-slash
+    fall-through are the genuine ``GatewayRunner`` methods (audit B3: the branch
+    must be decided by the real chain, including the quick/plugin legs the first
+    round skipped). Only the leaf seams — slash access, command hooks, and the
+    ``/new`` and ``/compress`` handlers — are stubs, recording what they were
+    asked to run. No seam here ever touches the response future: delivering the
+    receipt is the production inject path's job (audit B1).
+    """
+
+    _hm_resolve_command = GatewayRunner._hm_resolve_command
+    _hm_dispatch_canonical_command = GatewayRunner._hm_dispatch_canonical_command
+    _hm_dispatch_quick_and_plugin_commands = GatewayRunner._hm_dispatch_quick_and_plugin_commands
+    _hm_skill_slash_rewrite = GatewayRunner._hm_skill_slash_rewrite
+    _hm_dispatch_idle_commands = GatewayRunner._hm_dispatch_idle_commands
+    _HM_CANONICAL_COMMANDS = GatewayRunner._HM_CANONICAL_COMMANDS
+
+    def __init__(self, dispatched: dict):
+        self._dispatched = dispatched
+        self._draining = False
+
+    def _route_stop_epoch(self, _session_key: str) -> int:
+        return 0
+
+    def _hm_quick_commands(self) -> dict:
+        return {}
+
+    def _check_slash_access(self, _source, _canonical):
+        return None
+
+    async def _hm_command_hooks(self, event, source, quick_key, command, canonical):
         return False, None, None  # no command hooks participate here
 
-    async def _cmd_new(event, source, quick_key):
-        dispatched["cmd_new"] = event
+    def _hm_drop_held_input(self, event):
+        self._dispatched["drop_held"] = event
+
+    def _gateway_plain_command_handlers(self) -> dict:
+        return {}
+
+    def _gateway_idle_command_handlers(self) -> dict:
+        return {"compress": self._handle_compress}
+
+    def _async_profile_scope_for_source(self, _source):
+        return contextlib.nullcontext()
+
+    async def _hm_cmd_new(self, event, _source, _quick_key):
+        self._dispatched["cmd_new"] = event
         return True, "新会话已开启。"
 
-    async def _handle_compress(event):
-        dispatched["compress"] = event
+    async def _handle_compress(self, event):
+        self._dispatched["compress"] = event
         return "压缩预览：无需压缩。"
 
-    stub = GatewayRunner  # class attrs (canonical set, idle/plain command tuples)
-    import contextlib
-    from types import SimpleNamespace
-    return SimpleNamespace(
-        _HM_CANONICAL_COMMANDS=stub._HM_CANONICAL_COMMANDS,
-        _hm_quick_commands=dict,
-        _check_slash_access=lambda source, canonical: None,
-        _hm_command_hooks=_hooks,
-        _hm_drop_held_input=lambda event: dispatched.setdefault("drop_held", event),
-        _gateway_plain_command_handlers=dict,
-        _gateway_idle_command_handlers=lambda: {"compress": _handle_compress},
-        _async_profile_scope_for_source=lambda source: contextlib.nullcontext(),
-        _hm_cmd_new=_cmd_new,
-    ), dispatched
+    async def _hm_dispatch_plugin_command(self, event, source, command):
+        self._dispatched["plugin"] = command
+        return False, None, command
+
+    async def _run_in_executor_with_context(self, func, *args):
+        return func(*args)
+
+    async def _admit_command_turn(self, event, source, session_key, stop_epoch):
+        self._dispatched["admit_turn"] = event
+        return True, None
 
 
-async def _resolve_and_dispatch(stub, event):
-    """Mirror the built-in idle-path slice of ``_hm_dispatch_idle_commands``."""
-    handled, result, command, canonical = await GatewayRunner._hm_resolve_command(
-        stub, event, event.source, "session-key"
-    )
-    if not handled:
-        handled, result = await GatewayRunner._hm_dispatch_canonical_command(
-            stub, event, event.source, "session-key", canonical
+def _native_idle_handler(runner: FakeRunner, stub: _NativeIdleStub):
+    """A ``_message_handler`` clone of the real idle-path decision shape: the REAL
+    ``_hm_dispatch_idle_commands`` owns the branch; a handled command answers with
+    its return value, and fall-through runs the agent turn. The body NEVER touches
+    the response future (that is the production seam's job, asserted end-to-end).
+    """
+
+    async def handler(event):
+        stub._dispatched["seen"] = event
+        handled, receipt = await stub._hm_dispatch_idle_commands(
+            event, event.source, "session-key"
         )
-    return handled, result, command, canonical
+        if handled:
+            return receipt
+        return await runner._handle_message(event)
+
+    return handler
 
 
 def test_injected_new_opens_the_command_lane_gate():
@@ -89,28 +142,46 @@ def test_injected_new_opens_the_command_lane_gate():
     assert event.get_command() == "new"
 
 
-def test_injected_new_resolves_and_dispatches_via_the_real_gateway_chain():
-    # Proves the opened gate reaches the RESET lane: the real resolution +
-    # canonical-dispatch methods route the injected event to _hm_cmd_new and the
-    # turn is handled there — the agent/turn path (the only writer of a user
-    # line) is never entered, so no /new text persists and no model turn runs.
+def test_command_lane_receipt_delivered_by_production_publish_over_real_chain():
+    # B1 + B3 in one: the real idle orchestration routes the injected event to the
+    # reset lane and RETURNS its receipt; the injection's production code publishes
+    # that return value into the rendezvous. The test body never touches the future,
+    # so this fails if the dispatch return is discarded (the round-1/round-2 gap:
+    # accepted=True, response=""). The agent lane (the only writer of a user line)
+    # is never entered.
     runner = FakeRunner()
-    stub, dispatched = _dispatch_stub()
+    dispatched: dict = {}
+    runner.adapter._message_handler = _native_idle_handler(runner, _NativeIdleStub(dispatched))
 
-    async def command_lane_handler(event):
-        handled, receipt, command, canonical = await _resolve_and_dispatch(stub, event)
-        assert (handled, command, canonical) == (True, "new", "new")
-        assert is_gateway_known_command(canonical)
-        event.source._local_inbound_response_future.set_result(receipt)
-
-    runner.adapter._message_handler = command_lane_handler
-    result = asyncio.run(inject_local_inbound(runner, _payload(message_id="cmd-new-2", text="/new")))
+    result = asyncio.run(
+        inject_local_inbound(runner, _payload(message_id="cmd-new-prod-1", text="/new"))
+    )
 
     assert result["accepted"] is True
     assert result["response"] == "新会话已开启。"
     assert "reason" not in result
-    assert "cmd_new" in dispatched  # reset lane owned the turn
-    assert runner.calls == 0  # never the agent lane: no model turn, no user line
+    assert dispatched.get("cmd_new") is dispatched.get("seen")  # reset lane owned the turn
+    assert "admit_turn" not in dispatched  # never rewritten into a model turn
+    assert runner.calls == 0  # no model turn ran, so no /new user line can persist
+
+
+def test_command_lane_return_never_overrides_an_egress_publish():
+    # B1 double-delivery lock: ``_publish_local_inbound_response`` is one-shot. A
+    # receipt already published by egress (e.g. a durable-admission replay of the
+    # turn) must win verbatim over the handler return value.
+    runner = FakeRunner()
+
+    async def handler(event):
+        event.source._local_inbound_response_future.set_result("EGRESS-FIRST")
+        return "HANDLER-RETURN"
+
+    runner.adapter._message_handler = handler
+    result = asyncio.run(
+        inject_local_inbound(runner, _payload(message_id="cmd-no-double-1", text="/new"))
+    )
+
+    assert result["response"] == "EGRESS-FIRST"
+    assert "reason" not in result
 
 
 def test_plain_text_injection_keeps_the_control_gate_closed():
@@ -121,36 +192,30 @@ def test_plain_text_injection_keeps_the_control_gate_closed():
     assert runner.adapter.seen.allow_gateway_control is False
 
 
-def test_unknown_slash_text_still_falls_through_to_the_model_lane():
-    # The whitelist is NOT widened: an unregistered name keeps the gate CLOSED,
-    # so the event is not a command at all. The real chain entry (the actual
-    # resolver) yields no command/canonical, and the unknown-slash rejection
-    # branch stays unreachable for injected text — it lives inside the skill
-    # rewrite, which early-returns on a falsy command. The text answers as an
-    # agent turn, exactly like before the repair.
+def test_unknown_slash_branch_decided_by_the_real_idle_orchestration():
+    # B3: the WHOLE real idle chain — resolver, canonical dispatch, the
+    # quick/plugin leg and the skill-slash rewrite — decides that a gate-closed
+    # unknown name is NOT a command and falls through. Nothing in this test body
+    # pre-selects the branch: the handler consults only the production
+    # ``_hm_dispatch_idle_commands`` return. The answer arrives as an agent turn
+    # with the rendezvous receipt intact, exactly like before the repair.
     runner = FakeRunner()
-    stub, dispatched = _dispatch_stub()
+    dispatched: dict = {}
+    stub = _NativeIdleStub(dispatched)
+    runner.adapter._message_handler = _native_idle_handler(runner, stub)
 
-    async def resolve_like_handler(event):
-        assert event.allow_gateway_control is False
-        assert event.is_command() is False
-        handled, _result, command, canonical = await _resolve_and_dispatch(stub, event)
-        assert (handled, command, canonical) == (False, None, None)
-        assert GatewayRunner._hm_skill_slash_rewrite(
-            stub, event, event.source, "session-key", None
-        ) is None  # no rejection reply is produced for injected unknown text
-        # fall-through semantics = the model lane answers (FakeRunner turns)
-        await runner._handle_message(event)
-
-    runner.adapter._message_handler = resolve_like_handler
     result = asyncio.run(inject_local_inbound(
-        runner, _payload(message_id="unknown-1", text="/frobnicate 这个指令不存在")))
+        runner, _payload(message_id="unknown-real-1", text="/frobnicate 这个指令不存在")))
 
     event = runner.adapter.seen
-    assert event.get_command() is None  # the command chain was never entered
-    assert result["response"] == "答对了。下一题"
-    assert runner.calls == 1  # …and the model lane runs, unchanged
+    assert event.allow_gateway_control is False
+    assert event.get_command() is None          # the command chain was never entered
+    assert result["response"] == "答对了。下一题"    # the model lane answered via the future
+    assert runner.calls == 1
     assert "cmd_new" not in dispatched
+    assert "admit_turn" not in dispatched
+    # the real quick/plugin leg ran and declined to invent a command
+    assert dispatched.get("plugin") is None
 
 
 def test_unknown_slash_keeps_the_rendezvous_grace_wait(monkeypatch):
@@ -255,9 +320,9 @@ def test_command_lane_receipt_hits_the_message_id_rendezvous(monkeypatch):
 
 
 def test_command_lane_without_publish_returns_clean_empty_result(monkeypatch):
-    # A command lane that answers without a publish-side turn (the receipts ride
-    # the native send path, not the future) must return "" with no fake content
-    # and no response_timeout, and still clean the rendezvous entry.
+    # A command lane whose handler genuinely answers with NO return value and NO
+    # publish (e.g. receipts riding the native send path) must return "" with no
+    # fake content and no response_timeout, and still clean the rendezvous entry.
     parked = _install_grace_park_spy(monkeypatch)
     runner = FakeRunner()
 
@@ -274,22 +339,78 @@ def test_command_lane_without_publish_returns_clean_empty_result(monkeypatch):
     assert "cmd-silent-1" not in runner._local_inbound_response_waiters
 
 
-def test_injected_compress_resolves_through_the_command_lane():
+def test_injected_compress_dispatches_via_real_idle_table_and_answers_with_receipt(monkeypatch):
+    # The canonical-dispatch leg of the REAL chain owns /compress through the
+    # idle-handler table, and the preview receipt reaches the sidecar via the
+    # production publish of the handler return value (no manual set_result).
+    parked = _install_grace_park_spy(monkeypatch)
     runner = FakeRunner()
-    stub, dispatched = _dispatch_stub()
+    dispatched: dict = {}
+    stub = _NativeIdleStub(dispatched)
+    runner.adapter._message_handler = _native_idle_handler(runner, stub)
 
-    async def command_lane_handler(event):
-        assert event.get_command() == "compress"
-        dispatched["event"] = event
-        handled, result, _command, canonical = await _resolve_and_dispatch(stub, event)
-        assert (handled, canonical) == (True, "compress")
-        event.source._local_inbound_response_future.set_result(result)
-
-    runner.adapter._message_handler = command_lane_handler
     result = asyncio.run(inject_local_inbound(
         runner, _payload(message_id="cmd-compress-1", text="/compress --preview")))
 
     assert is_gateway_known_command("compress")
     assert "compress" in GatewayRunner._IDLE_COMMANDS
-    assert dispatched["compress"] is dispatched["event"]  # idle dispatch table owned it
+    assert dispatched.get("compress") is dispatched.get("seen")  # idle dispatch table owned it
     assert result["response"] == "压缩预览：无需压缩。"
+    assert parked == []  # command lane: never burned the grace window
+
+
+def test_gate_reads_the_target_profiles_plugin_registry(tmp_path, monkeypatch):
+    # B2: the plugin half of ``is_gateway_known_command`` is per-home
+    # (plugins.py caches one manager per ``_plugin_home_key``), while the command
+    # dispatches under the TARGET profile's runtime scope. Evaluating the gate
+    # under the caller's home alone false-opens launch-only verbs and false-closes
+    # target-only ones (round-2 probe); the gate must query the registry inside the
+    # resolved target scope. Built-ins answer from the static set and never bind.
+    import hermes_cli.plugins as plugins_module
+    from hermes_constants import get_hermes_home
+
+    caller_home = Path(get_hermes_home()).expanduser().resolve()
+    target_home = tmp_path / "profiles" / "hema-target"
+    target_home.mkdir(parents=True)
+    table = {
+        str(caller_home): {"launchonly": {"description": "launch-profile verb", "handler": None}},
+        str(target_home): {"targetonly": {"description": "target-profile verb", "handler": None}},
+    }
+
+    def _home_keyed_discovery():
+        home = str(Path(get_hermes_home()).expanduser().resolve())
+        return SimpleNamespace(_plugin_commands=table.get(home, {}))
+
+    monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", _home_keyed_discovery)
+
+    class _ScopedRunner(FakeRunner):
+        def _routed_profile_home(self, _profile_name):
+            return target_home
+
+    runner = _ScopedRunner()
+
+    # target-only verb: the caller-scope query used to FALSE-CLOSE the gate.
+    asyncio.run(inject_local_inbound(runner, _payload(message_id="b2-open", text="/targetonly")))
+    assert runner.adapter.seen.allow_gateway_control is True
+
+    # launch-only verb: the caller-scope query used to FALSE-OPEN the gate.
+    asyncio.run(inject_local_inbound(runner, _payload(message_id="b2-close", text="/launchonly")))
+    assert runner.adapter.seen.allow_gateway_control is False
+
+    # the scope bind must unwind; the injection keeps the caller's ambient home
+    assert Path(get_hermes_home()).expanduser().resolve() == caller_home
+
+
+def test_gate_keeps_caller_scope_when_target_profile_does_not_resolve():
+    # ``UNRESOLVED_PROFILE_HOME`` means the target's native handlers run unscoped
+    # too — its dispatch reads the CALLER's table, so binding nothing IS the
+    # alignment, and built-in commands keep opening the gate as before.
+    from gateway.run_adapters import UNRESOLVED_PROFILE_HOME
+
+    class _UnresolvableRunner(FakeRunner):
+        def _routed_profile_home(self, _profile_name):
+            return UNRESOLVED_PROFILE_HOME
+
+    runner = _UnresolvableRunner()
+    asyncio.run(inject_local_inbound(runner, _payload(message_id="b2-unres-1", text="/new")))
+    assert runner.adapter.seen.allow_gateway_control is True

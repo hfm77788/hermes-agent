@@ -7,6 +7,7 @@ session; presentation stays muted so the sidecar remains the single delivery pat
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from pathlib import Path
@@ -14,6 +15,8 @@ from typing import Any
 
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import Platform
+
+logger = logging.getLogger(__name__)
 
 
 _MAX_TEXT_CHARS = 8000
@@ -41,7 +44,7 @@ def _clean(value: Any, *, limit: int = _MAX_ID_CHARS) -> str:
     return str(value or "").strip()[:limit]
 
 
-def _injected_slash_opens_command_lane(text: str) -> bool:
+def _injected_slash_opens_command_lane(text: str, *, plugin_home: Any = None) -> bool:
     """True only when sidecar-injected slash text targets a registered gateway command.
 
     Repair t_a032be60 (diagnosis t_6196a57c): the hardcoded gate False kept the
@@ -56,6 +59,18 @@ def _injected_slash_opens_command_lane(text: str) -> bool:
     chat with the rendezvous grace wait intact. Opening the gate grants nothing —
     the resolved command still passes ``_check_slash_access``, command hooks and
     busy policy.
+
+    Audit B2 (round 2): the PLUGIN half of that whitelist is resolved from the
+    ACTIVE Hermes home's manager (plugins.py ``_plugin_home_key``), while the
+    command dispatches under the TARGET profile's runtime scope
+    (``run_adapters.py::_make_profile_message_handler``). Evaluating the gate
+    under the caller's home alone false-opens launch-only plugin verbs and
+    false-closes target-only ones. ``plugin_home`` (resolved by the caller from
+    the routing chain) rebinds the plugin-table query into the target profile's
+    scope, so gate and dispatch read the same registry; built-in names answer
+    from the static set first and cost nothing. A bind failure (hosted-scope
+    refusal, resolution error) falls back to the caller-scope query — the
+    pre-B2 behaviour, never a widened surface.
     """
     parts = (text or "").lstrip().split(maxsplit=1)
     if not parts or not parts[0].startswith("/"):
@@ -63,10 +78,61 @@ def _injected_slash_opens_command_lane(text: str) -> bool:
     raw = parts[0][1:].lower().split("@", 1)[0]
     if not raw or "/" in raw:
         return False
-    from hermes_cli.commands import is_gateway_known_command, resolve_command
+    from hermes_cli.commands import (
+        GATEWAY_KNOWN_COMMANDS,
+        is_gateway_known_command,
+        resolve_command,
+    )
 
     cmd_def = resolve_command(raw)
-    return is_gateway_known_command(cmd_def.name if cmd_def else raw)
+    name = cmd_def.name if cmd_def else raw
+    if name in GATEWAY_KNOWN_COMMANDS or plugin_home is None:
+        return is_gateway_known_command(name)
+    try:
+        from agent.runtime_scope import bind_profile_scope
+
+        with bind_profile_scope(plugin_home, hydrate_secrets=False):
+            return is_gateway_known_command(name)
+    except Exception:
+        logger.debug(
+            "plugin registry scope bind refused; gate evaluated under the caller's home",
+            exc_info=True,
+        )
+        return is_gateway_known_command(name)
+
+
+def _injection_plugin_registry_home(runner: Any, profile: str) -> Path | None:
+    """The target profile's plugin-registry home, or None when the caller scope IS it.
+
+    None keeps the historical caller-scope evaluation, which is exactly right when:
+    the profile routes to this process's own home (default/primary — the common
+    classroom path pays zero binding cost), the named profile does not resolve
+    (``UNRESOLVED_PROFILE_HOME`` — its native handlers run unscoped too, so the
+    caller's table IS the dispatch table), or the runner carries no routing
+    resolver (a bare test adapter rig).
+    """
+    resolver = getattr(runner, "_routed_profile_home", None)
+    if not callable(resolver):
+        return None
+    from gateway.run_adapters import UNRESOLVED_PROFILE_HOME
+
+    try:
+        home = resolver(profile)
+    except Exception:
+        logger.debug("profile home for the command-lane gate does not resolve", exc_info=True)
+        return None
+    # ``UNRESOLVED_PROFILE_HOME`` and ``None`` both mean "no distinct scope to bind" —
+    # isinstance is the narrowing, never a name equality with the sentinel's class.
+    if not isinstance(home, (str, Path)) or home is UNRESOLVED_PROFILE_HOME:
+        return None
+    from hermes_constants import get_hermes_home, hermes_home_key
+
+    try:
+        if hermes_home_key(home) == hermes_home_key(get_hermes_home()):
+            return None
+    except Exception:
+        return None
+    return Path(home)
 
 
 def _profile_adapter(runner, profile: str, platform: Platform):
@@ -172,7 +238,8 @@ async def _execute_local_inbound(runner, params: dict[str, Any]) -> dict[str, An
             if hasattr(adapter, "_resolve_channel_prompt") else None
         ),
         # Command-lane gate (repair t_a032be60): opens ONLY for injected text
-        # that names a registered gateway command (see
+        # that names a registered gateway command, queried under the TARGET
+        # profile's plugin registry (audit B2; see
         # _injected_slash_opens_command_lane). The hardcoded False made
         # ``is_command()``/``get_command()`` (platforms/event.py) permanently
         # None, so the health check's /new ran as chat text and the model
@@ -181,7 +248,9 @@ async def _execute_local_inbound(runner, params: dict[str, Any]) -> dict[str, An
         # chat keep the pre-repair model-lane behaviour; every gated command
         # still faces the native ``is_gateway_known_command`` whitelist, the
         # ``_check_slash_access`` policy and command hooks in the chain.
-        allow_gateway_control=_injected_slash_opens_command_lane(text),
+        allow_gateway_control=_injected_slash_opens_command_lane(
+            text, plugin_home=_injection_plugin_registry_home(runner, profile)
+        ),
     )
 
     recent_context = _clean(params.get("recent_context"), limit=_MAX_CONTEXT_CHARS)
@@ -223,17 +292,30 @@ async def _execute_local_inbound(runner, params: dict[str, Any]) -> dict[str, An
     try:
         handler: Any = getattr(adapter, "_message_handler", None)
         if callable(handler):
-            await handler(event)
+            dispatch_receipt = await handler(event)
         else:
-            await runner._handle_message(event)
-        _wait_started = time.monotonic()
-        response_timed_out = False
+            dispatch_receipt = await runner._handle_message(event)
         # Single source of truth with the gate above: only text actually routed
         # into the command lane skips the grace park (it answers without a
         # publish-side agent turn — repair t_479a04ac). The old
         # ``text.startswith("/")`` predicate also skipped it for unknown-slash
         # model turns, dropping their receipts (t_6196a57c §2.2).
         _is_command_lane = bool(event.allow_gateway_control)
+        if _is_command_lane and isinstance(dispatch_receipt, str) and dispatch_receipt:
+            # Audit B1: a native command's answer rides the handler's RETURN value
+            # (the profile handler forwards ``_handle_message``'s receipt); no
+            # agent-turn egress publishes it, so the sidecar used to get
+            # ``accepted=True, response=""`` after a real reset. Deliver it through
+            # the SAME production seam the egress uses: one-shot guarded
+            # (``future.done()`` — no double publish, no override of an egress
+            # receipt) and run through the normal chat-boundary sanitisation.
+            from gateway.run_turn import _publish_local_inbound_response
+
+            _publish_local_inbound_response(
+                event.source, {"final_response": dispatch_receipt}, runner=runner
+            )
+        _wait_started = time.monotonic()
+        response_timed_out = False
         if not response_future.done() and not _is_command_lane:
             # Slash-command lanes answer without a publish-side agent turn — never
             # park the grace window on them (repair t_479a04ac).
