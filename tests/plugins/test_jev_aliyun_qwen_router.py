@@ -684,3 +684,76 @@ def test_route_request_logs_honest_reason_not_decision_unparsed(mod, monkeypatch
     blob = "\n".join(r.getMessage() for r in caplog.records)
     assert "skip=effort_confidence_low" in blob
     assert "decision_unparsed" not in blob
+
+
+# ---- quota valve (bailian token-plan remaining guard) ----
+
+
+def _fresh_valve_settings(mod, tmp_path, remaining_pct=None, ts_age=0, **over):
+    import time as _t
+
+    vf = tmp_path / "valve.json"
+    if remaining_pct is not None:
+        vf.write_text(json.dumps({"remaining_pct": remaining_pct, "ts": int(_t.time()) - ts_age}))
+    base = _settings_for(mod)
+    base.update({"quota_valve_file": str(vf), "quota_saving_pct": 10.0, "quota_valve_stale_hours": 48.0})
+    base.update(over)
+    return base, vf
+
+
+def test_quota_valve_unit(tmp_path, mod, monkeypatch):
+    import time as _t
+
+    monkeypatch.setattr(mod._QUOTA_CACHE, "checked", 0.0) if False else None
+    base, _ = _fresh_valve_settings(mod, tmp_path)
+    # 缺文件 → 不干预
+    mod._QUOTA_CACHE.update({"checked": 0.0, "data": None})
+    assert mod._quota_valve(base) is None
+    # 余量高 → 不干预
+    (tmp_path / "valve.json").write_text(json.dumps({"remaining_pct": 40.0, "ts": int(_t.time())}))
+    mod._QUOTA_CACHE.update({"checked": 0.0, "data": None})
+    assert mod._quota_valve(base) is None
+    # 余量低 → 返回 remaining
+    (tmp_path / "valve.json").write_text(json.dumps({"remaining_pct": 8.0, "ts": int(_t.time())}))
+    mod._QUOTA_CACHE.update({"checked": 0.0, "data": None})
+    assert mod._quota_valve(base) == 8.0
+    # 陈旧数据 → 视为无效（采样器死了不能冻住阀门）
+    (tmp_path / "valve.json").write_text(json.dumps({"remaining_pct": 2.0, "ts": int(_t.time()) - 49 * 3600}))
+    mod._QUOTA_CACHE.update({"checked": 0.0, "data": None})
+    assert mod._quota_valve(base) is None
+
+
+def test_quota_valve_caps_escalation_to_flash(tmp_path, mod, monkeypatch):
+    import time as _t
+
+    vf = tmp_path / "valve.json"
+    vf.write_text(json.dumps({"remaining_pct": 8.0, "ts": int(_t.time())}))
+    monkeypatch.setattr(mod, "_root_plugin_settings", lambda: {
+        "centralized_profile_policy": True,
+        "flash_model": "qwen3.8-flash",
+        "max_model": "qwen3.8-max-0902",
+        "quota_valve_file": str(vf),
+        "quota_saving_pct": 10.0,
+        "quota_valve_stale_hours": 48.0,
+    })
+    mod._QUOTA_CACHE.update({"checked": 0.0, "data": None})
+    monkeypatch.setattr(
+        mod,
+        "_call_jev",
+        lambda **_: (_response(effort="xhigh", confidence=0.97, max_probability=0.95), 234),
+    )
+    result = _route(mod, Ctx(), _request())
+    assert result["request"]["model"] == "qwen3.8-flash"
+    assert result["reason"].startswith("flash_")
+    mod._QUOTA_CACHE.update({"checked": 0.0, "data": None})
+
+
+def test_quota_valve_inactive_keeps_max_escalation(mod, monkeypatch):
+    mod._QUOTA_CACHE.update({"checked": 0.0, "data": None})
+    monkeypatch.setattr(
+        mod,
+        "_call_jev",
+        lambda **_: (_response(effort="xhigh", confidence=0.97, max_probability=0.95), 234),
+    )
+    result = _route(mod, Ctx(), _request())
+    assert result["request"]["model"] == "qwen3.8-max-0902"
