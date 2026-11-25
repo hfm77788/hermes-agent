@@ -267,6 +267,13 @@ def _settings(ctx: Any) -> dict[str, Any]:
         "allow_max": _as_bool(value("allow_max", True), True),
         "centralized_profile_policy": centralized,
         "profile": profile,
+        "quota_valve_file": str(value("quota_valve_file", "") or "").strip(),
+        "quota_saving_pct": _as_float(
+            value("quota_saving_pct", 10.0), 10.0, low=0.0, high=100.0
+        ),
+        "quota_valve_stale_hours": _as_float(
+            value("quota_valve_stale_hours", 48.0), 48.0, low=0.1, high=720.0
+        ),
         "policy_name": policy_name,
     }
 
@@ -604,7 +611,7 @@ def _parse_route_with_reason(
             prob_gate = settings["downgrade_max_probability"]
         downgrade_allowed = confidence >= conf_gate and max_probability <= prob_gate
     model = max_model if ((manual_max and not downgrade_allowed) or should_max) else flash_model
-    tier = ("max_" if model == max_model else "flash_") + effort
+    tier = ("max_" if (model == max_model and max_model != flash_model) else "flash_") + effort
     return RouteDecision(
         model=model,
         effort=effort,
@@ -661,6 +668,48 @@ def _cache_put(turn_id: str, decision: RouteDecision | None) -> None:
         _TURN_CACHE.move_to_end(turn_id)
         while len(_TURN_CACHE) > _CACHE_LIMIT:
             _TURN_CACHE.popitem(last=False)
+
+
+_QUOTA_CACHE: dict[str, Any] = {"checked": 0.0, "data": None}
+
+
+def _quota_valve(settings: dict[str, Any]) -> float | None:
+    """Bailian token-plan quota valve.
+
+    Returns the remaining percentage when it has fallen to or below
+    settings["quota_saving_pct"] (meaning: cap every max-tier choice down to
+    the flash model so the last slice of the plan keeps serving turns until
+    reset).  Returns None (no intervention) when the state file is missing,
+    malformed, stale (stale-hours guard so a dead sampler never freezes the
+    valve closed), or above threshold.  Process-side result is cached for
+    60s to keep per-turn cost trivial.
+    """
+    now = time.time()
+    path = settings.get("quota_valve_file")
+    if not path:
+        return None  # valve opt-in: no explicit file configured → never intervenes
+    if now - _QUOTA_CACHE["checked"] < 60.0:
+        data = _QUOTA_CACHE["data"]
+    else:
+        data = None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                raw = json.load(fh)
+            if now - float(raw.get("ts", 0)) < settings["quota_valve_stale_hours"] * 3600.0:
+                data = raw
+        except (OSError, ValueError, TypeError):
+            data = None
+        _QUOTA_CACHE["checked"] = now
+        _QUOTA_CACHE["data"] = data
+    if not data:
+        return None
+    try:
+        remaining = float(data.get("remaining_pct"))
+    except (TypeError, ValueError):
+        return None
+    if remaining <= float(settings["quota_saving_pct"]):
+        return remaining
+    return None
 
 
 def _warn_rate_limited(message: str, *args: Any) -> None:
@@ -807,6 +856,14 @@ def route_request(ctx: Any, **kwargs: Any) -> dict[str, Any] | None:
         or aliases.get(_normalized_base_url(base_url))
         or settings["max_model"]
     )
+    _valve_remaining = _quota_valve(settings)
+    if _valve_remaining is not None and effective_max != settings["flash_model"]:
+        _skip_rate_limited(
+            "quota_valve_capped",
+            "jev-aliyun-qwen-router: quota valve engaged remaining=%.1f%% — max tier capped to flash profile=%s",
+            _valve_remaining, settings["profile"],
+        )
+        effective_max = settings["flash_model"]
     if active_model not in {settings["flash_model"], effective_max}:
         _skip_rate_limited(
             "model_not_routable",
