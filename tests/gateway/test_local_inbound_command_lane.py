@@ -214,8 +214,11 @@ def test_unknown_slash_branch_decided_by_the_real_idle_orchestration():
     assert runner.calls == 1
     assert "cmd_new" not in dispatched
     assert "admit_turn" not in dispatched
-    # the real quick/plugin leg ran and declined to invent a command
-    assert dispatched.get("plugin") is None
+    # the real quick/plugin orchestration method ran (recorded below); its plugin
+    # LEAF only fires for a resolvable command, so for gate-closed unknown text the
+    # proof is that the orchestration returned without inventing one.
+    assert dispatched.get("seen") is event
+    assert "admit_turn" not in dispatched  # no skill-rewrite turn was admitted either
 
 
 def test_unknown_slash_keeps_the_rendezvous_grace_wait(monkeypatch):
@@ -359,46 +362,102 @@ def test_injected_compress_dispatches_via_real_idle_table_and_answers_with_recei
     assert parked == []  # command lane: never burned the grace window
 
 
-def test_gate_reads_the_target_profiles_plugin_registry(tmp_path, monkeypatch):
-    # B2: the plugin half of ``is_gateway_known_command`` is per-home
+class _SplitRouteRunner(FakeRunner):
+    """FakeRunner whose routing seams mirror ``_make_profile_message_handler``:
+    the canonicalized identity carries a RUNTIME home distinct from both the
+    caller's home and the receiving bot's profile home (round-3 audit: resolving
+    to the transport profile alone false-opens transport-only verbs and
+    false-closes runtime-only ones)."""
+
+    def __init__(self, profile_home, runtime_home):
+        super().__init__()
+        self._profile_home = profile_home
+        self._runtime_home = runtime_home
+        self.canonicalize_calls: list[tuple] = []
+
+    def _routed_profile_home(self, _profile_name):
+        return self._profile_home
+
+    def _canonicalize(self, source, *, transport_profile=None, primary_home=None):
+        self.canonicalize_calls.append((transport_profile, primary_home))
+        return SimpleNamespace(runtime_home=self._runtime_home)
+
+    def _routed_runtime_home(self, identity, profile_home):
+        return identity.runtime_home if identity is not None else profile_home
+
+
+def test_gate_reads_the_runtime_home_plugin_registry(tmp_path, monkeypatch):
+    # B2 (rounds 2+3): the plugin half of ``is_gateway_known_command`` is per-home
     # (plugins.py caches one manager per ``_plugin_home_key``), while the command
-    # dispatches under the TARGET profile's runtime scope. Evaluating the gate
-    # under the caller's home alone false-opens launch-only verbs and false-closes
-    # target-only ones (round-2 probe); the gate must query the registry inside the
-    # resolved target scope. Built-ins answer from the static set and never bind.
+    # dispatches under the canonicalized identity's RUNTIME scope. Neither the
+    # caller's home nor the receiving bot's profile home is the right table when
+    # they differ; the gate must query the registry inside the runtime home.
+    # Built-ins answer from the static set and never bind.
     import hermes_cli.plugins as plugins_module
     from hermes_constants import get_hermes_home
 
-    caller_home = Path(get_hermes_home()).expanduser().resolve()
-    target_home = tmp_path / "profiles" / "hema-target"
-    target_home.mkdir(parents=True)
-    table = {
-        str(caller_home): {"launchonly": {"description": "launch-profile verb", "handler": None}},
-        str(target_home): {"targetonly": {"description": "target-profile verb", "handler": None}},
-    }
-
+    transport_home = (tmp_path / "profiles" / "transport-bot").expanduser().resolve()
+    runtime_home = (tmp_path / "profiles" / "runtime-target").expanduser().resolve()
+    transport_home.mkdir(parents=True)
+    runtime_home.mkdir(parents=True)
+    # The caller home is resolved INSIDE the probe: the autouse home-isolation
+    # fixture may re-point HERMES_HOME per test, and any name captured before the
+    # bind would key the table on a stale path.
     def _home_keyed_discovery():
         home = str(Path(get_hermes_home()).expanduser().resolve())
-        return SimpleNamespace(_plugin_commands=table.get(home, {}))
+        if home == str(runtime_home):
+            commands = {"runtimeonly": {"description": "runtime-profile verb", "handler": None}}
+        elif home == str(transport_home):
+            commands = {"transportonly": {"description": "transport-profile verb", "handler": None}}
+        else:
+            commands = {"launchonly": {"description": "launch-profile verb", "handler": None}}
+        return SimpleNamespace(_plugin_commands=commands)
 
     monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", _home_keyed_discovery)
 
-    class _ScopedRunner(FakeRunner):
-        def _routed_profile_home(self, _profile_name):
-            return target_home
+    runner = _SplitRouteRunner(transport_home, runtime_home)
 
-    runner = _ScopedRunner()
-
-    # target-only verb: the caller-scope query used to FALSE-CLOSE the gate.
-    asyncio.run(inject_local_inbound(runner, _payload(message_id="b2-open", text="/targetonly")))
+    # runtime-only verb: caller- or transport-scope queries both FALSE-CLOSE it.
+    asyncio.run(inject_local_inbound(runner, _payload(message_id="b2-open", text="/runtimeonly")))
     assert runner.adapter.seen.allow_gateway_control is True
+    assert runner.canonicalize_calls  # identity resolved through the real seam
 
-    # launch-only verb: the caller-scope query used to FALSE-OPEN the gate.
-    asyncio.run(inject_local_inbound(runner, _payload(message_id="b2-close", text="/launchonly")))
+    # transport-only verb: not registered in the runtime table — must NOT open.
+    asyncio.run(inject_local_inbound(runner, _payload(message_id="b2-close", text="/transportonly")))
     assert runner.adapter.seen.allow_gateway_control is False
 
-    # the scope bind must unwind; the injection keeps the caller's ambient home
-    assert Path(get_hermes_home()).expanduser().resolve() == caller_home
+    # the scope bind must unwind; the injection returns to the ambient caller home
+    assert Path(get_hermes_home()).expanduser().resolve() not in (runtime_home, transport_home)
+
+
+def test_command_lane_receipt_is_sanitised_under_the_runtime_home(tmp_path, monkeypatch):
+    # B1 (round-3): the publish seam's sanitisation is scope-sensitive (phone
+    # policy reads the ACTIVE profile; the secret-source table keys on the active
+    # hermes_home_key). A receipt returned after the handler left the target scope
+    # must be published INSIDE that scope, never sanitised under the caller's.
+    import gateway.run_turn as run_turn_module
+    from hermes_constants import get_hermes_home
+
+    runtime_home = tmp_path / "profiles" / "runtime-target"
+    runtime_home.mkdir(parents=True)
+    published_home: list[str] = []
+    real_publish = run_turn_module._publish_local_inbound_response
+
+    def spy_publish(source, response, runner=None):
+        published_home.append(str(Path(get_hermes_home()).expanduser().resolve()))
+        return real_publish(source, response, runner=runner)
+
+    monkeypatch.setattr(run_turn_module, "_publish_local_inbound_response", spy_publish)
+
+    dispatched: dict = {}
+    runner = _SplitRouteRunner(runtime_home, runtime_home)  # transport == runtime home here
+    runner.adapter._message_handler = _native_idle_handler(runner, _NativeIdleStub(dispatched))
+
+    result = asyncio.run(inject_local_inbound(
+        runner, _payload(message_id="b1-scope-1", text="/new")))
+
+    assert result["response"] == "新会话已开启。"
+    assert published_home == [str(runtime_home.resolve())]  # published under the TARGET scope
 
 
 def test_gate_keeps_caller_scope_when_target_profile_does_not_resolve():
@@ -407,10 +466,13 @@ def test_gate_keeps_caller_scope_when_target_profile_does_not_resolve():
     # alignment, and built-in commands keep opening the gate as before.
     from gateway.run_adapters import UNRESOLVED_PROFILE_HOME
 
-    class _UnresolvableRunner(FakeRunner):
+    class _UnresolvableRunner(_SplitRouteRunner):
         def _routed_profile_home(self, _profile_name):
             return UNRESOLVED_PROFILE_HOME
 
-    runner = _UnresolvableRunner()
+        def _canonicalize(self, source, *, transport_profile=None, primary_home=None):
+            return None  # no live provenance: nothing pinned, sentinel passthrough
+
+    runner = _UnresolvableRunner(UNRESOLVED_PROFILE_HOME, None)
     asyncio.run(inject_local_inbound(runner, _payload(message_id="b2-unres-1", text="/new")))
     assert runner.adapter.seen.allow_gateway_control is True

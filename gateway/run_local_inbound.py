@@ -68,9 +68,10 @@ def _injected_slash_opens_command_lane(text: str, *, plugin_home: Any = None) ->
     false-closes target-only ones. ``plugin_home`` (resolved by the caller from
     the routing chain) rebinds the plugin-table query into the target profile's
     scope, so gate and dispatch read the same registry; built-in names answer
-    from the static set first and cost nothing. A bind failure (hosted-scope
-    refusal, resolution error) falls back to the caller-scope query — the
-    pre-B2 behaviour, never a widened surface.
+    from the static set first and cost nothing. Round-3 audit: when the TARGET
+    table itself cannot be read the gate CLOSES for plugin verbs — guessing from
+    the caller's table could false-open a transport-only name, so an unreadable
+    target is treated as unregistered (model lane, the pre-repair behaviour).
     """
     parts = (text or "").lstrip().split(maxsplit=1)
     if not parts or not parts[0].startswith("/"):
@@ -95,38 +96,63 @@ def _injected_slash_opens_command_lane(text: str, *, plugin_home: Any = None) ->
             return is_gateway_known_command(name)
     except Exception:
         logger.debug(
-            "plugin registry scope bind refused; gate evaluated under the caller's home",
+            "plugin registry scope bind refused; the plugin verb is treated as unregistered",
             exc_info=True,
         )
-        return is_gateway_known_command(name)
+        return False
 
 
-def _injection_plugin_registry_home(runner: Any, profile: str) -> Path | None:
-    """The target profile's plugin-registry home, or None when the caller scope IS it.
+def _injection_dispatch_runtime_home(runner: Any, profile: str, source: Any) -> Path | None:
+    """The RUNTIME home the injected command actually dispatches under; None = the
+    caller's own scope IS that home.
 
-    None keeps the historical caller-scope evaluation, which is exactly right when:
-    the profile routes to this process's own home (default/primary — the common
-    classroom path pays zero binding cost), the named profile does not resolve
-    (``UNRESOLVED_PROFILE_HOME`` — its native handlers run unscoped too, so the
-    caller's table IS the dispatch table), or the runner carries no routing
-    resolver (a bare test adapter rig).
+    Round-3 audit (B2): ``run_adapters.py::_make_profile_message_handler``
+    canonicalizes the source FIRST and dispatches under
+    ``_routed_runtime_home(identity, profile_home)`` — a shared bot whose route
+    targets a satellite runs in the ROUTED profile's scope, so the receiving
+    bot's profile home alone is the wrong table (transport-only plugin verbs
+    false-open, runtime-only verbs false-close). This mirrors the same seams for
+    BOTH halves of the repair: the plugin-registry gate query and the receipt
+    publish run in this home's scope, never in a proxy for it.
+
+    None keeps caller-scope evaluation, which is exact when: the runner is a bare
+    rig without the routing seams (its handler runs unscoped too), the resolved
+    home IS this process's home (the common classroom path pays zero binding
+    cost), or the routed home is the ``UNRESOLVED_PROFILE_HOME`` sentinel (the
+    handler binds a nullcontext, so the caller's table IS the dispatch table). A
+    resolution exception also answers None: the caller table is the strictly
+    narrower pre-repair behaviour, never a widened surface.
     """
-    resolver = getattr(runner, "_routed_profile_home", None)
-    if not callable(resolver):
-        return None
     from gateway.run_adapters import UNRESOLVED_PROFILE_HOME
-
-    try:
-        home = resolver(profile)
-    except Exception:
-        logger.debug("profile home for the command-lane gate does not resolve", exc_info=True)
-        return None
-    # ``UNRESOLVED_PROFILE_HOME`` and ``None`` both mean "no distinct scope to bind" —
-    # isinstance is the narrowing, never a name equality with the sentinel's class.
-    if not isinstance(home, (str, Path)) or home is UNRESOLVED_PROFILE_HOME:
-        return None
     from hermes_constants import get_hermes_home, hermes_home_key
 
+    canonicalize = getattr(runner, "_canonicalize", None)
+    routed_profile = getattr(runner, "_routed_profile_home", None)
+    routed_runtime = getattr(runner, "_routed_runtime_home", None)
+    if not (callable(canonicalize) and callable(routed_profile) and callable(routed_runtime)):
+        return None
+    try:
+        primary = getattr(runner, "_primary_profile_name", None) or "default"
+        if profile in {"default", primary}:
+            # ``_make_default_profile_message_handler`` shape: the admitted
+            # primary source dispatches in its identity's runtime home.
+            admit = getattr(runner, "_admit_primary_source", None)
+            if not callable(admit):
+                return None
+            default_home = Path(get_hermes_home())
+            home = admit(source, default_home) or default_home
+        else:
+            profile_home = routed_profile(profile)
+            identity = canonicalize(source, transport_profile=profile)
+            home = routed_runtime(identity, profile_home)
+    except Exception:
+        logger.debug("dispatch runtime home does not resolve; caller scope is used", exc_info=True)
+        return None
+    # ``UNRESOLVED_PROFILE_HOME`` and ``None`` both mean "no distinct scope to
+    # bind" — isinstance is the narrowing, never a name equality with the
+    # sentinel's class.
+    if not isinstance(home, (str, Path)) or home is UNRESOLVED_PROFILE_HOME:
+        return None
     try:
         if hermes_home_key(home) == hermes_home_key(get_hermes_home()):
             return None
@@ -219,6 +245,12 @@ async def _execute_local_inbound(runner, params: dict[str, Any]) -> dict[str, An
     # persisted into SessionSource or accepted from public platform payloads.
     source._local_inbound_skill = skill
     source._local_inbound_has_media = bool(media_urls)
+    # Round-3 audit (B2): resolve the command lane's dispatch scope ONCE, through
+    # the same identity seams the profile message handler uses, and keep BOTH the
+    # gate query and the receipt publish inside it. Canonicalizing here is the
+    # gateway's own ingress invariant (the handler's repeat call is a no-op on the
+    # pinned identity).
+    dispatch_home = _injection_dispatch_runtime_home(runner, profile, source)
     auto_skill = [skill] if skill else (
         adapter._resolve_channel_skills(chat_id)
         if hasattr(adapter, "_resolve_channel_skills") else None
@@ -249,7 +281,7 @@ async def _execute_local_inbound(runner, params: dict[str, Any]) -> dict[str, An
         # still faces the native ``is_gateway_known_command`` whitelist, the
         # ``_check_slash_access`` policy and command hooks in the chain.
         allow_gateway_control=_injected_slash_opens_command_lane(
-            text, plugin_home=_injection_plugin_registry_home(runner, profile)
+            text, plugin_home=dispatch_home
         ),
     )
 
@@ -309,11 +341,25 @@ async def _execute_local_inbound(runner, params: dict[str, Any]) -> dict[str, An
             # the SAME production seam the egress uses: one-shot guarded
             # (``future.done()`` — no double publish, no override of an egress
             # receipt) and run through the normal chat-boundary sanitisation.
+            # Round-3 audit: the seam's sanitisation is scope-sensitive (the phone
+            # policy reads the ACTIVE profile, the secret-source redaction table is
+            # keyed by the active ``hermes_home_key``), and the handler has already
+            # LEFT the target runtime scope by the time its receipt returns here.
+            # Publish inside the same scope the command dispatched under — never a
+            # caller-scope sanitisation of a target-profile receipt.
             from gateway.run_turn import _publish_local_inbound_response
 
-            _publish_local_inbound_response(
-                event.source, {"final_response": dispatch_receipt}, runner=runner
-            )
+            if dispatch_home is None:
+                _publish_local_inbound_response(
+                    event.source, {"final_response": dispatch_receipt}, runner=runner
+                )
+            else:
+                from gateway.run import _async_profile_runtime_scope
+
+                async with _async_profile_runtime_scope(dispatch_home):
+                    _publish_local_inbound_response(
+                        event.source, {"final_response": dispatch_receipt}, runner=runner
+                    )
         _wait_started = time.monotonic()
         response_timed_out = False
         if not response_future.done() and not _is_command_lane:
